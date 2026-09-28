@@ -1,0 +1,51 @@
+{
+    "name": "dolibarr/shopifyintegration",
+    "description": "Module d'intégration Shopify pour Dolibarr ERP/CRM",
+    "license": "GPL-3.0-or-later",
+    "require": {
+        "guzzlehttp/guzzle": "^6.5",
+        "psr/log": "^1.1",
+        "ext-json": "*",
+        "ext-curl": "*"
+    },
+    "require-dev": {
+        "dealerdirect/phpcodesniffer-composer-installer": "^1.0",
+        "phpcompatibility/php-compatibility": "^9.3",
+        "phpstan/phpstan": "^1.12",
+        "phpunit/phpunit": "^10.5",
+        "squizlabs/php_codesniffer": "^3.10",
+        "symfony/var-dumper": "^6.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "Shopifyintegration\\": "class/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Test\\": "test/"
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "preferred-install": "dist",
+        "sort-packages": true,
+        "allow-plugins": {
+            "dealerdirect/phpcodesniffer-composer-installer": true
+        }
+    },
+    "scripts": {
+        "test": "phpunit --testdox",
+        "test:unit": "phpunit --testdox --testsuite 'Unit Tests'",
+        "test:integration": "phpunit --testdox --testsuite 'Integration Tests'",
+        "test:functional": "phpunit --testdox --testsuite 'Functional Tests'",
+        "test:db-migrations": "phpunit --testdox --group db-migrations",
+        "phpcs": "phpcs --standard=PSR12 --extensions=php class/",
+        "phpstan": "phpstan analyse class/",
+        "check-sql": "grep -r --include=\"*.php\" \"\\$sql.*\\$_\" --color class/ || echo \"No direct SQL injections found\"",
+        "setup-test-db": "php test/setup/database/create_test_db.php",
+        "build:fast": "./generate_module_fast.sh",
+        "build:release": "./generate_module_locally.sh",
+        "phpcompat": "phpcs --standard=PHPCompatibility --runtime-set testVersion 7.4 --runtime-set ignore_warnings_on_exit 1 admin class lib webhooks ajax core build"
+    }
+}
