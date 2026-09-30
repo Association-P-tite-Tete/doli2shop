@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.3.1
  * @link        https://doli2shop.ptitetete.org
  */
@@ -38,6 +38,17 @@ class StoreService
 
     /** @var bool Vrai si la dernière requête de fetch() a échoué (≠ « aucune ligne trouvée ») */
     private $lastFetchFailed = false;
+
+    /**
+     * @var bool Vrai si le DERNIER create() a dû retenter en boutique SECONDAIRE suite à une race
+     *      TOCTOU sur l'index unique uk_doli2shop_stores_default_key (story
+     *      doublon-is-default-boutiques-non-empeche, finding 1 de la review 3 couches du
+     *      2026-09-26). Réinitialisé en tête de CHAQUE create(). Permet à l'appelant de distinguer
+     *      « create() a réussi du premier coup en is_default=1 » (aucune race, la cible EST par
+     *      défaut avec certitude, aucune relecture n'est nécessaire) de « create() a dû retenter
+     *      en secondaire » (seul cas où une relecture apporte une information supplémentaire).
+     */
+    private $lastCreateDemotedByDefaultKeyRace = false;
 
     /** @var int Identifiant entité Dolibarr */
     private $entity;
@@ -68,6 +79,11 @@ class StoreService
      */
     public function create(array $data): int
     {
+        // Finding 1 (review 3 couches 2026-09-26) : réinitialisé à CHAQUE appel, y compris sur un
+        // retour anticipé en erreur ci-dessous — un appelant qui inspecterait ce drapeau après un
+        // create() en échec ne doit jamais lire l'état laissé par un appel PRÉCÉDENT.
+        $this->lastCreateDemotedByDefaultKeyRace = false;
+
         if (empty($data['label']) || empty($data['shop_domain'])) {
             $this->log('create() - label et shop_domain obligatoires', LOG_WARNING);
             return -1;
@@ -104,8 +120,9 @@ class StoreService
         }
         // is_default / active : TOUJOURS écrits (défaut explicite 0/1 si absents des données) —
         // comportement historique de create(), volontairement conservé.
+        $isDefaultRequested = isset($data['is_default']) && (int) (bool) $data['is_default'] === 1;
         $columns[] = 'is_default';
-        $values[]  = isset($data['is_default']) ? (int) (bool) $data['is_default'] : 0;
+        $values[]  = $isDefaultRequested ? 1 : 0;
         $columns[] = 'active';
         $values[]  = isset($data['active']) ? (int) (bool) $data['active'] : 1;
         if (array_key_exists('token_expires_at', $data)) {
@@ -142,9 +159,48 @@ class StoreService
 
         $result = $this->db->query($sql);
         if (!$result) {
-            $this->db->rollback();
-            $this->log('create() - Erreur INSERT boutique "' . $label . '": ' . $this->db->lasterror(), LOG_ERR);
-            return -1;
+            // Story doublon-is-default-boutiques-non-empeche (AC1) : l'index unique
+            // uk_doli2shop_stores_default_key (migration update_2.6.0_2.6.0b.sql) peut être violé
+            // par une VRAIE race TOCTOU — deux process concurrents créent chacun une boutique
+            // is_default=1 pour la MÊME entity au même instant (cf. StoreService::ensureDefaultStore(),
+            // admin/oauth_receive.php, Validate 2026-09-23 point 3). Ce n'est PAS une erreur
+            // applicative : une AUTRE boutique est devenue défaut entre-temps. On ne perd JAMAIS la
+            // boutique demandée pour ce cas précis : nouvelle tentative IMMÉDIATE en boutique
+            // SECONDAIRE (is_default=0), plutôt que d'échouer ou de laisser un doublon se créer.
+            //
+            // ⚠️ Les appelants qui avaient demandé is_default=1 DOIVENT relire l'état RÉEL de la
+            // ligne créée (fetch()) avant d'agir dessus (ex. écrire des constantes globales
+            // supposées "pour la boutique par défaut") — jamais faire confiance à leur propre
+            // calcul d'avant l'INSERT (cf. admin/oauth_receive.php, qui relit après ce retour).
+            if ($isDefaultRequested && $this->isDuplicateDefaultKeyError()) {
+                // Finding 1 (review 3 couches 2026-09-26) : posé AVANT la tentative de retry
+                // elle-même — si le retry échoue à son tour (ci-dessous, `if (!$result)` après ce
+                // bloc), create() renvoie -1 et l'appelant ne consultera de toute façon jamais ce
+                // drapeau (son propre chemin d'erreur ne branche pas dessus) ; le poser ici plutôt
+                // qu'après le succès du retry évite un état incohérent si un futur appelant venait
+                // à l'inspecter avant ce return -1.
+                $this->lastCreateDemotedByDefaultKeyRace = true;
+                $this->log(
+                    'create() - Race TOCTOU détectée sur is_default=1 (entity=' . $this->entity
+                    . ', label="' . $label . '") : une autre boutique est déjà devenue défaut'
+                    . ' entre-temps — nouvelle tentative en boutique SECONDAIRE (is_default=0)',
+                    LOG_WARNING
+                );
+                $isDefaultColumnIndex = array_search('is_default', $columns, true);
+                if ($isDefaultColumnIndex !== false) {
+                    $values[$isDefaultColumnIndex] = 0;
+                }
+                $sql  = 'INSERT INTO ' . MAIN_DB_PREFIX . 'doli2shop_stores';
+                $sql .= ' (' . implode(', ', $columns) . ')';
+                $sql .= ' VALUES (' . implode(', ', $values) . ')';
+                $result = $this->db->query($sql);
+            }
+
+            if (!$result) {
+                $this->db->rollback();
+                $this->log('create() - Erreur INSERT boutique "' . $label . '": ' . $this->db->lasterror(), LOG_ERR);
+                return -1;
+            }
         }
 
         $dolibarrStoreId = $this->db->last_insert_id(MAIN_DB_PREFIX . 'doli2shop_stores');
@@ -169,6 +225,44 @@ class StoreService
         }
 
         return (int) $dolibarrStoreId;
+    }
+
+    /**
+     * Détecte si la DERNIÈRE requête exécutée sur `$this->db` a échoué sur l'index unique
+     * `uk_doli2shop_stores_default_key` (story doublon-is-default-boutiques-non-empeche) —
+     * errno MySQL/MariaDB 1062 (clé dupliquée) ET message mentionnant précisément ce nom
+     * d'index, jamais un 1062 générique qui pourrait provenir d'un tout autre index (ex.
+     * `uk_doli2shop_stores_domain`, sur un doublon de `shop_domain` — cas différent, jamais
+     * traité comme une race sur `is_default`).
+     *
+     * @return bool
+     * @since  2.6.0
+     */
+    private function isDuplicateDefaultKeyError(): bool
+    {
+        if ((int) $this->db->lasterrno() !== 1062) {
+            return false;
+        }
+        return stripos((string) $this->db->lasterror(), 'default_key') !== false;
+    }
+
+    /**
+     * Indique si le DERNIER appel à create() a dû retenter la création en boutique SECONDAIRE
+     * suite à une race TOCTOU sur l'index unique uk_doli2shop_stores_default_key (finding 1,
+     * review 3 couches 2026-09-26, story doublon-is-default-boutiques-non-empeche).
+     *
+     * Permet à l'appelant de distinguer, SANS relecture, le cas où create() a inséré la ligne
+     * avec is_default=1 du PREMIER coup (aucune race : la cible EST par défaut avec certitude) du
+     * cas où une race a été détectée et gérée en interne (seul cas où une relecture apporte une
+     * information supplémentaire — cf. admin/oauth_receive.php, qui ne relit plus qu'après un
+     * `true` ici, jamais systématiquement).
+     *
+     * @return bool
+     * @since  2.6.0
+     */
+    public function lastCreateWasDemotedByDefaultKeyRace(): bool
+    {
+        return $this->lastCreateDemotedByDefaultKeyRace;
     }
 
     /**
@@ -235,13 +329,33 @@ class StoreService
      *  - -1 : erreur SQL sur l'UPDATE.
      *  - -2 : boutique inexistante ou hors entité — détecté via `fetch()` AVANT l'UPDATE (qui
      *         n'est alors PAS exécuté). Distinct de 0 : ici la ligne n'existe pas du tout.
+     *  - -3 : promotion à boutique par défaut (`is_default => 1`) REFUSÉE par une race TOCTOU sur
+     *         l'index unique `uk_doli2shop_stores_default_key` (story
+     *         doublon-is-default-boutiques-non-empeche) — une AUTRE boutique est devenue défaut
+     *         entre-temps. Les AUTRES champs de `$data`, s'il y en avait, ont quand même été
+     *         appliqués (nouvelle tentative sans `is_default`) ; SEULE la promotion a échoué.
+     *         Aucun appelant actuel ne passe `is_default` à `update()` (cf. Validate 2026-09-23) :
+     *         cette sentinelle prépare un futur appelant (ex. action « promouvoir » d'admin/stores.php).
      *
-     * Tout appelant testant `< 0` traite déjà `-2` comme une erreur sans modification.
+     * Tout appelant testant `< 0` traite déjà `-2`/`-3` comme un échec sans modification COMPLÈTE
+     * (mais `-3` peut avoir appliqué les autres champs — un appelant qui en tient compte doit
+     * distinguer `-1`/`-2` de `-3` explicitement plutôt que se contenter de `< 0`).
+     *
+     * ⚠️ LOW (review 3 couches 2026-09-26) — ORDRE pour un futur appelant « promouvoir » : cette
+     * méthode ne démote JAMAIS elle-même une AUTRE boutique de la même entity. Un futur appelant
+     * qui voudrait faire passer la boutique par défaut de A à B DOIT démoter A (`update(A, ['is_default' => 0])`)
+     * AVANT de promouvoir B (`update(B, ['is_default' => 1])`), jamais l'inverse ni les deux en
+     * parallèle : tant que A porte encore `is_default=1`, promouvoir B viole l'index unique
+     * `uk_doli2shop_stores_default_key` (les deux produiraient le même `default_key = entity`) et
+     * la promotion de B échoue SYSTÉMATIQUEMENT en `-3` — pas une race occasionnelle, un échec
+     * garanti à chaque appel tant que l'ordre démotion-puis-promotion n'est pas respecté.
      *
      * @param  int   $dolibarrStoreId Rowid de la boutique à mettre à jour
      * @param  array $data            Données à modifier (seules les clés présentes sont mises à jour)
-     * @return int                    1 = modifié, 0 = no-op légitime, -1 = erreur SQL, -2 = inexistante/hors entité
+     * @return int                    1 = modifié, 0 = no-op légitime, -1 = erreur SQL,
+     *                                -2 = inexistante/hors entité, -3 = promotion défaut refusée (race)
      * @since  2.5.0 Sentinelle -2 ajoutée (Story 58-3) — contrat étendu, voir ci-dessus
+     * @since  2.6.0 Sentinelle -3 ajoutée (story doublon-is-default-boutiques-non-empeche)
      */
     public function update(int $dolibarrStoreId, array $data): int
     {
@@ -295,8 +409,12 @@ class StoreService
         if (array_key_exists('fk_categorie_proposal', $data)) {
             $setClauses[] = 'fk_categorie_proposal = ' . ($data['fk_categorie_proposal'] !== null ? (int) $data['fk_categorie_proposal'] : 'NULL');
         }
+        $isDefaultSetClause = null;
+        $isDefaultRequestedOn = false;
         if (isset($data['is_default'])) {
-            $setClauses[] = 'is_default = ' . (int) (bool) $data['is_default'];
+            $isDefaultRequestedOn = (int) (bool) $data['is_default'] === 1;
+            $isDefaultSetClause = 'is_default = ' . (int) (bool) $data['is_default'];
+            $setClauses[] = $isDefaultSetClause;
         }
         if (isset($data['active'])) {
             $setClauses[] = 'active = ' . (int) (bool) $data['active'];
@@ -346,6 +464,51 @@ class StoreService
 
         $result = $this->db->query($sql);
         if (!$result) {
+            // Story doublon-is-default-boutiques-non-empeche : même race TOCTOU que create()
+            // (cf. son commentaire) mais côté UPDATE — une promotion à défaut (is_default => 1)
+            // qui perd la course contre une autre boutique concurrente. Aucun appelant actuel ne
+            // passe is_default à update() (Validate 2026-09-23), mais on gère proprement ce cas
+            // dès maintenant plutôt que de laisser un futur appelant redécouvrir la race : les
+            // AUTRES champs sont réappliqués SANS la promotion, jamais un échec total qui perdrait
+            // des changements par ailleurs valides.
+            if ($isDefaultRequestedOn && $this->isDuplicateDefaultKeyError()) {
+                $this->log(
+                    'update() - Race TOCTOU détectée sur is_default=1 (rowid=' . $dolibarrStoreId
+                    . ', entity=' . (int) $this->entity . ') : une autre boutique est déjà devenue'
+                    . ' défaut entre-temps — promotion refusée',
+                    LOG_WARNING
+                );
+                $retrySetClauses = array_values(array_filter(
+                    $setClauses,
+                    function ($clause) use ($isDefaultSetClause) {
+                        return $clause !== $isDefaultSetClause;
+                    }
+                ));
+
+                if (empty($retrySetClauses)) {
+                    // is_default était le SEUL changement demandé : rien d'autre à retenter.
+                    $this->db->rollback();
+                    return -3;
+                }
+
+                $retrySql  = 'UPDATE ' . MAIN_DB_PREFIX . 'doli2shop_stores';
+                $retrySql .= ' SET ' . implode(', ', $retrySetClauses);
+                $retrySql .= ' WHERE rowid = ' . $dolibarrStoreId;
+                $retrySql .= ' AND entity = ' . (int) $this->entity;
+                $retryResult = $this->db->query($retrySql);
+
+                if ($retryResult) {
+                    // Commit direct ICI : les autres champs sont appliqués, la promotion ne l'est
+                    // PAS — ne JAMAIS traverser le bloc de purge d'overrides plus bas (MEDIUM-4),
+                    // qui suppose $data['is_default']==1 réellement écrit (déplacerait le défaut
+                    // au lieu de le supprimer, cf. mémoire projet).
+                    $this->db->commit();
+                    return -3;
+                }
+
+                // Le retry lui-même a échoué : traité comme une erreur SQL ordinaire ci-dessous.
+            }
+
             $this->db->rollback();
             $this->log('update() - Erreur UPDATE rowid=' . $dolibarrStoreId . ': ' . $this->db->lasterror(), LOG_ERR);
             return -1;
@@ -454,6 +617,32 @@ class StoreService
     /**
      * Retourne la boutique par défaut de l'entité (is_default=1).
      *
+     * Story `doublon-is-default-boutiques-non-empeche` (AC3) : la migration
+     * `update_2.6.0_2.6.0b.sql` (index unique `uk_doli2shop_stores_default_key`) empêche
+     * désormais qu'une entity porte deux lignes `is_default=1` — mais reste une défense en
+     * profondeur pour une installation restée en état incohérent AVANT cette migration. Une
+     * seule requête, SANS `LIMIT 1` (il faut pouvoir compter les lignes réellement présentes) ;
+     * si plus d'une ligne existe, l'anomalie est journalisée et la boutique au `rowid` le plus
+     * petit est retournée (comportement inchangé pour l'appelant).
+     *
+     * ⚠️ Finding 3 (review 3 couches 2026-09-26) : pourquoi `MIN(rowid)` suffit ICI et n'a PAS
+     * été aligné sur la règle de départage « shop_domain == constante DOLI2SHOP_STORE_HOSTNAME »
+     * qu'applique désormais `update_2.6.0_2.6.0b.sql` — plutôt que de dupliquer cette même
+     * requête `llx_const` dans ce chemin de lecture appelé à CHAQUE requête (contrairement à la
+     * migration, exécutée une seule fois) :
+     * - Après application de la migration, l'index unique garantit qu'il ne peut plus JAMAIS y
+     *   avoir plus d'une ligne `is_default=1` par entity pour une écriture normale (`create()`/
+     *   `update()` gèrent déjà la race sur cet index) — la branche `$rowCount > 1` ci-dessous
+     *   n'est donc plus atteignable en fonctionnement normal APRÈS migration.
+     * - Elle ne reste atteignable que sur une installation dont `update_2.6.0_2.6.0b.sql` n'a PAS
+     *   encore tourné (mise à jour de fichiers sans réactivation du module) — un état transitoire
+     *   qui se résout de lui-même dès la prochaine activation, et qui est de toute façon DÉJÀ
+     *   celui qui existait avant cette story (aucune régression : `MIN(rowid)` est exactement le
+     *   tie-break historique de `getDefault()`, inchangé sur ce cas précis).
+     * - `getDefault()` alarme déjà l'admin (`LOG_WARNING`) dans ce cas : la story ne laisse donc
+     *   jamais ce cas silencieux, elle documente seulement pourquoi le choix précis de LAQUELLE
+     *   des deux lignes est retournée n'a pas besoin d'imiter la préférence de la migration.
+     *
      * @return object|null Objet boutique par défaut, ou null si aucune
      */
     public function getDefault(): ?object
@@ -465,12 +654,25 @@ class StoreService
         $sql .= ' FROM ' . MAIN_DB_PREFIX . 'doli2shop_stores';
         $sql .= ' WHERE entity = ' . (int) $this->entity;
         $sql .= ' AND is_default = 1';
-        $sql .= ' ORDER BY rowid ASC LIMIT 1';
+        $sql .= ' ORDER BY rowid ASC';
 
         $result = $this->db->query($sql);
         if (!$result) {
             $this->log('getDefault() - Erreur requête: ' . $this->db->lasterror(), LOG_ERR);
             return null;
+        }
+
+        // AC3 : détection défensive du doublon — num_rows() sur le résultat COMPLET (pas de
+        // LIMIT ci-dessus), avant le fetch_object() qui suit et qui ne consomme que la 1ère ligne.
+        $rowCount = (int) $this->db->num_rows($result);
+        if ($rowCount > 1) {
+            $this->log(
+                'getDefault() - ANOMALIE : ' . $rowCount . ' lignes is_default=1 pour entity='
+                . $this->entity . ' (la contrainte unique uk_doli2shop_stores_default_key aurait dû'
+                . ' l\'empêcher — installation non migrée, ou état antérieur à la migration'
+                . ' update_2.6.0_2.6.0b.sql) — retour de la boutique au rowid le plus petit',
+                LOG_WARNING
+            );
         }
 
         $row = $this->db->fetch_object($result);
@@ -786,6 +988,24 @@ class StoreService
 
         $dolibarrStoreId = $this->create($data);
         if ($dolibarrStoreId <= 0) {
+            // Story doublon-is-default-boutiques-non-empeche (Validate 2026-09-23, point 3) :
+            // countStores()===0 puis create() n'est PAS atomique — une AUTRE requête concurrente
+            // déclenchant elle aussi l'init du module sur la MÊME entity (double chargement de
+            // page, cron + admin en parallèle) peut avoir créé la boutique par défaut entre notre
+            // countStores() et notre create() (l'INSERT échoue alors sur shop_domain identique —
+            // uk_doli2shop_stores_domain — ou, plus rarement selon l'ordre de vérification
+            // MySQL/MariaDB, sur is_default identique — uk_doli2shop_stores_default_key). Ce n'est
+            // PAS un échec réel : on relit l'état AVANT d'alarmer, au lieu de faire confiance à ce
+            // seul retour.
+            if ($this->countStores() > 0) {
+                $this->log(
+                    'ensureDefaultStore() - Race TOCTOU détectée (entity=' . $this->entity . ') :'
+                    . ' une autre requête concurrente a déjà créé la boutique par défaut entre-temps'
+                    . ' — no-op',
+                    LOG_INFO
+                );
+                return 0;
+            }
             $this->log('ensureDefaultStore() - Échec création boutique par défaut (entity=' . $this->entity . ')', LOG_ERR);
             return -1;
         }

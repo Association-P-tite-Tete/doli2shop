@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.2.1
  * @link        https://doli2shop.ptitetete.org
  */
@@ -77,7 +77,11 @@ class AlertManager
         $this->alertEmail = getDolGlobalString('DOLI2SHOP_ALERT_EMAIL', '');
         $this->threshold = getDolGlobalInt('DOLI2SHOP_ALERT_THRESHOLD', 3);
 
-        $typesStr = getDolGlobalString('DOLI2SHOP_ALERT_TYPES', 'webhook,health');
+        // Story 63-11 (AC5) : 'license' ajouté aux types par défaut — réutilise le pipeline
+        // d'alerte existant (throttle par type, cron déjà planifié) pour rendre visibles des
+        // échecs répétés de validation licence, sans nouveau canal ni nouvelle configuration
+        // pour un admin ayant déjà activé les alertes proactives.
+        $typesStr = getDolGlobalString('DOLI2SHOP_ALERT_TYPES', 'webhook,health,license');
         $this->alertTypes = array_map('trim', explode(',', $typesStr));
     }
 
@@ -183,9 +187,69 @@ class AlertManager
             }
         }
 
+        // Vérification échecs répétés de validation licence (Story 63-11, AC5)
+        if ($this->isAlertEnabled('license')) {
+            $result['checked']++;
+            if (!$this->canSendAlert('license')) {
+                $this->log("AlertManager::checkAndAlert - Cooldown license actif, alerte supprimée", LOG_DEBUG);
+                $result['throttled'] = true;
+            } else {
+                $licenseFailure = $this->checkLicenseValidationFailures();
+                if (!empty($licenseFailure)) {
+                    $sent = $this->sendAlert('license', $licenseFailure);
+                    if ($sent) {
+                        $result['alerts_sent']++;
+                    }
+                }
+            }
+        }
+
         $this->log("AlertManager::checkAndAlert - Vérifié: " . $result['checked'] . " types, Alertes envoyées: " . $result['alerts_sent'], LOG_INFO);
 
         return $result;
+    }
+
+    /**
+     * Détecte des échecs consécutifs de validation licence (Story 63-11, AC5).
+     *
+     * Réutilise le compteur déjà tenu par SupportManager::validateDualChannel() pour son repli
+     * progressif (AC3) — aucune nouvelle donnée, aucun nouveau canal : seulement une lecture
+     * de plus dans le pipeline d'alerte existant (même seuil DOLI2SHOP_ALERT_THRESHOLD que les
+     * vérifications webhook/health).
+     *
+     * @return array|null Données d'alerte, ou null si sous le seuil configuré
+     */
+    public function checkLicenseValidationFailures()
+    {
+        require_once dirname(__FILE__) . '/supportmanager.class.php';
+
+        try {
+            $supportManager = new SupportManager($this->db);
+            $summary = $supportManager->getDualChannelFailureSummary();
+        } catch (\Throwable $e) {
+            $this->log("AlertManager::checkLicenseValidationFailures - Exception: " . $e->getMessage(), LOG_ERR);
+            return null;
+        }
+
+        $failureCount = isset($summary['failure_count']) ? (int) $summary['failure_count'] : 0;
+
+        // ⚠️ HIGH de la revue 3 couches du 29/08 : le test `>=` seul suffisait quand le seuil
+        // vaut 0 — `0 >= 0` est vrai, donc une alerte « 0 échec consécutif » partait à CHAQUE
+        // exécution du CRON, sur une installation parfaitement saine. Un seuil à 0 est une
+        // saisie plausible (un administrateur qui croit désactiver le seuil). La garde
+        // `$failureCount > 0` rend l'alerte impossible sans échec réel, quel que soit le seuil.
+        if ($failureCount > 0 && $failureCount >= $this->threshold) {
+            $this->log(
+                "AlertManager::checkLicenseValidationFailures - {$failureCount} échecs consécutifs détectés (seuil: {$this->threshold})",
+                LOG_WARNING
+            );
+            return [
+                'failure_count' => $failureCount,
+                'last_result' => $summary['last_result'] ?? null,
+            ];
+        }
+
+        return null;
     }
 
     /**
@@ -329,6 +393,8 @@ class AlertManager
                 return '[Doli2Shop] ' . $langs->trans('AlertEmailSubjectWebhook', $store, $data['error_count'] ?? 0);
             case 'health':
                 return '[Doli2Shop] ' . $langs->trans('AlertEmailSubjectHealth', $store);
+            case 'license':
+                return '[Doli2Shop] ' . $langs->trans('AlertEmailSubjectLicense', $store, $data['failure_count'] ?? 0);
             default:
                 return '[Doli2Shop] ' . $langs->trans('AlertEmailSubjectGeneric', $store);
         }
@@ -374,6 +440,15 @@ class AlertManager
             $html .= '<td style="padding: 8px; border-bottom: 1px solid #eee; color: #e74c3c; font-weight: bold;">' . ((int) ($data['errors_24h'] ?? 0)) . ' ' . $langs->trans('AlertErrors24h') . '</td></tr>';
             $html .= '<tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>' . $langs->trans('AlertWebhooksActive') . '</strong></td>';
             $html .= '<td style="padding: 8px; border-bottom: 1px solid #eee;">' . ((int) ($data['webhooks_active'] ?? 0)) . '/' . ((int) ($data['webhooks_total'] ?? 0)) . '</td></tr>';
+        } elseif ($type === 'license') {
+            $html .= '<tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>' . $langs->trans('AlertType') . '</strong></td>';
+            $html .= '<td style="padding: 8px; border-bottom: 1px solid #eee;">' . $langs->trans('AlertTypeLicense') . '</td></tr>';
+            $html .= '<tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>' . $langs->trans('AlertErrorCount') . '</strong></td>';
+            $html .= '<td style="padding: 8px; border-bottom: 1px solid #eee; color: #e74c3c; font-weight: bold;">' . ((int) ($data['failure_count'] ?? 0)) . '</td></tr>';
+            if (!empty($data['last_result']['status'])) {
+                $html .= '<tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>' . $langs->trans('AlertLatestError') . '</strong></td>';
+                $html .= '<td style="padding: 8px; border-bottom: 1px solid #eee;"><code>' . htmlspecialchars($data['last_result']['status'], ENT_QUOTES, 'UTF-8') . '</code></td></tr>';
+            }
         }
 
         $html .= '</table>';

@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.0.26
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -849,7 +849,9 @@ class ShopifyDiagnostic
             $shopDomain .= '.myshopify.com';
         }
 
-        $apiUrl = 'https://doli2shop.ptitetete.org/api/billing.php?action=get-license-by-shop&shop_domain=' . urlencode($shopDomain);
+        // Review 3 couches 27/09 (finding HIGH n°1) : URL de production rendue surchargeable —
+        // point de résolution unique, cf. doli2shopGetBillingApiEndpoint() (lib/doli2shop.lib.php).
+        $apiUrl = doli2shopGetBillingApiEndpoint() . '?action=get-license-by-shop&shop_domain=' . urlencode($shopDomain);
 
         dol_syslog("ShopifyDiagnostic::checkSupportByShopDomain - Appel API: " . $apiUrl, LOG_DEBUG);
 
@@ -3299,13 +3301,10 @@ if (isShopifyModuleEnabled($conf)) {
 
     $report['configuration'] = $fullConfigFormatted;
 
-    // Masquage des credentials sensibles pour sécurité de l'export (v2.1.8 — Story 1.2)
-    $sensitiveKeys = array('shopify_access_token', 'shopify_api_key', 'shopify_api_secret_key', 'dolibarr_api_key');
-    foreach ($sensitiveKeys as $key) {
-        if (!empty($report['configuration'][$key])) {
-            $report['configuration'][$key] = maskSensitiveValue($report['configuration'][$key]);
-        }
-    }
+    // Story fix-export-diagnostic-secrets (CRITICAL) : plus de masquage ici, sur une liste figée de
+    // clés (v2.1.8 — Story 1.2, qui ne couvrait pas shopify_refresh_token, sorti EN CLAIR) —
+    // doli2shopRedactSensitiveConfig() masque TOUT le rapport (donc aussi cette section) par motif
+    // de nom de clé, juste avant l'export JSON ci-dessous.
 }
 
 // CORRECTION v2.0.31: Nettoyage des entités HTML pour export JSON
@@ -3318,39 +3317,56 @@ function cleanHtmlEntitiesForJson($data) {
     return $data;
 }
 
-/**
- * Masque une valeur sensible pour l'export JSON
- *
- * Format: first4****last4 si >= 12 chars, **** sinon
- *
- * @param  mixed $value Valeur à masquer
- * @return mixed Valeur masquée (string masqué, ou valeur inchangée si vide/non-string)
- */
-function maskSensitiveValue($value)
-{
-    if (empty($value) || !is_string($value)) {
-        return $value;
-    }
-    if (strlen($value) >= 12) {
-        return substr($value, 0, 4) . '****' . substr($value, -4);
-    }
-    return '****';
-}
+// Story fix-export-diagnostic-secrets (CRITICAL) : l'ancienne maskSensitiveValue() ci-dessus
+// (substr($value, 0, 4) . '****' . substr($value, -4)) exposait 8 des caractères du secret, et
+// n'était appelée que sur 4 clés figées — `shopify_refresh_token` en sortait EN CLAIR. Remplacée
+// par doli2shopRedactSensitiveConfig() (lib/doli2shop.lib.php), masquage intégral par MOTIF de nom
+// de clé, appliquée à TOUT le rapport juste avant l'export (voir plus bas).
 
 // Ajouter le mode licence détecté au rapport JSON (v2.1.8 — Story 1.3)
 $report['licence_mode'] = $diagnostic->getLicenceMode();
 
 // CORRECTION v2.0.28: Gestion de l'export JSON si demandé (après construction complète du rapport)
 if ($format === 'json') {
-    // Nettoyer toutes les entités HTML pour un JSON propre
-    $cleanReport = cleanHtmlEntitiesForJson($report);
-    
-    $filename = 'diagnostic_shopify_' . date('Y-m-d_H-i-s') . '.json';
-    header('Content-Type: application/json; charset=utf-8');
-    header('Content-Disposition: attachment; filename="' . $filename . '"');
-    header('Cache-Control: no-cache, must-revalidate');
-    header('Expires: Sat, 26 Jul 1997 05:00:00 GMT');
-    echo json_encode($cleanReport, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    // Re-review 3 couches (MEDIUM) : le masquage et l'export sont désormais entourés d'un
+    // try/catch(\Throwable) — si le masquage échoue pour une raison quelconque, l'export renvoie
+    // une erreur JSON générique, SANS jamais sortir le rapport non masqué, et journalise l'incident.
+    try {
+        // Nettoyer toutes les entités HTML pour un JSON propre
+        // Story fix-export-diagnostic-secrets (CRITICAL) : masquage de TOUT le rapport (pas
+        // seulement $report['configuration']) juste avant l'export — couvre aussi le numéro de
+        // série de licence porté par les checks 'support' (addCheck()), où qu'il apparaisse dans
+        // l'arborescence.
+        // Story export-diagnostic-detection-hex-elargie (constat 3, LOW) : masquage + encodage
+        // factorisés dans doli2shopBuildRedactedJsonExport() (JSON_THROW_ON_ERROR inclus, lève
+        // désormais une \JsonException interceptée ci-dessous plutôt que de renvoyer `false` en
+        // silence sur une chaîne UTF-8 invalide).
+        $jsonExport = doli2shopBuildRedactedJsonExport(cleanHtmlEntitiesForJson($report));
+
+        $filename = 'diagnostic_shopify_' . date('Y-m-d_H-i-s') . '.json';
+        header('Content-Type: application/json; charset=utf-8');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Cache-Control: no-cache, must-revalidate');
+        header('Expires: Sat, 26 Jul 1997 05:00:00 GMT');
+        echo $jsonExport;
+    } catch (\Throwable $e) {
+        dol_syslog(
+            'diagnostic.php: échec du masquage/export du diagnostic JSON — export refusé pour ne'
+            . ' jamais risquer de sortir le rapport non masqué : ' . $e->getMessage(),
+            LOG_ERR
+        );
+        if (!headers_sent()) {
+            header('Content-Type: application/json; charset=utf-8');
+        }
+        // Story export-diagnostic-detection-hex-elargie (constat 3, LOW) : http_response_code()
+        // n'émet aucun avertissement après envoi des en-têtes (contrairement à header()), impact
+        // réel négligeable — gardé sous headers_sent() par cohérence avec le header() ci-dessus,
+        // défensif plutôt que correctif d'un défaut observable.
+        if (!headers_sent()) {
+            http_response_code(500);
+        }
+        echo json_encode(array('error' => 'export_failed'));
+    }
     exit;
 }
 

@@ -36,7 +36,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.1.2
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org

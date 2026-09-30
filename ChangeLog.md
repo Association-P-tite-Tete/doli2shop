@@ -1,5 +1,1316 @@
 # CHANGELOG SHOPIFY INTEGRATION FOR DOLIBARR ERP CRM
 
+## 2.6.0 — 29 septembre 2026 : SYNTHÈSE — LE MODULE TIENT SON JOURNAL, LA CONNEXION SHOPIFY SE VÉRIFIE MIEUX
+
+> **Résumé de la version 2.6.0, pensé pour une lecture rapide.** Le détail complet, story par
+> story — module et site confondus — reste dans les entrées ci-dessous ; cette synthèse ne les
+> remplace pas, elle en tire ce qui est visible ou utile pour vous.
+
+### Ce qui change pour vous
+
+- **Le module tient enfin son propre journal.** Chaque cycle de synchronisation est tracé — durée,
+  produits traités, erreurs, images — avec sa provenance (tâche planifiée, écran, webhook, API) et
+  une ligne écrite **au démarrage**, avant tout travail : c'est ce qui permet de distinguer « rien à
+  faire » de « ça ne tourne plus ». Un bouton **« Télécharger le journal (CSV) »** vous permet de le
+  joindre à une demande de support à la place d'un fichier de plusieurs centaines de méga-octets.
+  Aucune donnée personnelle de vos clients n'y figure.
+- **Vos photos produits ne disparaissent plus pendant l'envoi.** Jusqu'ici, un incident au milieu
+  d'une synchronisation (quota Shopify, coupure réseau, fichier illisible) pouvait laisser un produit
+  sans aucune image le temps de la prochaine tentative. Les nouvelles photos sont désormais envoyées
+  et confirmées par Shopify **avant** que les anciennes ne soient retirées.
+- **Connexion Shopify plus sûre : une page de confirmation, une seule fois.** À votre prochaine
+  reconnexion (bouton « Connecter »/« Reconnecter »), une page affichera l'adresse de votre Dolibarr
+  et demandera confirmation avant toute transmission — si l'adresse n'est pas la vôtre ou que vous
+  n'êtes pas à l'origine de la reconnexion, cliquez sur Annuler et contactez le support. Les
+  reconnexions suivantes depuis la même adresse redeviennent silencieuses, comme avant.
+- **Sécurité renforcée sur plusieurs écrans**, suite à un audit interne : vos identifiants Shopify
+  (jeton, clés API) ne s'affichent plus jamais en clair dans l'onglet Réglages ; l'export de
+  diagnostic (celui que vous envoyez au support) masque désormais tout champ qui ressemble à un
+  identifiant ou un secret, quel que soit son nom ; une licence peut désormais être révoquée
+  proprement en cas de besoin.
+- **Un jeton Shopify révoqué ou expiré est maintenant signalé comme une erreur**, et non plus affiché
+  comme « aucun produit à synchroniser » — un cas qui deviendra plus fréquent quand Shopify
+  invalidera les jetons OAuth non expirables (1ᵉʳ janvier 2027).
+- **Un article jamais activé à un emplacement Shopify n'est plus retenté à l'infini** à chaque cycle :
+  passé quelques tentatives, il repasse à un rythme très espacé (réglable) le temps qu'une action
+  manuelle soit faite côté Shopify, avec un compteur dédié visible à l'écran.
+- **Panne rare de doublon corrigée** : un produit synchronisé au même instant par deux déclencheurs
+  (webhook et cycle de stock, par exemple) ne peut plus se dupliquer dans la table de correspondance
+  interne Dolibarr ↔ Shopify.
+- **Client avec un préfixe de table de base de données personnalisé (`≠ llx_`)** : les migrations
+  SQL du module s'appliquent désormais correctement — un défaut qui bloquait la mise à jour du
+  schéma sans ce correctif (dossier support Europe Loisirs).
+
+### À faire par vous après la mise à jour
+
+1. **Rien d'obligatoire pour que la synchronisation continue de fonctionner** : toutes les
+   migrations s'appliquent automatiquement à l'activation du module, rétrocompatible dans tous les
+   cas normaux.
+2. **À votre prochaine reconnexion Shopify, une page de confirmation de domaine s'affichera une
+   fois** (voir ci-dessus) — vérifiez l'adresse affichée et confirmez.
+3. **Si vous avez déjà transmis un export de diagnostic (JSON) au support avant cette version** :
+   reconnectez votre boutique depuis l'onglet Licence (cela renouvelle automatiquement l'identifiant
+   concerné), et signalez-nous si ce fichier a transité par un canal que vous ne maîtrisez pas.
+4. **En cas de souci de synchronisation**, ouvrez le nouvel écran de journal et téléchargez le CSV
+   avant de nous écrire — cela remplace un envoi de `dolibarr.log` complet.
+
+## MODULE 2.6.0 — DÉTAIL COMPLET : CHAQUE CYCLE DE SYNCHRONISATION LAISSE SA TRACE
+
+> Ce détail story par story n'est pas embarqué dans le paquet d'installation (garde-fou de
+> taille) — il reste consultable ici et sur https://doli2shop.ptitetete.org/changelog. Le paquet
+> embarque la synthèse ci-dessus.
+
+> **Une version dédiée à une seule chose : savoir ce que le module a fait, et quand.**
+>
+> Elle ne change aucun comportement de synchronisation. Elle répond à une question qui, jusqu'ici,
+> demandait plusieurs allers-retours par courriel et la lecture d'un fichier de plusieurs centaines
+> de méga-octets : **« est-ce que ça a tourné ? »**
+
+### 🔴 Un produit ne peut plus se retrouver sans AUCUNE photo pendant l'envoi
+
+À chaque synchronisation, le module recalculait toutes les photos d'un produit en supprimant
+**d'abord** les images déjà présentes sur Shopify, puis en envoyant les nouvelles. Entre les deux,
+le produit n'avait **plus aucune image** : si le moindre incident survenait pendant l'envoi (nom de
+fichier refusé, quota Shopify, coupure réseau, fichier illisible), le produit restait sans photo, et
+chaque nouvelle tentative recommençait par une nouvelle suppression. C'est exactement ce qui s'est
+produit en production le 19/09/2026 : un client a vu le catalogue d'un produit repartir sans aucune
+image, trois tentatives de suite.
+
+**Ce qui change.** Les nouvelles photos sont désormais envoyées et vérifiées **avant** que les
+anciennes ne soient retirées — jamais l'inverse. Si l'envoi échoue, en totalité ou en partie, **rien
+n'est supprimé** : vos photos actuelles restent en place sur Shopify, l'incident est journalisé de
+façon exploitable, et le module retentera automatiquement au cycle suivant. Une photo ajoutée à la
+main directement dans Shopify (au-delà de ce que Dolibarr fournit) n'est jamais supprimée par ce
+mécanisme non plus.
+
+**Renforcé après une seconde revue (27/09/2026), avant toute publication.** Deux points ont été
+durcis :
+- La « vérification » ci-dessus attend désormais la confirmation **réelle et définitive** de
+  Shopify, pas seulement sa réponse immédiate (qui peut annoncer un traitement encore en cours,
+  puis échouer quelques secondes plus tard sans que le module l'ait vu). Un traitement qui échoue
+  de cette façon différée est maintenant traité exactement comme un échec immédiat : rien n'est
+  supprimé, nouvelle tentative au cycle suivant.
+- La reconnaissance d'une photo « posée par le module » (celle qui a le droit d'être retirée lors
+  d'un remplacement) ne dépend plus de sa position dans la liste renvoyée par Shopify — une photo
+  ajoutée à la main et qui se retrouverait en tête de liste aurait pu, avant ce renfort, être
+  supprimée par erreur. Le module retient désormais, pour chaque photo qu'il crée, qu'elle est
+  la sienne ; une photo antérieure à ce suivi reste reconnue par ses caractéristiques habituelles.
+  Toute photo qui ne correspond à aucun de ces critères est conservée, quel qu'en soit le nombre.
+- Un échec de SUPPRESSION (rare, après un envoi par ailleurs réussi) est maintenant compté et
+  signalé séparément : au pire un doublon visible, jamais une perte de photo.
+
+**Une troisième revue (toujours le 27/09/2026) a resserré encore ce renfort**, avant toute
+publication :
+- La reconnaissance « photo posée par le module » ne se contente plus d'une simple ressemblance de
+  forme (« … - photo N sur M ») : elle exige désormais une correspondance EXACTE, complète, avec ce
+  que le module aurait réellement écrit pour CE produit et son nombre de photos ACTUEL. Une photo
+  ajoutée à la main qui reprendrait, par coïncidence, la forme d'un texte du module mais avec un
+  autre nom de produit n'est plus reconnue à tort.
+- La vérification du statut réel auprès de Shopify est maintenant certaine de porter sur les photos
+  concernées : un identifiant qui, par accident, ne reviendrait pas dans la réponse de Shopify est
+  traité comme « pas encore prêt », jamais comme « prêt » par défaut.
+- Un budget de temps global protège désormais chaque cycle de synchronisation : si la vérification
+  de plusieurs produits d'affilée prenait trop de temps cumulé, les produits suivants du même cycle
+  ne sont plus interrogés à l'infini — ils sont traités avec la même prudence qu'un échec (rien
+  supprimé, nouvelle tentative au cycle suivant), pour ne jamais mettre en péril le reste de la
+  synchronisation du cycle.
+
+**Un dernier renfort (28/09/2026) referme la seule fenêtre restante.** Le budget de temps ci-dessus
+ne protégeait que la phase de VÉRIFICATION, pas l'envoi lui-même : un produit malchanceux, resté
+en fin de file de traitement à chaque cycle, pouvait voir de nouvelles photos envoyées à répétition
+sans que les précédentes ne soient jamais retirées — un doublon qui grossit à chaque tentative.
+Corrigé sur trois plans : un envoi n'est plus déclenché du tout si le budget du cycle est déjà
+consommé ; un produit ainsi reporté est désormais traité en PRIORITÉ dès le cycle suivant, pour ne
+jamais rester bloqué en fin de file ; et si un envoi précédent, resté sans confirmation, est
+désormais confirmé (ou au contraire définitivement rejeté par Shopify) au moment d'un nouveau
+cycle, le module s'en sert directement au lieu d'en renvoyer un troisième.
+
+**Un correctif complémentaire (28/09/2026)** referme un dernier cas où la priorité accordée à un
+produit reporté (paragraphe ci-dessus) restait posée plus longtemps que nécessaire : un produit
+rattrapé dès le cycle suivant, mais dont les photos se révélaient déjà à jour ou absentes côté
+Dolibarr, gardait sa priorité indéfiniment au lieu d'être remis dans le rang normal. Sans
+conséquence sur les photos elles-mêmes — uniquement sur l'ORDRE de traitement des produits d'un
+cycle à l'autre.
+
+**Un second correctif (28/09/2026, même journée)** corrige un défaut plus sérieux touchant CE
+MÊME mécanisme de priorité, découvert avant toute publication : pour un produit à déclinaisons
+(couleur, taille…) — la majorité d'un catalogue — la priorité n'était en réalité jamais prise en
+compte par le cycle suivant. Un produit ainsi reporté restait, dans les faits, en fin de file
+comme avant ce mécanisme. Toujours sans conséquence sur les photos elles-mêmes : uniquement sur
+l'ordre de traitement, et le correctif s'applique automatiquement à chaque synchronisation.
+
+Aucune action requise : ce changement s'applique automatiquement à chaque synchronisation.
+
+### 🔎 Pourquoi cette version existe
+
+Deux dossiers clients de septembre 2026 ont buté sur le même mur. Dans l'un d'eux, la synchronisation
+du stock ne partait plus ; la cause était que **les tâches planifiées de Dolibarr ne s'exécutaient
+pas du tout** — mais le module n'avait aucun moyen de le dire. Son écran de diagnostic annonçait
+chaque tâche comme « Actif », ce qui décrit sa **configuration**, pas son **exécution**. Le
+diagnostic a finalement été rendu par une capture d'écran de la liste des tâches planifiées de
+Dolibarr, où l'on voyait « 0 lancement ».
+
+Un module doit pouvoir répondre lui-même à cette question.
+
+### 📓 Un journal de cycle, consultable et téléchargeable
+
+- **Chaque cycle de synchronisation est tracé**, avec un identifiant qui rassemble toutes ses
+  lignes, sa **provenance** — tâche planifiée, écran, webhook, API — et son bilan : durée, produits
+  traités, erreurs, images sautées, images renvoyées, produits laissés sans photo.
+- **Une ligne est écrite au DÉMARRAGE**, avant tout travail. C'est le point essentiel, et celui qui
+  règle le cas ci-dessus : sans elle, un planificateur à l'arrêt et un planificateur qui tourne sans
+  rien avoir à faire laissent exactement la même absence de trace. Avec elle, « dernier cycle
+  planifié : il y a quatre jours » devient une réponse, pas une déduction.
+- **La distinction entre automatique et manuel est enregistrée.** Une synchronisation lancée à la
+  main et une synchronisation planifiée ne se confondent plus — sans quoi un client qui relance
+  manuellement masque, sans le savoir, le fait que rien ne tourne tout seul.
+
+### 📥 Un bouton pour nous l'envoyer
+
+L'écran du journal porte désormais un bouton **« Télécharger le journal (CSV) »**. En cas de
+problème, vous téléchargez et vous joignez le fichier à votre message : le diagnostic commence sur
+des faits, au lieu d'une série de questions.
+
+Le fichier est volontairement **borné** et contient **exactement ce qui est affiché à l'écran** — ni
+plus, ni moins. Aucun contenu de commande, aucune donnée personnelle de vos clients n'y figure :
+le journal enregistre des identifiants, des compteurs et des résultats, pas le détail des échanges
+avec Shopify.
+
+### 🛠️ Ce que cela change pour le support
+
+Concrètement, une demande d'assistance qui commençait par « pouvez-vous m'envoyer vos journaux ? »
+— avec un fichier souvent trop volumineux pour être transmis — commence maintenant par un fichier de
+quelques dizaines de kilo-octets qui dit ce qui s'est passé, quand, et par quel chemin.
+
+### 🔧 Sous le capot, pour les administrateurs
+
+- Le journal s'écrit sur une **connexion séparée** à la base : sa trace subsiste même lorsque
+  l'opération qu'elle décrit échoue et annule ses propres écritures. Autrement dit, **l'échec le
+  plus intéressant est justement celui qui laisse une trace**.
+- Le journal ne peut jamais faire échouer ce qu'il observe : en cas de problème d'écriture, il
+  renonce silencieusement plutôt que d'interrompre une synchronisation.
+- La durée de conservation reste réglable, et la purge existante est inchangée.
+
+### 📦 Cette version rattrape aussi des travaux restés de côté
+
+La branche de développement 2.6.0 portait dix lots de travaux antérieurs qui n'avaient jamais été
+publiés, désormais intégrés : durcissement de la récupération de connexion Shopify, correction du
+plafond de tentatives de liaison de licence, bornage de la revalidation de licence et visibilité de
+son échec, et retrait de données personnelles des journaux applicatifs du site.
+
+Le mécanisme de liaison d'une licence à une boutique (site web) a par ailleurs reçu un
+**renforcement de sécurité supplémentaire** : la protection anti-abus posée lors d'un précédent
+correctif a été étendue pour rester efficace même face à un usage plus insistant, et un point
+d'entrée du site devenu inutile (redondant avec le point d'entrée officiel utilisé par le module) a
+été fermé. Aucune action requise côté module — ces changements sont entièrement côté site et
+n'affectent pas l'activation normale d'une licence.
+
+### 🔴 Un jeton Shopify révoqué s'affichait comme « aucun produit à synchroniser »
+
+Signalé par un audit interne : l'écran de synchronisation manuelle des produits interroge Shopify
+pour compter les produits **avant** de commencer un cycle. Quand le jeton d'accès Shopify était
+révoqué ou expiré, ce comptage échouait silencieusement — et l'écran affichait quand même « aucun
+produit à synchroniser, synchronisation terminée », exactement le message d'un catalogue réellement
+vide. Rien ne permettait de distinguer les deux à l'écran.
+
+**Ce qui change.** Cette réponse Shopify en échec est désormais reconnue avant le comptage et
+affichée comme une erreur exploitable — jamais comme un succès à zéro produit. Un catalogue
+réellement vide continue d'afficher « aucun produit à synchroniser » exactement comme avant : ce
+correctif ne change rien au cas normal.
+
+Même logique pour l'import des produits depuis Shopify : si la réponse de Shopify ne contient pas la
+liste de produits attendue, le lot d'import échoue désormais avec un message d'erreur, au lieu de
+conclure « plus aucun produit à importer » et d'annoncer une synchronisation terminée.
+
+**Pourquoi maintenant.** Shopify rendra les jetons OAuth non expirables invalides à partir du
+1ᵉʳ janvier 2027 : sans ce correctif, ce mode de panne — aujourd'hui occasionnel (jeton révoqué à la
+main, ou expiration non rafraîchie) — serait devenu systématique à cette échéance pour toute
+installation non reconnectée.
+
+### 🧪 Trois erreurs qui seraient passées inaperçues sont maintenant détectées par les tests
+
+Aucun changement de comportement : cette entrée concerne nos contrôles automatiques. Trois
+régressions graves, si elles étaient introduites un jour, laissaient jusqu'ici la suite de tests au
+vert : une **TVA de facture forcée à zéro**, une **annulation Shopify traitée comme une création de
+commande**, et une requête de nettoyage qui, sans son filtre, **effacerait la correspondance
+Shopify de tout le catalogue** au lieu d'un seul produit. Chacune est désormais vérifiée sur la
+valeur réellement transmise, et nous avons prouvé que les tests échouent quand on réintroduit
+l'erreur, y compris sous une forme détournée. Même traitement pour les expéditions (numéro de
+suivi, quantités, expédition partielle) et pour les commandes déjà annulées.
+
+### 🔐 Connexion Shopify : moins de données sensibles dans l'adresse de redirection, et une vérification d'appartenance avant toute transmission
+
+Lors de la connexion d'une boutique, le serveur intermédiaire (« proxy ») qui relie Shopify à votre
+module transmettait jusqu'ici les informations de connexion **directement dans l'adresse de la page
+de retour**, comme n'importe quel paramètre visible dans la barre d'adresse. Un module à jour
+demande désormais au proxy de **conserver ces informations de son côté**, le temps d'un aller-retour
+serveur à serveur : l'adresse de retour ne porte plus qu'un identifiant à usage unique, valable
+quelques minutes et jamais réutilisable. **Aucune action requise** : ce mécanisme est rétrocompatible
+et invisible pour toute boutique déjà connectée.
+
+**Nouveau, ce cycle** : le proxy vérifie désormais que l'adresse de votre instance Dolibarr est bien
+connue pour votre boutique avant toute transmission. Si ce n'est pas encore le cas — une toute
+première connexion, un changement d'adresse Dolibarr, ou une reconnexion dont l'adresse n'avait
+encore jamais été validée explicitement — une page de confirmation s'affiche avant que quoi que ce
+soit ne soit transmis, avec l'adresse concernée bien lisible et un bouton Annuler. Une fois
+confirmée, l'adresse est mémorisée : les reconnexions suivantes depuis cette même adresse ne
+redemandent plus rien.
+
+**À savoir** : cette vérification s'appuie sur un nouveau registre, séparé de vos réglages de
+licence — elle ne modifie ni ne consulte votre quota de domaines. Une conséquence directe et
+attendue : **si votre boutique est déjà connectée, votre toute prochaine reconnexion affichera
+cette page de confirmation une seule fois**, le temps de constituer ce registre ; les
+reconnexions suivantes depuis la même adresse redeviennent ensuite silencieuses, comme avant.
+Ce n'est pas une régression — c'est la vérification elle-même qui se met en place. Si l'adresse
+affichée n'est pas la vôtre, ou si vous n'êtes pas à l'origine de cette reconnexion, cliquez sur
+Annuler et contactez le support.
+
+### 🔴 L'export de diagnostic ne contient plus aucun identifiant de connexion en clair
+
+Signalé par un audit interne : le bouton **« Exporter diagnostic (JSON) »** de l'onglet Santé —
+précisément le fichier qu'on vous demande d'envoyer au support en cas de problème — copiait toute
+votre configuration et ne masquait qu'une petite liste de champs. Un identifiant de connexion
+utilisé pour le renouvellement automatique de l'accès à votre boutique en sortait **en clair**.
+
+**Ce qui change.** Le masquage ne repose plus sur une liste : tout champ dont le nom évoque un
+identifiant de connexion, un mot de passe ou une clé secrète est désormais masqué intégralement,
+quel que soit son nom exact — y compris un futur champ qui n'existe pas encore aujourd'hui. Votre
+numéro de série de licence, lui, reste partiellement lisible (ex. `SI-2026-****-1234`) : assez pour
+que le support l'identifie, jamais assez pour l'exposer en entier. **Aucune action requise** : le
+fichier exporté est simplement plus sûr qu'avant, sa structure ne change pas.
+
+**Si vous avez déjà envoyé un export de diagnostic au support avant cette version** (par courriel,
+pièce jointe ou tout autre moyen), nous vous recommandons de reconnecter votre boutique depuis
+l'onglet Licence — cela renouvelle automatiquement l'identifiant concerné — puis, si le fichier a
+transité par un canal que vous ne maîtrisez pas, de nous en informer pour que nous puissions vous
+accompagner.
+
+### 🔴 L'écran de configuration affichait vos identifiants Shopify en clair
+
+Signalé par un audit interne : l'onglet **Réglages** de la configuration du module affichait la
+valeur réelle de votre jeton d'accès, votre clé API et votre clé secrète API Shopify — que la
+boutique soit connectée par OAuth (dans une partie invisible mais toujours présente dans le code
+source envoyé à votre navigateur) ou configurée manuellement (affichée en toutes lettres à l'écran).
+
+**Ce qui change.** Ces 3 champs affichent désormais uniquement un statut — **Configuré** / **Non
+configuré** — jamais la valeur elle-même, quel que soit le mode de connexion. Le champ de saisie
+reste présent mais vide par défaut, avec une aide « laisser vide pour conserver la valeur
+actuelle » : une valeur saisie remplace celle en base, un champ laissé vide ne la touche pas.
+**Aucune action requise** : vos identifiants déjà enregistrés restent inchangés, et l'écran reste
+utilisable exactement comme avant pour les configurer ou les modifier.
+
+Le reste de l'onglet (catégorie de produits, emplacement Shopify, etc.) s'enregistre toujours sans
+qu'il soit nécessaire de ressaisir ces 3 champs à chaque sauvegarde.
+
+Si vous gérez plusieurs boutiques, une courte mention apparaît désormais sous ce bloc lorsque vous
+consultez l'onglet d'une boutique **secondaire** : ces 3 identifiants sont ceux de la boutique **par
+défaut**, partagés par toutes les boutiques secondaires (ils n'ont jamais été propres à chaque
+boutique).
+
+### 🟠 Le masquage de l'export de diagnostic est élargi à tous les fichiers que vous pouvez nous envoyer
+
+Suite de la revue ci-dessus : le masquage ne portait jusqu'ici que sur les deux exports JSON de
+l'onglet Santé, et ne reconnaissait un identifiant technique en clair (32 caractères ou plus,
+hexadécimal) que sous quelques noms de champ précis — un futur champ au nom un peu différent
+l'aurait laissé passer. Une frontière trop stricte laissait par ailleurs échapper un tel
+identifiant s'il était collé à un mot par un tiret bas (ex. `token_abcdef…`).
+
+**Ce qui change** : la détection s'applique désormais à N'IMPORTE QUEL champ du rapport (les
+empreintes de fichier légitimes — MD5, SHA1, SHA256 — restent lisibles UNIQUEMENT si le nom du
+champ correspond exactement ou se termine par ces mots), et un identifiant technique collé à un mot
+est détecté comme les autres. Un bloc de clé privée (`-----BEGIN…-----END…-----`) qui se
+retrouverait par erreur dans un message est également masqué en bloc. Le même masquage protège
+maintenant aussi l'export JSON des événements de webhook (`admin/webhooks.php`,
+`admin/webhook_events.php`) — y compris quand le contenu Shopify externe reprend, par coïncidence,
+un nom de champ habituellement épargné (MD5, checksum…) — l'export CSV du journal des actions, et
+le **téléchargement du fichier de journal dédié**.
+
+Ce téléchargement se lit et se masque désormais par blocs, sans jamais charger le fichier entier en
+mémoire, et distingue une fin de fichier normale d'une lecture interrompue (le fichier devient
+alors clairement signalé comme tronqué, plutôt que de s'arrêter en silence). Si le fichier ne peut
+pas être ouvert (permissions, fichier disparu entre-temps), vous voyez désormais un message d'erreur
+explicite au lieu d'un fichier vide silencieusement annoncé comme réussi. **Aucune action requise** :
+ces fichiers sont simplement plus sûrs qu'avant, leur contenu utile ne change pas.
+
+### 🔴 Le signal « reconnexion requise » restait affiché après une reconnexion réussie
+
+Quand Shopify révoquait un jeton et que l'écran affichait « reconnexion requise », effectuer la
+reconnexion complète — le geste correct, recommandé par nos propres écrans — **ne faisait pas
+disparaître le signal**. Il restait allumé jusqu'au prochain rafraîchissement automatique du
+jeton, ce qui pouvait laisser croire, pendant plusieurs heures, qu'une boutique fraîchement
+réparée était encore en panne.
+
+Une reconnexion OAuth complète réussie éteint désormais ce signal immédiatement, aussi bien pour
+la boutique par défaut (ses deux copies internes) que pour une boutique secondaire — y compris
+lorsque, juste après la reconnexion, un appel Shopify transitoire échoue : ce signal a désormais
+le dernier mot, et ne peut plus être reposé à tort sur la boutique par défaut par une reconnexion
+qui concernait en réalité une boutique secondaire. La déconnexion volontaire d'une boutique
+l'éteint désormais elle aussi (décision du mainteneur) : une boutique délibérément déconnectée
+n'affiche plus un signal « reconnexion requise » qui n'a plus de sens tant qu'elle reste
+déconnectée.
+
+Re-review : dans le cas très rare où la boutique reconnectée ne peut pas être rechargée juste
+après la reconnexion (incident transitoire de base), l'auto-configuration de l'emplacement et des
+webhooks n'est plus tentée à l'aveugle contre la boutique par défaut pour une boutique secondaire
+ou nouvellement créée — un message non bloquant informe l'admin de vérifier manuellement.
+
+### 🔒 Deux boutiques ne pouvaient plus être marquées « par défaut » en même temps
+
+Rien n'empêchait, jusqu'ici, que deux boutiques d'une même installation portent simultanément le
+statut de boutique par défaut — un cas qui ne pouvait apparaître qu'à la suite d'un concours de
+circonstances rare (deux connexions Shopify complétées au même instant sur deux boutiques
+différentes, ou deux démarrages du module en parallèle sur la même installation), mais qui, s'il se
+produisait, pouvait faire pointer la configuration technique globale (jeton d'accès, identifiants)
+vers la mauvaise boutique sans aucun avertissement à l'écran.
+
+**Ce qui change** : la base de données refuse désormais cette situation au niveau du schéma, pas
+seulement au niveau du code. Si les deux connexions se produisent malgré tout au même instant,
+celle qui arrive en second est acceptée normalement, comme boutique secondaire, au lieu d'échouer
+ou de créer l'incohérence — aucune connexion Shopify n'est jamais perdue par ce correctif.
+
+Aucune action n'est requise : la mise à jour se corrige d'elle-même à l'installation, y compris sur
+une installation qui aurait déjà, par le passé, accumulé cette incohérence — et l'index de
+protection est désormais posé dès **cette même activation**, même sur une installation très
+ancienne, sans attendre une seconde réactivation du module.
+
+**Si une installation portait déjà cette incohérence** (rare, uniquement possible avant ce
+correctif), la mise à jour choisit laquelle des boutiques en doublon reste « par défaut » de la
+façon la plus fiable possible : celle dont l'adresse Shopify correspond à la configuration
+actuellement active, si elle est identifiable — sinon la plus ancienne.
+
+**Correctifs complémentaires (review 3 couches du 26/09)** : le message d'avertissement affiché à
+l'écran lorsqu'une boutique est créée en secondaire (à la suite d'une double connexion simultanée)
+distingue désormais clairement deux cas — la démotion confirmée, et l'état non confirmé après un
+incident de base transitoire (jamais de bascule silencieuse dans ce dernier cas). La date de
+première connexion d'une boutique secondaire nouvellement créée est désormais correctement
+enregistrée (elle ne l'était pas dans ce cas précis).
+
+### 🧪 Deux points de robustesse trouvés en revue interne (aucun impact client)
+
+Aucun changement de comportement observable : deux défauts de conception latents, jamais rencontrés
+en production, corrigés par précaution sur la classe `ShopifyApi`.
+
+- `loadConfiguration()` dérivait le statut « boutique par défaut » depuis `is_default` sans jamais
+  vérifier que la boutique appartenait bien à l'entité en cours de chargement. Un désaccord — qui
+  supposerait un bug appelant, aucun n'en produit un aujourd'hui — force désormais ce statut à faux
+  et journalise l'anomalie, au lieu de risquer d'écrire la configuration technique globale sous la
+  mauvaise entité.
+- La remise à zéro du signal « reconnexion requise », lors de l'écriture des jetons de la boutique
+  par défaut, pouvait échouer seule sans qu'aucune trace ne le distingue d'un échec de persistance
+  du jeton lui-même. Cet échec isolé est désormais journalisé distinctement.
+
+### 🔒 La reconnexion Shopify n'accepte plus qu'un seul mode de vérification
+
+Depuis la version 2.3.0, la reconnexion à Shopify (bouton « Connecter »/« Reconnecter ») est
+protégée par une vérification renforcée, sans qu'aucune action ne soit nécessaire de votre part.
+Un second mode de vérification, plus ancien, restait accepté en secours pour ne pas bloquer les
+installations qui n'avaient pas encore reçu cette amélioration — il est désormais retiré.
+
+**Ce qui change concrètement** : rien, pour toute installation déjà en version 2.3.0 ou
+ultérieure — la reconnexion continue de fonctionner exactement comme avant, dans n'importe quel
+ordre de mise à jour entre le site et le module.
+
+**Seule exception** : une installation restée sur une version antérieure à la 2.3.0 (parc mesuré :
+aucune installation active recensée dans les 30 derniers jours) ne pourra plus **initier une
+nouvelle reconnexion** Shopify tant que le module n'aura pas été mis à jour — la synchronisation
+déjà en place, elle, n'est pas affectée. Si un message d'erreur apparaît lors d'une reconnexion,
+mettre à jour le module Doli2Shop vers la dernière version le résout.
+
+### 🔴 Un article jamais activé à un emplacement Shopify était retenté indéfiniment, à chaque cycle
+
+Suite du hotfix 2.5.7 ci-dessous : quand un article existe bien côté Shopify mais n'a jamais été
+rattaché à l'emplacement configuré pour la boutique (variante créée récemment, jamais rattachée
+dans l'admin Shopify « Locations » de la fiche produit), le module l'écarte à raison — mais rien ne
+distinguait jusqu'ici « un incident réseau ponctuel » de « ce produit ne se résoudra jamais tant que
+personne n'agit côté Shopify ». Le produit entier était donc resélectionné à chaque cycle de
+synchronisation, indéfiniment : un appel réseau de plus, un avertissement de plus dans le journal, à
+chaque fois, sans jamais converger.
+
+**Ce qui change.** Au-delà de quelques cycles consécutifs (5 par défaut, réglable), le produit
+concerné n'est plus retenté qu'à intervalle très élargi (6 heures par défaut, réglable), le temps
+qu'une action manuelle soit faite côté Shopify — jamais une suppression silencieuse de la
+synchronisation. Un avertissement explicite est journalisé **une seule fois** au moment où le
+plafond est atteint, plus un compteur dédié (visible sur l'écran de synchronisation manuelle, dans
+la sortie de la tâche planifiée, et dans le journal de cycle) pour savoir combien d'articles sont
+actuellement dans cette situation. Dès que l'article est activé à l'emplacement Shopify, le compteur
+repart de zéro et la synchronisation retrouve sa cadence normale — le plafond ne devient jamais un
+blocage définitif.
+
+### 🔒 Un produit synchronisé au même instant par deux déclencheurs pouvait apparaître deux fois dans la correspondance interne
+
+Un produit synchronisé au même instant par deux déclencheurs — un webhook Shopify et le cycle de
+stock, par exemple, ou une notification Shopify réémise après un incident réseau — pouvait, dans de
+rares cas, se retrouver dupliqué dans le tableau de correspondance interne entre vos produits
+Dolibarr et vos produits Shopify. Ce n'est plus possible : les deux points d'écriture concernés se
+coordonnent désormais correctement lorsqu'ils interviennent au même instant sur le même produit.
+
+**Aucune action n'est requise** : correctif transparent, migration automatique à l'activation du
+module comme les précédentes.
+
+### 🧹 SITE — Un secret devenu inutile depuis le cutover OAuth n'était plus qu'une charge à provisionner
+
+> ⚠️ **Note de déploiement — pas d'action mainteneur avant la publication de cette version.** Ce
+> changement porte sur le SITE (`doli2shop.ptitetete.org`), pas sur le module. Il **part avec la
+> release 2.6.0 complète**, jamais via un déploiement site isolé ou anticipé : le retrait de code
+> décrit ci-dessous doit atteindre la production **en même temps** que le cutover OAuth de la
+> version 2.6.0 (au-dessus), pas avant, pas séparément. Une fois cette version publiée et le site
+> déployé (release OU `workflow_dispatch` sur `main`, peu importe lequel), la valeur
+> `OAUTH_PROXY_SECRET` peut être retirée de `public_html/config/secrets.php` en production — jamais
+> avant, tant que l'ancienne configuration pourrait encore être servie.
+
+Le cutover de la version 2.6.0 vers la signature OAuth asymétrique a retiré le seul usage restant
+de la constante `OAUTH_PROXY_SECRET` côté site — mais le fichier de configuration du proxy OAuth
+continuait d'exiger sa présence au démarrage (page en erreur si absente), et la documentation la
+présentait toujours comme un secret à provisionner et à régénérer périodiquement.
+
+- **Correctif** : le proxy OAuth (`website/oauth/config.php`) démarre désormais sans exiger cette
+  constante, qui n'est plus lue ni définie nulle part. Le gestionnaire de secrets et le modèle de
+  configuration (`secrets.example.php`) ne la mentionnent plus. Le fichier d'exemple obsolète
+  `website/oauth/config.php.example` — qui documentait un mécanisme de configuration abandonné
+  depuis la Story 34.6 — a été supprimé au profit de `website/config/secrets.example.php`.
+- **Aucune action n'est requise côté client** : ce changement ne touche à aucune logique de
+  vérification de signature (déjà figée par le cutover ci-dessus), uniquement à une exigence de
+  configuration devenue sans objet.
+
+## MODULE 2.6.0 — DÉTAIL COMPLET : `MigrationManager` SUBSTITUE ENFIN LE PRÉFIXE DE TABLE CHEZ LES CLIENTS `!= llx_`
+
+> Ce détail n'est pas embarqué dans le paquet d'installation (garde-fou de taille) — il reste
+> consultable ici et sur https://doli2shop.ptitetete.org/changelog.
+
+> Story `migrationmanager-prefixe-de-tables-non-substitue`. HIGH — dossier support Europe Loisirs
+> (29/09/2026) : journal du module pris à la réactivation, 21 migrations en échec « RETRY » puis
+> `Table '<base>.llx_const' doesn't exist ». `class/MigrationManager.class.php::executeMigration()`
+> exécutait le contenu brut des fichiers `sql/update_*.sql` **sans** substituer `llx_` par
+> `MAIN_DB_PREFIX` — contrairement au cœur (`run_sql()`, identique sur Dolibarr 18/23/24), qui
+> l'applique déjà pour tout fichier chargé via `_load_tables()`. Défaut présent depuis
+> l'introduction de la classe (2.1.2), sans conséquence chez un client au préfixe standard `llx_`.
+
+- **Correctif** : nouvelle méthode pure `MigrationManager::substituteTablePrefix($sqlContent,
+  $prefix = null)`, appelée sur le contenu SQL BRUT juste avant `parseSQLContent()` — jamais après,
+  jamais requête par requête (le filtre anti-marqueur DETTE 50-6 compare déjà un nom de table
+  **préfixé** au contenu qu'on lui donne ; substituer après l'aurait rendu aveugle sous préfixe
+  personnalisé et aurait réintroduit le bug multi-entité que ce filtre corrige). Même règle que le
+  cœur (`preg_replace('/llx_/i', ...)`, uniquement si le préfixe cible n'est pas `llx_`), avec
+  l'échappement obligatoire de la chaîne de remplacement (`\` puis `$`) qu'un préfixe client
+  contenant ces caractères aurait sinon fait interpréter comme référence arrière par
+  `preg_replace()`.
+- **Tests** : 7 tests unitaires sur la fonction pure (no-op sur `llx_`, casse insensible,
+  échappement `\`/`$`, défaut = constante réelle) + 1 test unitaire AC4 (réactivation : une ligne
+  de suivi `success=0` déjà présente est rejouée et repasse en succès) +
+  `test/integration/MigrationManagerCustomPrefixIntegrationTest.php` (nouveau, groupe PHPUnit
+  `migration-custom-prefix`, exclu par défaut — `composer run test:migration-custom-prefix`) :
+  rejoue réellement deux migrations câblées, fichiers non modifiés, sous un vrai préfixe
+  personnalisé (`d2stest_`, base jetable dédiée), sur MySQL 3306 **et** MariaDB 3307, et prouve que
+  le filtre DETTE 50-6 tient toujours sous ce préfixe. `test/bootstrap.php` lit désormais
+  `DOLI2SHOP_TEST_DB_PREFIX` (défaut `llx_`, comportement inchangé pour le reste de la suite) —
+  seul moyen de faire tourner un process PHPUnit sous un préfixe différent, `MAIN_DB_PREFIX` étant
+  une constante PHP figée une fois par process. Mutations vérifiées manuellement (rouge sur
+  substitution retirée, rouge sur substitution déplacée après le parsing, vert restauré).
+- **AC3 (état réel du schéma client)** : confirmé par lecture directe du cœur sur les trois bornes
+  supportées (18.0.10/23.0.x/24.0.1) que `_load_tables()`/`run_sql()` appliquent bien la
+  substitution — mais que `_load_tables()` retourne un code d'erreur "mou" (jamais négatif),
+  interdisant d'affirmer une garantie absolue sur l'état du schéma d'un client précis par la seule
+  lecture de code. Détail et formulation client dans la story.
+
+## MODULE 2.6.0 — DÉTAIL COMPLET : LE PAQUET LIVRÉ NE CONTIENT PLUS LES COMMENTAIRES PHP NI 16 MIGRATIONS SQL MORTES
+
+> Ce détail n'est pas embarqué dans le paquet d'installation (garde-fou de taille) — il reste
+> consultable ici et sur https://doli2shop.ptitetete.org/changelog.
+
+> Story `paquet-module-sans-commentaires`. MEDIUM (BUILD) — pas d'incident client en cours, mais le
+> garde-fou de taille de `paquet-module-sous-2-mo` (1 992 294 o) était déjà dépassé par le rythme
+> normal de développement au moment de l'étude (29/09/2026) : le paquet reconstruit sur le disque
+> pesait 2 010 252 o, au-dessus du seuil.
+
+**Correctif, uniquement au moment de la CONSTRUCTION du paquet ZIP livré** (jamais dans le dépôt, ni
+dans le miroir public communautaire, qui restent intégralement commentés — obligation GPL côté
+source) :
+
+- **Les commentaires PHP (`// ...`, `/* ... */`, docblocks) sont retirés du paquet livré**, à
+  l'exception du tout premier bloc de chaque fichier (en-tête `@file`/`@copyright`/`@license`
+  conservée verbatim). Le nombre de lignes de chaque fichier ne change pas (un commentaire retiré
+  est remplacé par le même nombre de retours à la ligne) — aucun impact sur un éventuel diagnostic
+  qui référencerait un numéro de ligne. `php -l` est vérifié sur chaque fichier transformé ; au
+  moindre échec, le build s'arrête et ne produit aucun ZIP.
+- **16 migrations SQL jamais exécutées** (`sql/update_1.0.0-2.0.0.sql` et 15 autres, toutes
+  antérieures à la version 2.1.1, ciblant des tables devenues obsolètes depuis la refonte v2.1.0) et
+  la table `llx_shopify_field_mapping` (jamais utilisée par aucun code du module) **ne sont plus
+  incluses dans le ZIP livré** — ces fichiers restent dans le dépôt et son historique, seulement
+  absents du paquet. `sql/update_2.1.4_2.1.5.sql`, qui crée la déduplication de contacts par adresse
+  et les champs point-relais (Mondial Relay/Boxtal/Atlas) rattachés aux commandes, **reste dans le
+  paquet** : il est exécuté par le cœur Dolibarr à chaque activation/réactivation du module,
+  indépendamment de son statut dans le gestionnaire de migrations interne.
+- **Gain mesuré** (build réel, clone jetable, base `dev-v2.6.0`) : paquet ramené de 2 010 252 o à
+  1 420 333 o (**-29,3 %**), soit une marge de ≈ 572 Ko sous le garde-fou de taille — contre
+  ≈ 66 Ko avant ce correctif. Sur la base `dev-v2.6.0` déjà allégée par
+  `paquet-module-alleger-les-langues` (943 clés de langue mortes retirées, fusionnée entre-temps) :
+  1 919 107 o → 1 329 180 o, gain identique (≈ 590 Ko).
+- **Aucune action n'est requise** : correctif de construction du paquet uniquement, aucun changement
+  de comportement du module installé, aucune migration de schéma affectée par ce correctif.
+
+## SITE — 29 septembre 2026 : UN FICHIER DE CONFIGURATION UNIQUE POUR `website/` (Story A, additive)
+
+> Story `site-configuration-unique`, sous-story A. Demande du mainteneur : la configuration du
+> site était éclatée en 18 sources distinctes (`config/`, `database/db_config.php`, `.env`,
+> `config.php` racine, 4 implémentations dupliquées de lecture des secrets Shopify, 2 configs SMTP
+> indépendantes, une documentation d'admin décrivant un schéma inexistant) — cause-racine, entre
+> autres, de l'incident actif D1 (`webhooks/billing/handler.php` cherchait `shopify_api_secret`
+> dans une clé qui n'a jamais existé dans `db_config.php`, hotfix séparé déjà mergé). Story A =
+> **additive uniquement** : aucun lecteur existant n'est modifié, rien ne change de comportement
+> en production tant que la Story B (migration) n'est pas faite.
+
+- **Chargeur unique `SiteConfig`** (`website/config/SiteConfig.class.php`) : classe statique sans
+  dépendance Composer, lit un futur fichier `doli2shop-config.php` par ordre de priorité (hors
+  `public_html` en priorité 1, repli `website/config/` déjà protégé par `.htaccess` en priorité 2).
+  `get()`/`has()`/`requireAll()`/`sourceUsed()` — une clé vide compte comme NON configurée (le
+  principe même qui aurait empêché l'incident D1), aucune valeur n'est jamais journalisée, y
+  compris en cas d'erreur de lecture (seul le nom du fichier fautif l'est).
+- **Template versionné** `website/config/doli2shop-config.example.php` : schéma complet
+  (database, shopify, smtp_transactional, oauth, licence_signature, urls, support, test_flags),
+  aucune valeur réelle, un commentaire obligatoire/optionnel par clé.
+- **Écran de génération authentifié** `website/admin/site_config_generate.php` (et non un script
+  CLI — aucun accès SSH constaté sur ce compte Hostinger, cf. Validate du 29/09) : gardé par
+  `requireAuth()` + jeton CSRF, sur le modèle exact d'`admin/migrate.php`. Lecture seule par
+  défaut (aperçu des NOMS de clé détectées, jamais une valeur) ; écriture derrière deux
+  confirmations distinctes (génération, puis écrasement si le fichier cible existe déjà) ;
+  fichier écrit avec permissions restrictives 0600 (écriture atomique tmp + rename, umask
+  restrictif, sur le modèle d'`oauth/keys.php`).
+- **Logique de fusion pure** extraite dans `website/config/SiteConfigGenerator.class.php`
+  (`detectLegacySources()`, `buildMergedConfig()`, `writeConfigFile()`) : aucune dépendance
+  HTTP/session, testable par PHPUnit sans base de données — c'est ce composant qu'un futur
+  wrapper CLI réutiliserait si un accès SSH était confirmé un jour.
+- **Garde-fous** : exclusion FTP (`deploy-website.yml`) et `.gitignore` du fichier de repli
+  (`website/config/doli2shop-config.php`, jamais committé, jamais déployé) ; test statique
+  (`SiteConfigNewCodeGuardTest`) qui échoue si `SiteConfig`/l'écran de génération lisent
+  `getenv()`/`$_ENV`/`db_config.php`/`secrets.php` directement, ou si l'écran perd sa garde
+  d'authentification/CSRF/refus d'écrasement.
+- **Tests** : 34 tests / 105 assertions ajoutés (`SiteConfigTest`, `SiteConfigGeneratorTest`,
+  `SiteConfigNewCodeGuardTest`), suite site 698 → 732 tests (2384 → 2489 assertions), 0 échec.
+  Mutations croisées vérifiées manuellement : priorité primaire/repli inversée, validation
+  `has()` (clé vide acceptée à tort), refus d'écrasement retiré, garde CSRF et garde
+  d'authentification (`includes/header.php`) retirées de l'écran — les 4 mutations font échouer
+  les tests dédiés, puis restaurées.
+- **Code review 3 couches (29/09, 0 CRITICAL/HIGH)** — 3 findings corrigés avant `done` :
+  - MEDIUM : `writeConfigFile()` génère désormais un test avec des valeurs hostiles (guillemets
+    simple/double, backslash, `?> <?php echo 1;`, retour ligne, octet NUL, UTF-8) — le fichier
+    est réellement ré-`include`u (donc analysé par le parseur PHP) sous `ob_start()`, et le
+    tableau relu doit être identique OCTET POUR OCTET à celui écrit, sans aucune sortie produite.
+    Mutation vérifiée : `var_export()` remplacé par une concaténation naïve sans échappement →
+    `ParseError` à l'inclusion, test rouge, restauré.
+  - LOW : nom de fichier temporaire de `writeConfigFile()` rendu aléatoire
+    (`bin2hex(random_bytes(8))`, plus le PID prévisible/réutilisable) ; les appels
+    `is_file()`/`is_dir()`/`is_writable()` sur le chemin PRIMAIRE (hors `public_html`) sont
+    désormais protégés contre l'avertissement PHP `open_basedir restriction in effect` (vérifié
+    via `ini_get('open_basedir')`, chemin traité comme "absent" sans avertissement si hors des
+    répertoires autorisés) dans `SiteConfig`, `SiteConfigGenerator::writeConfigFile()` et
+    `resolveTargetPath()`.
+  - LOW : `resolveTargetPath()` extrait de l'écran vers `SiteConfigGenerator` (fonction pure),
+    testé sur ses 2 branches (primaire choisi / repli choisi) ; nouvelle méthode publique
+    `fileExistsSafely()` réutilisée par l'écran pour la même protection `open_basedir`.
+  - Suite site 732 → 736 tests (2489 → 2498 assertions), 0 échec.
+- **Hors périmètre de cette Story A** (Story B/C, backlog) : AUCUN lecteur existant
+  (`database/db_config.php`, `config/secrets.php`, `.env`, `webhooks/gdpr/config.php`,
+  `oauth/config.php`, `src/Service/SecretsManager.php`, `Database.class.php`...) n'est migré ni
+  retiré — ils continuent de fonctionner exactement comme avant.
+
+## SITE — 29 septembre 2026 : `SupportApiController::list()` NE FAIT PLUS CONFIANCE AU `license_id` DE LA REQUÊTE
+
+> Story `support-api-list-license-id-non-verifie`. MEDIUM (latent, IDOR) — née de la code review
+> 3 couches de la story 63-22 (28/08), Edge Case Hunter, constat hors périmètre à l'époque.
+> `SupportApiController::list()` filtrait par un `license_id` **lu directement dans la requête**
+> pour n'importe quel appelant, admin ou pas — contrairement au filtre `email`, déjà conditionné
+> par `is_admin`. Le chemin est mort aujourd'hui (`.htaccess:34`, `RewriteRule ^api/ - [L]`) et
+> `authenticateApiRequest()` ne renvoie `success => true` pour aucun appelant non-admin — mais ce
+> second verrou disparaîtra dès qu'un service de licence réel sera implémenté, et le défaut
+> s'activerait alors immédiatement sans autre changement de code.
+
+- **Correctif** : extraction d'une méthode privée pure `resolveTicketListingScope(array $auth,
+  Request $request): ?array` — aucun appel à `TicketService`/PDO. Branche admin inchangée
+  (`email`/`license_id` restent dérivés de la requête). Branche non-admin : la portée est
+  **toujours** dérivée de `$auth['license_id']`/`$auth['email']` ; un `license_id` de requête
+  absent (ou chaîne vide `?license_id=`, traitée comme absente) ne change rien ; un `license_id`
+  de requête présent et **différent** (comparaison des deux opérandes castées en `string` puis
+  `===`) déclenche un refus explicite (403 `Access denied`) **avant tout appel** à
+  `TicketService`/PDO — aucune information sur l'existence réelle d'une licence tierce ne fuit
+  (pas d'oracle d'existence : même refus pour une licence réelle d'un autre client ou une valeur
+  inventée).
+- **Défense en profondeur** : un appelant non-admin authentifié dont `$auth` ne porte ni
+  `license_id` ni `email` exploitables se voit refuser `list()`, plutôt que de recevoir une liste
+  non filtrée.
+- **Tests** : `website/tests/SupportApiListLicenseIdOwnershipGuardTest.php` (21 tests, 40
+  assertions), exécutés par réflexion sans base de données (patron
+  `MockControllerFailClosedGuardTest.php`). Morsure croisée vérifiée manuellement : suppression
+  de la comparaison, inversion de la comparaison, suppression de la branche admin, suppression de
+  la défense en profondeur, suppression de la normalisation `license_id=''` → absent — les cinq
+  mutations font échouer les tests dédiés (6, 9, 5, 3 et 1 échecs respectivement).
+- **Hors périmètre** (2 stories dédiées, plus urgentes, produites par le Validate du 29/09 —
+  endpoints VIVANTS en production, absorbées entre-temps par le hotfix
+  `hotfix-site-preuve-identite-boutique`, PR #328) : oracle d'existence 404/403 sur
+  `view()`/`reply()`/`close()`/`attach()` (nouvelle story backlog
+  `oracle-existence-404-403-support-api`, à arbitrer par le mainteneur).
+
+## SITE — 29 septembre 2026 : LA DÉLIAISON SELF-SERVICE, TESTÉE CONTRE UN VRAI SERVEUR SMTP
+
+> Story `smtp-deliaison-jamais-teste-en-reel`. Un point aveugle, pas un défaut de code : la
+> déliaison self-service (`website/shopify-app/unlink-serial.php`, en production depuis le
+> 13/08) répond toujours « demande enregistrée » au demandeur, y compris quand l'envoi de
+> l'e-mail de confirmation échoue — voulu, pour ne pas devenir un oracle permettant de deviner
+> si un numéro de série existe. Mais personne n'était donc prévenu d'un échec. Contrôle de stock
+> en base de production (31/08) : **zéro** demande de déliaison depuis la mise en service —
+> aucun client resté sans réponse, mais le chemin SMTP réel n'avait donc jamais été exercé.
+
+### 🐛 Un SMTP mal configuré en silence pouvait transformer l'anti-oracle en oracle par timeout
+
+Trouvé pendant le Validate (29/09), pas dans la rédaction initiale de la story :
+`PhpMailerTransport::configureMailer()` ne bornait ni le délai de connexion, ni le délai
+d'attente des réponses SMTP (défaut PHPMailer 300s). Aucun `.htaccess`/`php.ini` du dépôt ne
+borne `max_execution_time`, qui reste donc celui de l'hébergeur (souvent 30 à 60s sur du
+mutualisé). Un SMTP injoignable **en silence** (port filtré, IP non routée — à distinguer d'un
+« serveur arrêté », qui échoue vite) pouvait donc faire tuer le process PHP par le timeout de
+l'hébergeur avant que la page ait pu répondre « demande enregistrée » : le client aurait alors
+reçu une page d'erreur brute après 30 à 60s, là où toutes les autres branches répondent en
+~1200ms — un oracle de contenu ET de temps strictement pire que celui que la story 61-12 avait
+fermé.
+
+- **Correctif** : le délai de connexion (`PHPMailer::$Timeout`) et le délai d'attente des
+  réponses SMTP (`SMTP::$Timelimit`, posé via `getSMTPInstance()` — ce n'est PAS une propriété
+  de `PHPMailer`, une confusion qui aurait rendu le correctif inopérant sans y toucher) sont
+  désormais bornés à 10 secondes, très en dessous du `max_execution_time` réel de l'hébergement.
+- ⚠️ **Ce correctif BORNE le risque, il ne FERME PAS l'oracle temporel** (précision apportée par
+  la code review 3 couches du 29/09, finding M1 — la première rédaction de cette entrée disait
+  « fermé », c'est inexact) : la branche éligible d'`unlink-serial.php` peut désormais prendre
+  jusqu'à ~10s quand le SMTP est dégradé en silence, contre ~1200ms (`RESPONSE_FLOOR_MS`) pour
+  toutes les autres branches — un écart mesurable et reproductible reste un oracle temporel,
+  seulement borné au lieu d'être illimité (auparavant : jusqu'à 300s, ou un crash hébergeur).
+  Story backlog ouverte pour fermer ce résidu :
+  `deliaison-oracle-temporel-smtp-degrade` (piste : répondre au client avant l'envoi —
+  `fastcgi_finish_request()` si disponible, ou file d'envoi différée + cron).
+- **Preuve mesurée, pas seulement lue dans le code** : un test d'intégration exerce la VRAIE
+  `PhpMailerTransport` (jamais de double de test) contre un vrai hôte non routé (RFC 5737
+  TEST-NET-1) dans un process séparé, borné depuis l'extérieur (`pcntl_alarm()` s'est révélé ne
+  PAS interrompre de façon fiable une connexion réseau bloquante sur ce runtime — vérifié
+  empiriquement, pas supposé). Retirer le bornage fait échouer ce test explicitement après ~25s,
+  jamais après les 300s du défaut PHPMailer. **Ajout de la review (finding H1)** : ce premier test
+  (hôte non routé) ne bornait que la phase de CONNEXION TCP (`Timeout`) — un second scénario
+  (serveur qui ACCEPTE la connexion mais n'écrit jamais la bannière SMTP) exerce spécifiquement
+  `Timelimit`, sur le même principe de process enfant borné. Les deux mutations (retirer l'une ou
+  l'autre ligne, séparément) ont été vérifiées : chacune ne casse que SON scénario, jamais l'autre.
+
+### 🐛 Le chemin d'envoi SMTP réel n'avait jamais été exercé par un test
+
+Le seul test existant sur ce chemin (`NotificationServiceMailTransportTest`) utilise un double de
+test qui ne parle jamais vraiment SMTP — son propre docblock le disait déjà noir sur blanc.
+
+- **Correctif** : nouveau test d'intégration (groupe PHPUnit dédié `smtp-integration`, exclu du
+  run par défaut — un serveur SMTP de test local, aiosmtpd, doit être lancé explicitement) qui
+  fait réellement remettre un message à un serveur SMTP local, pour les 5 langues du module,
+  et vérifie l'en-tête `Subject` (encodage RFC 2047 correctement décodable), la sous-partie
+  `Content-Type: text/html; charset=UTF-8` du message multipart, la présence du lien de
+  confirmation complet, et l'absence de fuite d'identifiants SMTP dans le message envoyé. Deux
+  cas d'échec distincts sont couverts séparément : connexion refusée (rapide) et hôte injoignable
+  en silence (borné, cf. ci-dessus) — la confusion des deux aurait donné une fausse confiance.
+
+### 🐛 Un échec d'envoi de confirmation de déliaison était invisible pour l'opérateur
+
+`process_result` (`email_sent`/`email_failed`/`email_error`) était déjà écrit en base à chaque
+demande, mais n'était affiché que sur la fiche détail d'un événement — jamais dans la liste :
+un opérateur devait ouvrir les événements un par un pour remarquer un échec.
+
+- **Correctif** : la liste des événements (`admin/events.php`) affiche désormais le résultat
+  décodé sous forme de badge, et un encart récapitulatif (compteur par statut) apparaît quand le
+  filtre est réglé sur `unlink_requested` — y compris à zéro partout, sans division par zéro ni
+  tableau muet (le cas réel constaté au 29/09). La réponse envoyée au demandeur
+  (`unlink-serial.php`) reste strictement inchangée dans toutes les branches : cette visibilité
+  est réservée à l'opérateur.
+
+**Contrôles finaux (après la review 3 couches du 29/09 et fusion de `dev-v2.6.0`)** : 496 tests
+côté site (12 nouveaux pour le décodage de `process_result` ; le reste de l'écart avec le
+décompte précédent vient de la fusion de `dev-v2.6.0`, sans rapport avec cette story), aucun
+échec, suite par défaut inchangée en dehors des ajouts (verte sans aucun serveur SMTP lancé).
+Groupe dédié `smtp-integration` (exclu du run par défaut, nécessite un serveur SMTP de test
+local) : 8 tests (5 messages réellement reçus et inspectés, une locale chacun + connexion
+refusée + les deux scénarios « injoignable » ci-dessus), tous verts contre un vrai envoi réel
+(aiosmtpd local). Module inchangé par cette story (périmètre site uniquement).
+
+### Suivi (findings LOW de la review 3 couches du 29/09)
+
+- **L1** : un TROISIÈME `new PHPMailer(true)` non borné a été repéré à
+  `admin/emailing_settings.php:90` (bouton « tester la connexion », action `test_smtp`) — ajouté
+  au périmètre de la story backlog `campaignservice-second-transport-smtp-non-unifie`.
+
+**Actions restantes (mainteneur, AC1b — après déploiement de cette version en production,
+jamais avant, jamais exécutée par un agent)** : créer ou réutiliser une licence de test liée à
+une boutique factice, avec une adresse e-mail que le mainteneur contrôle réellement ; depuis le
+site EN LIGNE (navigateur, jamais un script), demander la déliaison de son numéro de série ;
+vérifier la réception réelle dans la boîte mail (dossier, en-têtes SPF/DKIM/DMARC, lien
+cliquable, jeton exploitable) ; documenter le résultat sans le committer (adresse mail
+personnelle) ; nettoyer la licence de test si besoin. Ceci prouve ce que le test local ne peut
+pas prouver : réputation du domaine expéditeur et latence d'un vrai relais.
+
+## SITE — 29 septembre 2026 : LA BASCULE DU PARC EXISTANT DEVIENT TRAÇABLE, JAMAIS ACCIDENTELLE
+
+> **Ce n'est pas une version du module, et il n'y a rien à installer.** Ce changement porte sur
+> le back-office `doli2shop.ptitetete.org` (écran d'édition des licences + un nouvel outil
+> d'administration en ligne de commande). **Le module reste inchangé** : aucun numéro de version
+> ne change, et vous ne verrez aucune mise à jour proposée dans Dolibarr.
+>
+> Story `licence-bascule-du-parc-existant` (partie CODE uniquement — la campagne d'information,
+> la mesure d'usage et l'application effective du préavis 60 jours restent des actions du
+> mainteneur, hors code).
+
+### 🔒 Poser une date d'arrêt de synchronisation est désormais un geste tracé et protégé
+
+Jusqu'ici, rien n'empêchait de poser une date d'arrêt de synchronisation (`sync_stops_at`) sur une
+licence « à vie » (`lifetime`) par une simple erreur de saisie dans le formulaire d'édition — ni de
+savoir après coup qui avait activé cette date, ni quand.
+
+- **Refus dur côté serveur** : `admin/license_edit.php` rejette désormais explicitement toute date
+  d'arrêt de synchronisation posée sur une licence `lifetime`, en création comme en édition — pas
+  seulement dans le formulaire, à l'endroit où la donnée est réellement écrite.
+- **Traçabilité de la transition** : chaque changement réel de `sync_stops_at` (pose, retrait ou
+  modification) écrit désormais une ligne `billing_events` (`sync_stops_at_changed`, ancienne et
+  nouvelle valeur, auteur), à la fois en édition et en création d'une licence — un enregistrement
+  du formulaire sans changement réel ne produit aucun bruit.
+
+### 🧰 Nouvel outil d'administration : simulation du préavis 60 jours
+
+Un nouveau script (`database/simulate_sync_stops_at.php`) calcule, licence par licence, la date
+d'arrêt de synchronisation à appliquer pour la campagne d'information des 60 jours
+(`GREATEST(expires_at + 60 jours, date annoncée)`, licences « à vie » et révoquées exclues — la
+date annoncée est un plancher, jamais une date à laquelle rajouter 60 jours).
+
+- **Lecture seule par défaut** : affiche et consigne un rapport (aucune donnée personnelle — ni
+  e-mail, ni numéro de série), n'écrit rien tant que `--apply` n'est pas explicitement demandé.
+- **`--apply`** écrit une licence à la fois, par le même mécanisme de traçabilité que ci-dessus.
+- La formule de calcul est isolée dans une fonction testée indépendamment (licence renouvelée,
+  deux licences pour un même client, fuseau horaire, licence à vie, date d'expiration manquante).
+
+**Contrôles finaux** : 507 tests côté site (dont 34 nouveaux pour cette story), 1790 assertions,
+aucun échec. Chaque correctif/ajout est accompagné d'un test qui échoue si le défaut revient, y
+compris par mutation (7 variantes testées et confirmées détectées).
+
+### 🔒 Renforcé après la review 3 couches (29/09), avant toute publication
+
+Deux findings HIGH et trois MEDIUM ont été corrigés avant que cette entrée ne soit considérée
+close :
+
+- **Un jeton de type `{{DATE_ARRET_SYNC}}` pouvait partir tel quel dans un e-mail** si l'admin
+  oubliait de le remplacer avant l'envoi — le garde-fou anti-jeton-non-substitué ne connaissait
+  que les noms de variable déjà répertoriés. Il bloque désormais aussi tout jeton écrit
+  ENTIÈREMENT EN MAJUSCULES, la convention réservée aux marqueurs à remplacer à la main.
+- **Une date invalide comme `2026-02-30` était acceptée en silence**, glissée vers `2026-03-02`
+  sans jamais avertir personne — dans le script de simulation et dans le calcul interne. Toute
+  date saisie y est désormais validée strictement.
+- **L'écriture de la date d'arrêt et sa trace n'étaient pas garanties ensemble** : un échec de
+  journalisation aurait pu laisser une date écrite sans aucune preuve. Les deux opérations forment
+  désormais une seule transaction, annulée intégralement en cas d'échec.
+- **La formule de calcul a été recalculée** après confirmation que la campagne d'information avait
+  déjà été envoyée aux clients avec une date d'arrêt précise (12 novembre 2026) : cette date est
+  un engagement écrit, pas une date de départ à laquelle ajouter encore 60 jours. Aucune licence
+  ne peut désormais recevoir une date antérieure à celle promise.
+
+**Contrôles finaux (après renforcement)** : 533 tests côté site (dont 26 nouveaux pour cette
+passe), 1854 assertions, aucun échec.
+
+### 🔒 Deuxième renforcement (29/09) — le formulaire d'édition de licence acceptait toujours une date invalide
+
+Le renforcement précédent avait écrit et testé une validation stricte de date, mais **le
+formulaire d'édition de licence lui-même ne l'appelait pas encore** : une date incohérente
+(30 février) ou une valeur aberrante restait acceptée en silence à cet endroit précis, malgré ce
+que l'entrée précédente laissait entendre. Corrigé : le formulaire appelle désormais réellement
+cette validation, avec un message d'erreur visible si la date saisie n'est pas valide.
+
+- **`simulate_sync_stops_at.php --apply` ne peut plus avancer une date déjà négociée à la main** :
+  si une licence a déjà une date d'arrêt plus tardive que ce que le calcul standard donnerait
+  (report accordé à un client), elle est désormais explicitement conservée, sauf demande
+  explicite du mainteneur.
+
+**Contrôles finaux (deuxième renforcement)** : 550 tests côté site (dont 17 nouveaux), 1905
+assertions, aucun échec.
+
+## SITE — 26 septembre 2026 : UN OBJET « {{ VERSION }} » ET DES ENVOIS EN DOUBLE
+
+> **Ce n'est pas une version du module, et il n'y a rien à installer.** Ce changement porte sur
+> l'écran de publipostage (campagnes d'emailing) du site `doli2shop.ptitetete.org`. **Le module
+> reste inchangé** : aucun numéro de version ne change, et vous ne verrez aucune mise à jour
+> proposée dans Dolibarr. Une migration de la base du SITE reste à appliquer par le mainteneur —
+> voir « Actions restantes » en fin d'entrée.
+
+### 🐛 Un objet d'email pouvait contenir le texte littéral « {{ version }} »
+
+Deux messages envoyés le 02/04/2026 avaient pour objet « Doli2Shop v{{ version }} disponible » —
+la variable n'avait jamais été remplacée, et rien ne l'avait empêché de partir ainsi.
+
+- **Cause** : le calcul de l'objet ne remplace que les variables présentes ; une variable absente
+  (ou explicitement vidée) laissait le repère littéral dans l'objet envoyé, sans aucune vérification
+  avant l'envoi.
+- **Correctif** : un envoi (réel ou d'aperçu) est désormais bloqué si l'objet ou le corps du message
+  contient un repère non remplacé, ou si une variable obligatoire pour ce modèle d'email est vide —
+  la variable ou le repère en cause est nommé dans le message d'erreur. L'aperçu affiche maintenant
+  l'objet calculé (il ne montrait auparavant que le corps du message), ce qui rend le défaut visible
+  avant l'envoi plutôt qu'après.
+
+### 🐛 Certains envois partaient deux fois aux mêmes destinataires
+
+Les publipostages du 08/02/2026 et du 02/04/2026 sont partis deux fois vers les mêmes
+destinataires — probablement deux onglets ouverts sur le même envoi, ou un rechargement de page
+pendant qu'un envoi précédent tournait encore côté serveur.
+
+- **Cause** : le lot de destinataires à traiter était simplement lu en base sans y être réservé ;
+  deux envois qui se chevauchent pouvaient donc lire et traiter les mêmes destinataires avant que
+  l'un d'eux n'ait fini de les marquer comme envoyés.
+- **Correctif** : chaque lot de destinataires est désormais réservé de façon exclusive avant d'être
+  traité (un destinataire déjà réservé par un envoi en cours ne peut plus être repris par un autre) ;
+  un lot resté réservé anormalement longtemps (envoi interrompu) est automatiquement remis à
+  disposition. Une bannière d'avertissement signale également, avant de lancer un envoi, qu'une
+  autre campagne au contenu strictement identique existe déjà.
+
+**Preuve de la réservation exclusive** : script d'intégration à connexions réelles
+(`website/tests/integration/campaign_recipient_atomic_claim_check.php`) — deux connexions
+simultanées sur une base de test, l'une empêche bien l'autre de reprendre les mêmes destinataires
+(confirmé par un vrai blocage puis une expiration de verrou côté base de données), et rejoue
+l'ancien comportement pour prouver qu'il aurait laissé passer le doublon.
+
+**Contrôles finaux** : 272 tests côté site (27 nouveaux pour ce correctif), 2555 côté module
+(4 nouveaux), aucun échec. Chaque correctif est accompagné d'un test qui échoue si le défaut
+revient, y compris par mutation (contenu invalide, réservation contournée).
+
+### 🐛 Review 3 couches du 26 septembre : un lot interrompu pouvait rester invisible, et un crash pendant l'envoi pouvait provoquer un second doublon
+
+Une revue adversariale du correctif ci-dessus a trouvé quatre points supplémentaires, tous corrigés
+le jour même.
+
+- **Un envoi interrompu en cours de route pouvait disparaître de l'écran.** Le contrôle de fin de
+  campagne ne regardait que les destinataires « en attente », pas ceux « en cours de réservation » —
+  un envoi coupé en plein milieu (fermeture de l'onglet, redémarrage) faisait donc croire que tout
+  était fini, masquait le bouton pour reprendre l'envoi, et laissait certains destinataires sans
+  jamais recevoir le message. L'écran recalcule désormais ce qui reste à traiter à partir de l'état
+  réel des destinataires, et l'affiche clairement.
+- **Un plantage pendant l'envoi lui-même pouvait provoquer un second doublon**, distinct de celui
+  corrigé plus haut : si le serveur s'arrêtait juste après l'envoi réussi d'un message mais avant
+  d'avoir eu le temps de l'enregistrer comme envoyé, l'ancien mécanisme de reprise le renvoyait
+  automatiquement. Un destinataire dans cette situation passe désormais dans un statut « incertain »,
+  affiché à part avec son nombre, et n'est **plus jamais renvoyé automatiquement** — seule une action
+  manuelle explicite permet de le remettre en file d'attente, après vérification.
+- **Un texte contenant un exemple de code entre doubles accolades pouvait être refusé à tort.** Le
+  contrôle ajouté par le premier correctif ne distinguait pas une variable réellement attendue par le
+  modèle d'email d'un texte qui ressemble à une variable sans en être une (un exemple de code cité
+  dans le contenu, par exemple). Seules les variables réellement utilisées par ce modèle bloquent
+  désormais l'envoi si elles ne sont pas résolues.
+- **Les réglages d'envoi (taille de lot, délai entre chaque email) n'étaient limités que côté
+  affichage**, contournables par un envoi de formulaire direct. Ils sont désormais également
+  vérifiés côté serveur, avec les mêmes bornes que celles déjà affichées à l'écran.
+
+Au passage, un fichier de migration de cette story portait par erreur le même numéro qu'un fichier
+d'une autre story en cours de préparation en parallèle (`012`) — renommé en `014` pour éviter tout
+conflit au moment de la fusion des deux ; un contrôle a été ajouté pour qu'une telle collision de
+numérotation ne puisse plus passer inaperçue à l'avenir.
+
+**Contrôles finaux** : 286 tests côté site (dont 14 nouveaux pour cette revue), 2567 côté module
+(dont 12 nouveaux), aucun échec. Le script d'intégration à connexions réelles a été rejoué avec
+succès. Chaque correctif est accompagné d'un test qui échoue si le défaut revient, y compris par
+mutation.
+
+### 🐛 Re-review du 26 septembre : un texte technique pouvait être bloqué à tort selon le modèle d'email
+
+Une seconde relecture du correctif ci-dessus a trouvé un point supplémentaire, corrigé le jour
+même.
+
+- **Une variable non utilisée par un modèle d'email pouvait quand même le bloquer.** Le correctif
+  précédent limitait déjà les blocages aux variables réellement attendues par un email — mais sans
+  distinguer QUEL modèle. Un numéro de version cité par erreur dans une « Annonce de retard » (qui
+  n'affiche jamais de numéro de version) était donc bloqué, alors que ce modèle n'a de toute façon
+  aucun moyen de le remplacer. Chaque modèle d'email ne bloque désormais que sur SES propres
+  variables.
+- Deux points de robustesse des tests, sans effet visible pour les utilisateurs : un test de
+  reprise des destinataires incertains a été renforcé pour vérifier qu'elle reste bien limitée à
+  la campagne concernée (elle l'était déjà en pratique) ; le message d'erreur explicite ajouté au
+  correctif précédent (nommant la migration à appliquer si elle manque) dispose maintenant d'un
+  test dédié.
+
+**Contrôles finaux** : 288 tests côté site (dont 2 nouveaux), 2569 côté module (dont 2 nouveaux),
+aucun échec.
+
+**Actions restantes (mainteneur)** :
+- Appliquer `website/database/migrations/014_add_recipient_atomic_claim.sql` sur la base du SITE
+  (statuts `sending`/`uncertain` + colonnes `claim_token`/`claimed_at`/`send_attempted_at`) —
+  idempotente, testée sur MariaDB, à appliquer **avant** le déploiement du code.
+- Mesurer l'ampleur réelle des envois défectueux/doublés (requête fournie dans la story, lecture
+  seule, à exécuter sur la base de production — hors de portée de cette session).
+- Déployer le code du site (aucun redémarrage de service requis, PHP interprété).
+- Surveiller l'apparition de destinataires au statut « incertain » après déploiement (rare en usage
+  normal) ; vérifier manuellement avant d'utiliser l'action « Renvoyer aux incertains ».
+
+## SITE — 26 septembre 2026 : L'IMPORT DES LICENCES DOLISTORE ÉCRIT ENFIN OÙ LE MODULE LIT
+
+> **Ce n'est pas une version du module, et il n'y a rien à installer.** Ce changement porte
+> uniquement sur le site `doli2shop.ptitetete.org` — l'espace qui gère les licences, les imports
+> DoliStore et le suivi des domaines. **Le module reste inchangé** : aucun numéro de version ne
+> change, et vous ne verrez aucune mise à jour proposée dans Dolibarr.
+
+### 🐛 Un client pouvait payer sans jamais recevoir sa licence, sans que rien ne le signale
+
+L'import automatique des commandes DoliStore écrivait dans un fichier que plus rien ne lisait
+depuis longtemps — la seule voie qui produisait réellement une licence utilisable était la saisie
+manuelle dans l'administration. Une commande qui n'était pas relevée à la main ne produisait donc
+**ni licence, ni courriel, ni alerte**. C'est arrivé le 27 août : une cliente a payé le plein tarif
+et attendu quinze jours avant d'écrire au support, sa licence ayant dû être créée à la main.
+
+- **Correctif** : l'import CSV DoliStore écrit désormais dans la même base que la création manuelle
+  d'une licence, et vérifie l'unicité du numéro de série sur cette base — plus sur un fichier que
+  la création manuelle ne mettait jamais à jour. Chaque ligne importée (créée, prolongée, ignorée ou
+  en erreur) est désormais consignée et consultable depuis un nouvel écran d'administration
+  (« Import DoliStore »), avec une alerte visible dès qu'une commande n'a produit aucune licence —
+  sans attendre qu'un client l'écrive.
+- **Un rapprochement en lecture seule** compare, pour chaque client, ce que l'ancien fichier
+  contenait à ce qui existe réellement en base, et signale en particulier le cas le plus grave :
+  un même client avec des numéros de licence différents des deux côtés (potentiellement deux
+  identifiants payants pour une seule commande). Ce rapprochement ne modifie rien ; son exécution
+  reste une action volontaire du mainteneur.
+
+### 🐛 Le suivi des domaines d'une ancienne API continuait d'écrire dans le fichier abandonné
+
+Une API de validation plus ancienne, dont le code affirmait lui-même ne plus être utilisée,
+continuait en réalité d'être appelée en production pour le suivi des domaines autorisés — et
+écrivait, elle aussi, dans le fichier abandonné ci-dessus, qui grossissait donc en silence à chaque
+vérification de licence. Ce suivi bascule désormais sur le même mécanisme de domaines déjà utilisé
+par le reste de l'administration (autorisation, domaines en attente de validation).
+
+### 🔒 Une licence peut désormais être révoquée
+
+Jusqu'ici, rien ne permettait de retirer proprement une licence en cas d'avoir ou de fraude : le
+code d'une fonction de suppression existait déjà mais échouait silencieusement, la valeur qu'elle
+tentait d'enregistrer n'étant pas acceptée par la base. Une licence révoquée est désormais un statut
+à part entière, tracé (date et motif) et pris en compte par tous les contrôles de validité —
+qu'une vérification passe par le numéro de série ou par l'adresse e-mail du client.
+
+### 🔍 Review 3 couches (26/09) : 9 défauts trouvés avant déploiement, tous corrigés
+
+Une revue adversariale sur ce correctif, avant sa mise en production, a trouvé et fait corriger :
+un doublon de licence possible quand un même client apparaît deux fois dans le même CSV (la
+dédup ne voyait pas encore ce que la ligne précédente venait de décider) ; l'absence d'une
+protection contre le renvoi intégral d'un même export (une commande déjà traitée pouvait
+recréer une seconde licence) ; l'action de révocation historique, qui appelait une méthode
+inexistante et échouait donc silencieusement en pratique ; une seule ligne en échec pouvant
+jusqu'ici interrompre tout un import CSV au lieu de continuer sur les commandes suivantes ; une
+date de commande invalide qui aurait pu, sans ce correctif, produire une expiration de licence
+au 1ᵉʳ janvier 1970 sans le moindre signalement ; et l'écran de rapport d'import qui aurait
+affiché une erreur brute tant que la migration de base n'est pas encore appliquée. Rien de tout
+cela n'a atteint la production : trouvé et corrigé avant le déploiement de ce train.
+
+**Contrôles finaux** : 315 tests côté site (dont 70 nouveaux pour ce correctif et sa review),
+2499 côté module (inchangé, aucun fichier du module touché), aucun échec. Chaque correctif est
+accompagné d'un test qui échoue si le défaut revient, y compris par mutation. Les deux
+migrations SQL ont été rejouées deux fois sur une base jetable (MariaDB), sans erreur.
+
+### 🐛 Une commande de plusieurs licences n'en aurait produit qu'une seule
+
+Une seconde relecture, toujours avant mise en production, a trouvé un défaut plus en amont que
+ceux corrigés ci-dessus : l'import ne tenait aucun compte du nombre d'exemplaires achetés. Un
+client achetant deux licences en une seule commande — ou recommandant alors qu'il en possédait
+déjà une — aurait vu sa commande **prolonger** une licence existante au lieu de produire les
+licences supplémentaires payées. Corrigé : une commande à plusieurs licences (plusieurs lignes,
+ou une quantité supérieure à 1) crée désormais autant de licences neuves que d'exemplaires
+achetés, y compris pour un client déjà licencié ; le cas simple (un seul exemplaire) continue de
+prolonger normalement une licence existante. Rien de tout cela n'a atteint la production.
+
+**Contrôles finaux** : 321 tests côté site (+6 pour ce correctif), 2499 côté module (inchangé),
+aucun échec. Preuve par mutation pour les deux branches de la règle (quantité, nombre de lignes).
+
+### 🐛 Une commande à plusieurs lignes pouvait, dans un cas précis, ne recevoir aucune seconde licence
+
+Une troisième relecture, sur du code déjà écrit mais toujours pas mis en production, a trouvé la
+cause exacte de ce que le correctif précédent visait à éviter : la reconnaissance des colonnes du
+fichier d'export lisait la mauvaise colonne pour le produit acheté dans un cas précis (la colonne
+« Référence de commande » et la colonne « Référence produit » pouvaient être confondues). Résultat
+concret : sur une commande contenant plusieurs licences, la seconde risquait d'être affichée comme
+« déjà traitée » sans qu'aucune licence ne soit réellement créée pour elle — un succès affiché à
+tort. Corrigé, avec un contrôle de rang qui distingue désormais correctement deux lignes légitimes
+d'une même commande d'un renvoi accidentel du même fichier. Rien de tout cela n'a atteint la
+production : trouvé et corrigé avant tout déploiement.
+
+**Contrôles finaux** : 330 tests côté site (+9 pour ce correctif), 2499 côté module (inchangé),
+aucun échec. Preuve par mutation, y compris sur le cas précis de confusion de colonnes reproduit
+avec le format réel du fichier d'export.
+
+### 🐛 Le mécanisme anti-doublon lui-même dépendait de l'ordre des lignes du fichier
+
+Une quatrième relecture, toujours avant mise en production, a trouvé que le correctif précédent
+avait sa propre limite : il distinguait deux lignes d'une même commande par leur position dans le
+fichier — mais les fichiers réels ne sont pas toujours triés dans le même sens d'un mois sur
+l'autre. Un nouvel export aurait donc pu, selon son tri, faire manquer une licence ou en créer une
+en trop. Corrigé par un mécanisme qui compte simplement, pour chaque commande et chaque produit,
+combien de licences ont déjà été produites — sans jamais se soucier de l'ordre des lignes ni de
+l'historique exact. Ce même correctif règle aussi un décalage propre au catalogue DoliStore : le
+nom du produit affiché a changé entre les exports 2025 et 2026 pour les mêmes ventes ; l'import
+identifie désormais le produit par son identifiant technique, stable dans le temps, et ne se fie
+au nom affiché qu'en dernier recours. Rien de tout cela n'a atteint la production.
+
+**Contrôles finaux** : 345 tests côté site (+15 pour ce correctif), 2499 côté module (inchangé),
+aucun échec. Preuve par mutation pour chaque point corrigé, et vérification en conditions réelles
+sur une base de test jetable.
+
+### 🐛 Une commande de plusieurs licences journalisait plusieurs lignes au lieu d'une seule — et pouvait fausser le comptage anti-doublon
+
+Une cinquième relecture, toujours avant mise en production, a trouvé que le mécanisme de comptage
+introduit par le correctif précédent avait lui-même un défaut : une commande de plusieurs licences
+(exemple : 3 exemplaires en une seule ligne) enregistrait 3 lignes dans l'historique d'import au
+lieu d'une seule. Un export ultérieur contenant un véritable second achat du même produit pouvait
+alors, à tort, être compté comme « déjà traité » et ne produire aucune licence. Corrigé : une
+commande de plusieurs licences reste désormais une seule ligne dans l'historique, avec le nombre
+d'exemplaires et la liste des licences produites consultables sur cette même ligne. Second défaut
+trouvé et corrigé dans le même correctif : une ligne d'import sans référence produit ou sans
+numéro de commande passait à travers le contrôle anti-doublon et pouvait, en cas de renvoi du même
+fichier, prolonger indéfiniment la même licence d'un an à chaque réimport — elle est désormais
+rejetée explicitement, avec un message invitant à la saisir à la main. Un troisième point, moins
+visible pour un client mais réel : deux imports lancés en même temps pouvaient chacun ignorer le
+travail de l'autre et produire un doublon ; l'import est désormais mis en file d'attente
+(un second import lancé pendant qu'un premier tourne encore reçoit un message clair l'invitant à
+réessayer). Rien de tout cela n'a atteint la production.
+
+**Contrôles finaux** : 349 tests côté site (+4 nets pour ce correctif), 2499 côté module
+(inchangé), aucun échec. Preuve par mutation pour chaque point corrigé ; la mise en file d'attente
+des imports simultanés a en outre été vérifiée par une exécution réelle à deux connexions sur une
+base de test jetable (MariaDB), rejouée deux fois après ajout des nouvelles colonnes.
+
+## SITE — 23 septembre 2026 : UN CHAMP DE CAMPAGNE VIDÉ RESTE VIDE
+
+> **Ce n'est pas une version du module, et il n'y a rien à installer.** Ce changement porte
+> uniquement sur l'écran d'édition des campagnes d'emailing du site `doli2shop.ptitetete.org`.
+> **Le module reste inchangé** : aucun numéro de version ne change, et vous ne verrez aucune mise
+> à jour proposée dans Dolibarr.
+
+### 🐛 Vider un champ d'une campagne l'effaçait, mais pas toujours
+
+En modifiant une campagne d'emailing (annonce de version, de retard, de fermeture ou email
+personnalisé), vider un champ pour revenir au repli par défaut — ou supprimer un contenu devenu
+obsolète — ne l'effaçait pas réellement : l'ancienne valeur restait en base et repartait au
+prochain envoi, sans que rien ne le signale à l'écran.
+
+- **Cause** : un champ soumis vide n'était tout simplement pas pris en compte lors de
+  l'enregistrement, et la valeur précédente était conservée à sa place.
+- **Portée du risque** : l'ajout des contenus par langue au gabarit « Annonce de version »
+  (22 septembre) avait fait passer le nombre de champs concernés de deux à douze sur ce seul
+  gabarit — des textes qui partent à des clients licenciés.
+- **Correctif** : la collecte des champs du formulaire ignore désormais qu'un champ est vide ou
+  non, et l'enregistrement remplace entièrement les anciennes valeurs plutôt que de les compléter.
+  Changer de gabarit sans perdre les réglages du précédent continue de fonctionner comme avant.
+
+### 🐛 Effet de bord trouvé par la review 3 couches : un champ de langue vidé affichait un bloc vide au lieu du repli
+
+Conséquence directe du correctif ci-dessus : un champ par langue (« Annonce de version », email
+« Personnalisé ») désormais enregistré vide plutôt qu'omis pouvait faire apparaître un bloc de
+contenu réellement vide dans l'email envoyé, au lieu de revenir sur la traduction anglaise puis
+française prévue par défaut.
+
+- **Correctif** : les deux gabarits concernés vérifient désormais que le champ de langue contient
+  autre chose que des espaces avant de l'utiliser, sans quoi le repli s'applique normalement.
+- **Autres correctifs de cette même review** : l'aperçu d'une campagne utilise désormais
+  exactement le même calcul que l'enregistrement (il pouvait auparavant afficher un aperçu
+  différent de ce qui serait réellement enregistré) ; un test qui affirmait à tort couvrir déjà la
+  mise à jour d'une campagne en base a été corrigé.
+
+**Contrôles finaux** : 207 tests côté site (dont 26 nouveaux pour ce correctif et sa review),
+2407 côté module, aucun échec. Chaque correctif est accompagné d'un test qui échoue si le défaut
+revient, y compris par mutation (huit variantes du défaut testées et confirmées détectées).
+
+### 🐛 Re-review du 23 septembre : le contrôle « champ vide » ne détectait pas tous les vides visuels, et l'aperçu manquait un contrôle de sécurité
+
+Une seconde relecture du correctif ci-dessus a trouvé deux points supplémentaires, tous deux
+corrigés le jour même.
+
+- **Le contrôle « pas seulement des espaces » ne suffisait pas.** Un éditeur de texte enrichi ne
+  laisse jamais un champ réellement vide derrière un contenu supprimé : il y reste par exemple un
+  paragraphe sans texte ou un simple retour à la ligne, qui n'étaient pas reconnus comme vides. Le
+  contrôle a été remplacé par une vérification unique, réutilisée partout où elle est nécessaire,
+  qui reconnaît ces cas tout en continuant de considérer qu'une image seule (sans texte) est un
+  contenu légitime, pas un champ vide.
+- **L'aperçu d'une campagne ne vérifiait plus qui le demandait.** Cet écran, qui affiche un rendu
+  à partir de ce qui est saisi dans le formulaire, ne s'assurait pas que la demande provenait bien
+  de l'écran d'administration lui-même. Il applique désormais la même vérification que
+  l'enregistrement d'une campagne.
+
+**Contrôles finaux** : 245 tests côté site (dont 64 nouveaux au total pour ce correctif et ses deux
+revues), 2407 côté module, aucun échec. Chaque correctif est accompagné d'un test qui échoue si le
+défaut revient, y compris par mutation.
+
+## SITE — 28 août 2026 : DONNÉES PERSONNELLES HORS DES JOURNAUX, MESSAGES D'ERREUR MUETS
+
+> **Ce n'est pas une version du module, et il n'y a rien à installer.** Ces changements portent
+> presque uniquement sur le site `doli2shop.ptitetete.org` — l'espace qui gère les licences, les
+> téléchargements et le support. **Le module reste en 2.5.2** : aucun numéro de version ne change,
+> et vous ne verrez aucune mise à jour proposée dans Dolibarr.
+>
+> Comme pour l'entrée du 21 août, ce lot n'a volontairement **pas** de numéro de version, pour ne
+> pas annoncer un paquet qui n'existe pas. En interne il est suivi sous le nom de train 2.6.0.
+
+### 🔒 Les données personnelles ne partent plus dans les journaux techniques
+
+Le 21 août, le site a cessé d'**enregistrer en base** le nom et l'adresse e-mail de vos clients là
+où ils étaient recopiés inutilement. Ce travail était incomplet : ces mêmes données continuaient de
+s'écrire **en clair dans les journaux techniques** du serveur — un canal que les trois protections
+mises en place à l'époque ne couvraient pas.
+
+- **Vingt-cinq emplacements corrigés**, et non les cinq initialement identifiés. Les plus gros
+  volumes venaient d'endroits inattendus : l'adresse du destinataire était consignée **à chaque
+  envoi d'e-mail** et **à chaque campagne**. Partout où c'était possible, la donnée est remplacée
+  par un identifiant technique qui permet de retrouver la licence concernée sans stocker
+  l'information elle-même.
+- **Quand aucun identifiant n'existe, la donnée est masquée** plutôt que supprimée : le diagnostic
+  reste possible, l'identification non. Les adresses IP ne conservent que leur portion réseau.
+- **Une réserve, dite franchement** : les journaux **déjà écrits** sur le serveur avant ce
+  correctif contiennent encore ces données. Tarir la source ne nettoie pas l'existant — leur purge
+  est une opération d'exploitation, à décider séparément.
+
+### 🛡️ Les messages d'erreur ne renseignent plus un visiteur anonyme
+
+Quand une erreur survenait sur certaines pages publiques, le message technique complet était
+renvoyé au navigateur : selon les cas, un chemin de fichier sur le serveur ou un détail de la base
+de données. Le visiteur reçoit désormais un message neutre, et le détail part dans le journal, à
+l'usage de l'exploitant.
+
+- **Neuf points d'entrée corrigés**, dont **six accessibles sans aucune authentification** — ce
+  sont les plus exposés, et ils n'avaient pas été repérés lors du premier examen.
+- **Le compte-rendu d'import est préservé.** Le détail ligne à ligne des refus lors d'un import
+  (« adresse invalide », « produit non concerné ») est *volontairement conservé* : c'est une
+  fonctionnalité livrée début août, destinée à un opérateur authentifié. La rendre muette aurait
+  été une régression déguisée en durcissement.
+- Les trois points de réception des demandes RGPD refusent désormais proprement un contenu
+  malformé, au lieu de le traiter à moitié.
+
+### 🧰 Côté module : une fragilité corrigée avant qu'elle ne morde
+
+Sur l'écran de configuration, un formulaire n'était pas refermé correctement selon l'onglet
+affiché. **Aucun effet visible aujourd'hui** — aucun bouton ni champ ne se trouvait dans la zone
+concernée — mais ce genre de défaut se réveille au premier ajout d'un champ à cet endroit, sous la
+forme d'un réglage qui ne s'enregistre pas sans message d'erreur. Corrigé, y compris sur un
+quatrième cas de figure que l'analyse initiale avait manqué.
+
+**Contrôles** : 1943 tests automatisés côté module (MySQL **et** MariaDB), 124 côté site, aucun
+échec. Chaque correctif est accompagné d'un test qui échoue si le défaut revient.
+
+## SITE — 21 août 2026 : SUPPORT PLUS RAPIDE, DONNÉES PERSONNELLES RÉDUITES
+
+> **Ce n'est pas une version du module, et il n'y a rien à installer.** Ces changements portent
+> uniquement sur le site `doli2shop.ptitetete.org` — l'espace qui gère les licences, les
+> téléchargements et le support. **Le module reste en 2.5.0** : aucun numéro de version ne change,
+> et vous ne verrez aucune mise à jour proposée dans Dolibarr.
+>
+> Cette entrée n'a volontairement **pas** de numéro de version, pour ne pas annoncer un paquet
+> « 2.5.1 » qui n'existe pas. En interne, ce lot de travaux est suivi sous le nom de train 2.5.1.
+>
+> La prochaine version du module sera la **2.5.2**.
+
+### 🔍 Retrouver un dossier client en quelques secondes, au lieu de plusieurs minutes
+
+- **La recherche trouve ce qu'on lui donne.** Coller l'URL complète d'une boutique
+  (`https://…myshopify.com/admin`) ne renvoyait rien : il fallait deviner quel fragment saisir.
+  Les cinq écrans de recherche acceptent désormais une URL, un domaine, un fragment ou un numéro de
+  série. Effet direct pour vous : une demande de support est instruite sans aller-retour pour
+  demander « quel est exactement votre domaine ? ».
+- **Une fiche de licence complète, et tout objet cliquable.** Les écrans affichaient des
+  identifiants sans lien : chaque consultation demandait une requête manuelle en base.
+- **L'historique d'une licence est consultable directement**, y compris par le domaine de la
+  boutique.
+
+### 🔒 Données personnelles — moins écrites, et purgées
+
+- **Le site cesse d'enregistrer ce qu'il peut retrouver autrement.** Nom, adresse e-mail et domaine
+  du client étaient recopiés dans l'historique technique à chaque événement, alors qu'ils sont déjà
+  attachés à la licence. Ces recopies sont supprimées partout où elles étaient remplaçables ;
+  les rares cas où la donnée est la trace elle-même (un e-mail *envoyé à* telle adresse) sont
+  conservés et documentés. L'adresse IP n'est plus enregistrée par défaut.
+- **La purge automatique de l'historique fonctionne enfin.** Elle ne pouvait rien supprimer : la
+  tâche planifiée appelait une fonction qui n'existait pas, et échouait donc avant la première
+  suppression. Elle ne retenait par ailleurs qu'une partie des lignes concernées. Corrigé, avec un
+  mode d'essai à blanc pour vérifier ce qui serait supprimé avant de le supprimer.
+
+### 🛡️ Durcissement de l'administration du site
+
+> Rien de tout cela n'était exploitable sans être déjà administrateur du site, sauf mention
+> contraire. Nous les corrigeons parce que la sécurité ne se juge pas au risque constaté, mais au
+> risque possible.
+
+- **Session renouvelée à la connexion**, pour qu'un identifiant de session obtenu avant une
+  connexion ne puisse pas devenir une session d'administration après elle.
+- **Toutes les actions d'administration qui modifient quelque chose exigent un jeton de sécurité** —
+  dix points d'entrée, dont trois qui agissaient sur un simple lien.
+- **Les messages d'erreur techniques ne remontent plus au visiteur.** Certaines pannes renvoyaient
+  le détail brut de la base de données (serveur, base, requête). Le détail va maintenant dans le
+  journal du serveur ; le visiteur reçoit un message clair. Un point d'entrée **sans
+  authentification** renvoyait ainsi la réponse brute de Shopify : c'est le défaut le plus sérieux de
+  cette version, trouvé par la revue de code et corrigé.
+- **Les scripts de maintenance ne sont plus protégés par un mot de passe écrit dans le code**, et
+  leur jeton ne circule plus dans l'adresse des pages — donc plus dans les journaux d'accès. Il peut
+  désormais être changé sans redéployer.
+- **Le fichier `robots.txt` ne publie plus la liste des chemins sensibles** du site.
+- **Une tâche planifiée qui supprime des données était atteignable depuis le web**, sans
+  authentification. Fermée à double tour : refus d'exécution hors ligne de commande, et accès web
+  interdit au répertoire.
+- **Les migrations du site fonctionnent sur MySQL comme sur MariaDB.** Deux d'entre elles
+  employaient une syntaxe propre à MariaDB et échouaient ailleurs, ce qui pouvait laisser des
+  comptes clients affichés en anglais.
+
+### 🧪 Fiabilité
+
+- **Le site a désormais sa propre suite de tests**, qu'il n'avait pas : tout correctif s'y faisait
+  jusqu'ici sans filet. Elle vérifie notamment que les protections listées ci-dessus ne peuvent pas
+  disparaître silencieusement lors d'une modification ultérieure — chaque garde-fou a été validé en
+  réintroduisant volontairement le défaut qu'il surveille.
+
+
+## SITE — 29 septembre 2026 : IDENTITÉ DE BOUTIQUE PROUVÉE AVANT TOUTE DONNÉE OU ACTION
+
+> **Ce n'est pas une version du module, et il n'y a rien à installer.** Ces changements portent
+> uniquement sur le site `doli2shop.ptitetete.org` — l'app embarquée, les pages de facturation et
+> les webhooks Shopify. **Le module reste en 2.5.7** : aucun numéro de version ne change, et vous ne
+> verrez aucune mise à jour proposée dans Dolibarr.
+
+### 🔴 Le nom d'une boutique ne suffisait plus, seul, à agir en son nom
+
+> Le nom d'une boutique Shopify (`xxx.myshopify.com`) n'est pas un secret — il apparaît dans
+> l'URL de toute vitrine publique. Plusieurs pages du site l'acceptaient pourtant comme unique
+> preuve d'identité.
+
+- **L'app embarquée exige désormais une preuve signée par Shopify** avant d'afficher le tableau de
+  bord d'une boutique — le même mécanisme de signature que celui, déjà correct, du retour de
+  connexion OAuth. Sans cette preuve, la page affiche un message neutre invitant à rouvrir
+  l'application depuis l'Admin Shopify, au lieu du tableau de bord d'une boutique quelconque.
+- **Deux pages de facturation acceptaient une mutation d'abonnement réel sur la seule mention d'un
+  nom de boutique.** L'une pouvait activer un abonnement sans qu'aucun paiement n'ait été confirmé
+  par Shopify ; l'autre pouvait déclencher un changement de plan payant réel sur le compte d'un
+  client déjà en place. Les deux exigent maintenant une confirmation vérifiée directement auprès de
+  Shopify, ou une preuve d'identité déjà établie dans la session en cours.
+- **Le lien de téléchargement du module suivait la même règle** : il ne se génère plus que pour la
+  boutique dont l'identité est prouvée dans la session en cours.
+
+### 🟠 Une notification de facturation Shopify n'était pas rattachée à sa véritable boutique
+
+- Shopify signe le CONTENU d'une notification de facturation, jamais l'en-tête qui indique de
+  quelle boutique elle provient. Une notification correctement signée pouvait donc, en théorie,
+  être présentée comme provenant d'une autre boutique que la sienne. Le site vérifie désormais que
+  la boutique indiquée correspond à ses propres enregistrements avant toute mise à jour
+  d'abonnement, et n'écrase plus les coordonnées d'un client depuis une notification de
+  désinstallation.
+- **Correctif connexe, sans lien avec la sécurité mais découvert à cette occasion :** le secret
+  utilisé pour vérifier ces notifications était lu à un endroit qui n'existe pas en production
+  depuis plusieurs semaines — toutes les notifications de facturation étaient donc silencieusement
+  refusées. Elles sont de nouveau acceptées avec ce correctif. *Voir l'action recommandée
+  ci-dessous.*
+
+### 🟡 Anti-énumération sur les points de consultation de licence sans authentification
+
+- Trois points de consultation restent volontairement accessibles sans authentification (ils sont
+  utilisés par votre module Dolibarr pour vérifier votre propre licence). Un plafond de débit par
+  adresse IP a été ajouté pour dissuader une consultation massive et automatisée, sans jamais
+  affecter l'usage normal de votre module.
+
+**Action recommandée après déploiement.** Les notifications de facturation Shopify étant restées
+bloquées plusieurs semaines, il est possible que Shopify ait automatiquement désactivé leur envoi
+pour les boutiques restées silencieuses trop longtemps. Un contrôle de leur bon état sur le tableau
+de bord développeur Shopify est recommandé après ce déploiement ; voir le rapport technique de ce
+correctif pour la procédure.
+
 ## 2.5.7 (2026-09-27) - HOTFIX : LA RE-SYNCHRONISATION DE STOCK REFUSAIT LES BOUTIQUES À PLUSIEURS EMPLACEMENTS
 
 > **Pour qui cette version compte-t-elle ?** Pour toute boutique Shopify configurée avec
@@ -71,6 +1382,18 @@ Cette version embarque également l'allègement du paquet d'installation engagé
 (passage sous 2 Mo : ChangeLog embarqué raccourci, documentation de développement exclue du ZIP
 distribué) — sans changement fonctionnel associé.
 
+**Nettoyage des fichiers de langue (943 clés mortes retirées).** Un audit complet (littéraux
+`trans()`, chaînes littérales dans tout le code livré y compris `sql/`/`js/`/`css/`, et
+vérification suffixe par suffixe des familles de clés construites dynamiquement — `Scope*`,
+`TicketStatus*`, `FulfillmentStatus*`) a identifié 943 clés de traduction sans aucune preuve
+d'usage, retirées des 5 fichiers `langs/{fr_FR,en_US,de_DE,es_ES,it_IT}/doli2shop.lang` (aucune
+autre modification). Gain mesuré sur le paquet réel : **91 149 octets** (2 010 246 → 1 919 097 o),
+faisant repasser la construction du module sous le garde-fou de taille de 1 992 294 o (avec
+~73 197 o de marge) — sans ce nettoyage, la construction du paquet 2.6.0 échouait. Un nouveau
+test automatisé (`test/unit/I18nParityTest.php::testNoDeadKeysInLangFiles`) protège désormais
+contre la réintroduction d'une clé morte ou la suppression d'une clé encore utilisée. Aucun
+changement de comportement pour vous — seuls des libellés jamais affichés ont été retirés.
+
 ## 2.5.6 (2026-09-23) - HOTFIX : UNE REMISE GLOBALE POUVAIT ÊTRE COMPTÉE DEUX FOIS
 
 > **Pour qui cette version compte-t-elle ?** Pour toute installation qui a mis à jour vers la
@@ -140,76 +1463,6 @@ puisque la version n'avait pas encore été publiée.
 > modifions rien nous-mêmes** sur des commandes déjà validées ou facturées : contactez-nous
 > (`doli2shop@ptitetete.org`) en précisant votre installation, nous vous fournirons la liste des
 > commandes candidates à vérifier avec votre comptable avant toute correction.
-
-## SITE — 21 août 2026 : SUPPORT PLUS RAPIDE, DONNÉES PERSONNELLES RÉDUITES
-
-> **Ce n'est pas une version du module, et il n'y a rien à installer.** Ces changements portent
-> uniquement sur le site `doli2shop.ptitetete.org` — l'espace qui gère les licences, les
-> téléchargements et le support. **Le module reste en 2.5.0** : aucun numéro de version ne change,
-> et vous ne verrez aucune mise à jour proposée dans Dolibarr.
->
-> Cette entrée n'a volontairement **pas** de numéro de version, pour ne pas annoncer un paquet
-> « 2.5.1 » qui n'existe pas. En interne, ce lot de travaux est suivi sous le nom de train 2.5.1.
->
-> La prochaine version du module sera la **2.5.2**.
-
-### 🔍 Retrouver un dossier client en quelques secondes, au lieu de plusieurs minutes
-
-- **La recherche trouve ce qu'on lui donne.** Coller l'URL complète d'une boutique
-  (`https://…myshopify.com/admin`) ne renvoyait rien : il fallait deviner quel fragment saisir.
-  Les cinq écrans de recherche acceptent désormais une URL, un domaine, un fragment ou un numéro de
-  série. Effet direct pour vous : une demande de support est instruite sans aller-retour pour
-  demander « quel est exactement votre domaine ? ».
-- **Une fiche de licence complète, et tout objet cliquable.** Les écrans affichaient des
-  identifiants sans lien : chaque consultation demandait une requête manuelle en base.
-- **L'historique d'une licence est consultable directement**, y compris par le domaine de la
-  boutique.
-
-### 🔒 Données personnelles — moins écrites, et purgées
-
-- **Le site cesse d'enregistrer ce qu'il peut retrouver autrement.** Nom, adresse e-mail et domaine
-  du client étaient recopiés dans l'historique technique à chaque événement, alors qu'ils sont déjà
-  attachés à la licence. Ces recopies sont supprimées partout où elles étaient remplaçables ;
-  les rares cas où la donnée est la trace elle-même (un e-mail *envoyé à* telle adresse) sont
-  conservés et documentés. L'adresse IP n'est plus enregistrée par défaut.
-- **La purge automatique de l'historique fonctionne enfin.** Elle ne pouvait rien supprimer : la
-  tâche planifiée appelait une fonction qui n'existait pas, et échouait donc avant la première
-  suppression. Elle ne retenait par ailleurs qu'une partie des lignes concernées. Corrigé, avec un
-  mode d'essai à blanc pour vérifier ce qui serait supprimé avant de le supprimer.
-
-### 🛡️ Durcissement de l'administration du site
-
-> Rien de tout cela n'était exploitable sans être déjà administrateur du site, sauf mention
-> contraire. Nous les corrigeons parce que la sécurité ne se juge pas au risque constaté, mais au
-> risque possible.
-
-- **Session renouvelée à la connexion**, pour qu'un identifiant de session obtenu avant une
-  connexion ne puisse pas devenir une session d'administration après elle.
-- **Toutes les actions d'administration qui modifient quelque chose exigent un jeton de sécurité** —
-  dix points d'entrée, dont trois qui agissaient sur un simple lien.
-- **Les messages d'erreur techniques ne remontent plus au visiteur.** Certaines pannes renvoyaient
-  le détail brut de la base de données (serveur, base, requête). Le détail va maintenant dans le
-  journal du serveur ; le visiteur reçoit un message clair. Un point d'entrée **sans
-  authentification** renvoyait ainsi la réponse brute de Shopify : c'est le défaut le plus sérieux de
-  cette version, trouvé par la revue de code et corrigé.
-- **Les scripts de maintenance ne sont plus protégés par un mot de passe écrit dans le code**, et
-  leur jeton ne circule plus dans l'adresse des pages — donc plus dans les journaux d'accès. Il peut
-  désormais être changé sans redéployer.
-- **Le fichier `robots.txt` ne publie plus la liste des chemins sensibles** du site.
-- **Une tâche planifiée qui supprime des données était atteignable depuis le web**, sans
-  authentification. Fermée à double tour : refus d'exécution hors ligne de commande, et accès web
-  interdit au répertoire.
-- **Les migrations du site fonctionnent sur MySQL comme sur MariaDB.** Deux d'entre elles
-  employaient une syntaxe propre à MariaDB et échouaient ailleurs, ce qui pouvait laisser des
-  comptes clients affichés en anglais.
-
-### 🧪 Fiabilité
-
-- **Le site a désormais sa propre suite de tests**, qu'il n'avait pas : tout correctif s'y faisait
-  jusqu'ici sans filet. Elle vérifie notamment que les protections listées ci-dessus ne peuvent pas
-  disparaître silencieusement lors d'une modification ultérieure — chaque garde-fou a été validé en
-  réintroduisant volontairement le défaut qu'il surveille.
-
 
 ## 2.5.5 (2026-09-18) - CE QUI SE TAISAIT SE VOIT : STOCK, PHOTOS, REMISES — ET UN JOURNAL À VOUS
 

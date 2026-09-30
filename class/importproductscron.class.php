@@ -8,7 +8,7 @@
  * @package     ShopifyIntegration
  * @subpackage  Class
  * @category cron
- * @version     2.5.7
+ * @version     2.6.0
  * @since 2.0.1
  * @author      P'tite Tête <doli2shop@ptitetete.com>
  * @copyright   2022-2025 Robert Steinbacher<robert.steinbacher@xivtech.de>
@@ -32,6 +32,7 @@ dol_include_once('/core/class/commonobject.class.php');
 require_once dirname(__FILE__) . '/LoggerTrait.php';
 require_once dirname(__FILE__) . '/CronHelperTrait.php';
 require_once dirname(__FILE__) . '/shopifyapi.class.php';
+require_once dirname(__FILE__) . '/runjournal.class.php';
 require_once dirname(__FILE__) . '/storeservice.class.php';
 require_once dirname(__FILE__) . '/../lib/doli2shop.lib.php';
 dol_include_once('/doli2shop/class/importproducts.class.php');
@@ -380,6 +381,47 @@ class ImportProductsCron extends CommonObject
      * @param  float       $startTime microtime de début (pour logging durée)
      * @return int                    0=OK, -1=erreur
      */
+    /**
+     * Rowid de la boutique, ou null.
+     *
+     * @param  object|null $store Boutique
+     * @return int|null
+     */
+    protected static function storeIdOf($store)
+    {
+        return (!empty($store) && !empty($store->id)) ? (int) $store->id : null;
+    }
+
+    /**
+     * Compteurs de bilan d'un cycle d'import.
+     *
+     * Ce sont exactement les compteurs qui vivaient jusqu'ici en LOG_WARNING, noyés dans un
+     * fichier partagé : ils deviennent le bilan lisible du run.
+     *
+     * @param  ImportProducts $importer Importeur au terme du cycle
+     * @return array<string,int>
+     */
+    protected static function countersOf($importer)
+    {
+        return [
+            'stock_echecs' => (int) ($importer->stockSyncFailedCount ?? 0),
+            'images_sautees' => (int) ($importer->imagesSyncSkippedCount ?? 0),
+            'images_renvoyees' => (int) ($importer->imagesResyncForcedCount ?? 0),
+            'images_sans_source' => (int) ($importer->imagesNoSourceFoundCount ?? 0),
+            // Story apparier-les-images-une-a-une-au-lieu-de-tout-detruire (AC1) : échecs de
+            // CRÉATION de médias (anciennes photos préservées, nouvelle tentative au prochain
+            // cycle) — même convention que les compteurs d'images ci-dessus.
+            'images_creation_echouee' => (int) ($importer->imagesCreationFailedCount ?? 0),
+            // MEDIUM (review 3 couches 27/09/2026) : échecs de SUPPRESSION après une création
+            // réussie (doublon possible, jamais de perte de photo) — même convention.
+            'images_suppression_echouee' => (int) ($importer->imagesDeleteFailedCount ?? 0),
+            // HIGH (re-review 27/09/2026, point 1) : produits DIFFÉRÉS (budget de polling déjà
+            // épuisé, ou lot précédent encore en cours) — ni échec ni réussite.
+            'images_differees' => (int) ($importer->imagesDeferredForBudgetCount ?? 0),
+            'stock_emplacement_plafonne' => (int) ($importer->stockLocationCappedCount ?? 0),
+        ];
+    }
+
     protected function runSyncForStore(int $entity, $store, float $startTime): int
     {
         $storeLabel = ($store !== null) ? ($store->shop_domain ?? ('store#' . $store->rowid)) : 'entity-fallback';
@@ -395,6 +437,12 @@ class ImportProductsCron extends CommonObject
 
         $this->log("[OK] Configuration verified for store: " . $storeLabel, LOG_INFO);
 
+        // Journal de RUN — la ligne de DÉMARRAGE est posée AVANT le travail, et c'est tout son
+        // intérêt : sans elle, un ordonnanceur à l'arrêt et un ordonnanceur qui tourne sans rien
+        // avoir à faire laissent la même absence de trace. Story
+        // journal-de-run-identifiant-et-provenance.
+        RunJournal::start($entity, RunJournal::ORIGIN_CRON, 'Synchronisation produits - ' . $storeLabel, self::storeIdOf($store));
+
         $importer = new ImportProducts($this->db, $entity, $store);
         $result = $importer->importProducts();
 
@@ -403,6 +451,7 @@ class ImportProductsCron extends CommonObject
             $this->output .= "\n" . 'Error during import for store ' . $storeLabel . ': ' . $importer->error;
             $executionTime = round(microtime(true) - $startTime, 2);
             $this->log("[ERROR] Store sync FAILED for " . $storeLabel . " after " . $executionTime . "s", LOG_ERR);
+            RunJournal::finish($entity, self::countersOf($importer), ActionLogger::RESULT_ERROR, self::storeIdOf($store));
             return -1;
         }
 
@@ -420,6 +469,15 @@ class ImportProductsCron extends CommonObject
         if (!empty($importer->stockSyncLocationErrorCount)) {
             $this->output .= "\n" . '[ERROR] Store ' . $storeLabel . ': ' . $importer->stockSyncLocationErrorCount . ' erreur(s) STRUCTURELLE(S) d\'emplacement Shopify (verifier shopify_location_id, voir logs LOG_ERR)';
             $this->log("[STOCK-LOCATION] " . $importer->stockSyncLocationErrorCount . " erreur(s) structurelle(s) d'emplacement pour store " . $storeLabel, LOG_ERR);
+        }
+
+        // Story stock-article-non-active-emplacement-reselection-perpetuelle (AC3) : articles
+        // ACTUELLEMENT plafonnés (référence de stock non résolue depuis N cycles consécutifs) —
+        // distinct du compteur ci-dessus (une erreur GraphQL GLOBALE), ce cas ne produit AUCUNE
+        // erreur GraphQL, juste une absence de niveau de stock pour l'article à l'emplacement.
+        if (!empty($importer->stockLocationCappedCount)) {
+            $this->output .= "\n" . '[WARN] Store ' . $storeLabel . ': ' . $importer->stockLocationCappedCount . ' article(s) plafonne(s) (jamais active(s) a l\'emplacement Shopify, action manuelle requise, voir logs LOG_WARNING)';
+            $this->log("[STOCK-LOCATION-CAPPED] " . $importer->stockLocationCappedCount . " article(s) plafonne(s) pour store " . $storeLabel, LOG_WARNING);
         }
 
         // Story variante-sans-correspondance-sku-ignoree-en-silence (AC1/AC2/AC3) : même
@@ -451,6 +509,46 @@ class ImportProductsCron extends CommonObject
                 . ' produit(s) laisses SANS PHOTO cote Shopify, faute d\'image trouvee cote Dolibarr (ni index llx_ecm_files, ni disque) : ' . $refs;
             $this->log("[IMAGES] " . $importer->imagesNoSourceFoundCount . " produit(s) sans source d'image cote Dolibarr pour store " . $storeLabel . " : " . $refs, LOG_WARNING);
         }
+
+        // Story apparier-les-images-une-a-une-au-lieu-de-tout-detruire (AC1) : échecs de
+        // CRÉATION de médias — anciennes photos préservées (aucune suppression), nouvelle
+        // tentative au prochain cycle. Même convention que les compteurs d'images ci-dessus.
+        if (!empty($importer->imagesCreationFailedCount)) {
+            $refs = implode(', ', $importer->imagesCreationFailedRefs);
+            if ($importer->imagesCreationFailedCount > count($importer->imagesCreationFailedRefs)) {
+                $refs .= ' (+' . ($importer->imagesCreationFailedCount - count($importer->imagesCreationFailedRefs)) . ')';
+            }
+            $this->output .= "\n" . '[ERROR] Store ' . $storeLabel . ': ' . $importer->imagesCreationFailedCount
+                . ' produit(s) en echec de creation de medias Shopify (anciennes photos preservees, nouvelle tentative au prochain cycle) : ' . $refs;
+            $this->log("[IMAGES] " . $importer->imagesCreationFailedCount . " produit(s) en echec de creation de medias pour store " . $storeLabel . " : " . $refs, LOG_ERR);
+        }
+
+        // MEDIUM (review 3 couches 27/09/2026) : échecs de SUPPRESSION après une création
+        // réussie — doublon possible (ancien + nouveau média), jamais de perte de photo.
+        if (!empty($importer->imagesDeleteFailedCount)) {
+            $refs = implode(', ', $importer->imagesDeleteFailedRefs);
+            if ($importer->imagesDeleteFailedCount > count($importer->imagesDeleteFailedRefs)) {
+                $refs .= ' (+' . ($importer->imagesDeleteFailedCount - count($importer->imagesDeleteFailedRefs)) . ')';
+            }
+            $this->output .= "\n" . '[ERROR] Store ' . $storeLabel . ': ' . $importer->imagesDeleteFailedCount
+                . ' produit(s) en echec de suppression des anciens medias apres creation reussie (doublon possible) : ' . $refs;
+            $this->log("[IMAGES] " . $importer->imagesDeleteFailedCount . " produit(s) en echec de suppression pour store " . $storeLabel . " : " . $refs, LOG_ERR);
+        }
+
+        // HIGH (re-review 27/09/2026, point 1) : produits DIFFEREES (budget de polling deja
+        // epuise, ou lot precedent encore en cours de traitement) - ni echec ni reussite, mais
+        // traites en PRIORITE au prochain cycle.
+        if (!empty($importer->imagesDeferredForBudgetCount)) {
+            $refs = implode(', ', $importer->imagesDeferredForBudgetRefs);
+            if ($importer->imagesDeferredForBudgetCount > count($importer->imagesDeferredForBudgetRefs)) {
+                $refs .= ' (+' . ($importer->imagesDeferredForBudgetCount - count($importer->imagesDeferredForBudgetRefs)) . ')';
+            }
+            $this->output .= "\n" . '[INFO] Store ' . $storeLabel . ': ' . $importer->imagesDeferredForBudgetCount
+                . ' produit(s) differe(s) (budget de polling epuise ou lot precedent en cours), priorite au prochain cycle : ' . $refs;
+            $this->log("[IMAGES] " . $importer->imagesDeferredForBudgetCount . " produit(s) differe(s) pour store " . $storeLabel . " : " . $refs, LOG_INFO);
+        }
+
+        RunJournal::finish($entity, self::countersOf($importer), ActionLogger::RESULT_SUCCESS, self::storeIdOf($store));
 
         $this->log("[OK] Sync completed for store: " . $storeLabel, LOG_INFO);
         return 0;

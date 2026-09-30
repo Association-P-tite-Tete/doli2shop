@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.1.6
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -50,6 +50,7 @@ require_once dirname(__FILE__) . '/sqlutils.class.php';
 require_once dirname(__FILE__) . '/syncflowpolicy.class.php';
 require_once dirname(__FILE__) . '/collectionsutils.class.php';
 require_once dirname(__FILE__) . '/LoggerTrait.php';
+require_once dirname(__FILE__) . '/CronHelperTrait.php';
 
 // Include compatibility functions for older Dolibarr versions
 require_once dirname(__FILE__) . '/../lib/compatibility.lib.php';
@@ -62,6 +63,7 @@ require_once dirname(__FILE__) . '/storecategoryhelper.class.php';  // Epic 47, 
 class ShopifyProductImporter
 {
     use LoggerTrait;
+    use CronHelperTrait;
 
     /** @var DoliDB Database handler */
     private $db;
@@ -642,6 +644,21 @@ class ShopifyProductImporter
         if (!empty($response->errors)) {
             $errorMsg = is_array($response->errors) ? json_encode($response->errors) : $response->errors;
             throw new Exception("GraphQL error: " . $errorMsg);
+        }
+
+        // Story 62-6 (finding 7, review 3 couches 2026-09-23) : `data` présent mais
+        // `data->products` absent (schéma Shopify cassé/changé, ex. renommage du champ racine)
+        // ne doit JAMAIS être confondu avec un catalogue légitimement épuisé. Un catalogue vide
+        // légitime renvoie toujours `products` (avec `edges: []`) — c'est `products` lui-même qui
+        // doit être présent, pas `edges`. Sans cette vérification, le `!empty(...->edges)`
+        // ci-dessous rendait les deux cas indiscernables : `$products` restait `[]` et
+        // `importProducts()` annonçait `success:true, "No products to import"` — la synchro page
+        // suivante affichait « terminé » alors que la réponse Shopify était structurellement
+        // inexploitable. Chemin volontairement limité à `['products']` (pas
+        // `['products', 'edges']`) : voir ShopifyProductImporterGetProductsFromShopifySchemaGuardTest.
+        $productsPathSignal = \ShopifyApi::extractGraphQLDataPath($response, ['products']);
+        if (!$productsPathSignal['success']) {
+            throw new Exception("GraphQL error: unexpected response schema — 'data.products' missing while fetching Shopify products page");
         }
 
         $products = [];
@@ -1914,42 +1931,110 @@ class ShopifyProductImporter
     {
         $this->log("Sauvegarde mapping: Dolibarr=$dolibarrProductId, Shopify=$shopifyProductId, Variant=$shopifyVariantId, Parent=$parentProductId", LOG_DEBUG);
 
-        // v2.1.9: Stratégie en 2 temps pour contourner la clé unique (fk_product, entity, fk_product_parent)
-        // Si fk_product_parent change, la clé composite change → INSERT au lieu d'UPDATE → doublon.
-        // On supprime d'abord l'ancien mapping du même fk_product pour cette entity.
-        // Story 47-3: filtrer aussi par fk_store pour ne pas effacer les mappings des autres boutiques.
-        // Rétrocompat : en chemin historique/fallback (fkStore=0), NE PAS filtrer sur fk_store —
-        // sinon le DELETE ne matcherait pas les lignes backfillées (fk_store>0) et l'INSERT créerait
-        // un doublon. fkStore=0 ⇒ comportement pré-47-3 (DELETE par fk_product+entity).
         $fkStore = (int)$this->shopifyApi->getStoreId();
-        $sqlDelete = "DELETE FROM " . MAIN_DB_PREFIX . "doli2shop_products";
-        $sqlDelete .= " WHERE fk_product = " . (int)$dolibarrProductId;
-        $sqlDelete .= " AND entity = " . (int)$this->entity;
-        if ($fkStore > 0) {
-            $sqlDelete .= " AND fk_store = " . $fkStore;
-        }
-        $this->db->query($sqlDelete);
 
-        // INSERT le mapping à jour (avec fk_store pour traçabilité par boutique)
-        $sql = "INSERT INTO " . MAIN_DB_PREFIX . "doli2shop_products";
-        $sql .= " (fk_product, shopifyProductId, shopifyVariantId, fk_product_parent, entity, fk_store, last_sync_status, tms)";
-        $sql .= " VALUES (";
-        $sql .= (int)$dolibarrProductId . ", ";
-        $sql .= "'" . $this->db->escape($shopifyProductId) . "', ";
-        $sql .= ($shopifyVariantId ? "'" . $this->db->escape($shopifyVariantId) . "'" : "NULL") . ", ";
-        $sql .= ($parentProductId ? (int)$parentProductId : "NULL") . ", ";
-        $sql .= (int)$this->entity . ", ";
-        $sql .= $fkStore . ", ";
-        $sql .= "'success', ";
-        $sql .= "'" . $this->db->idate(dol_now()) . "'";
-        $sql .= ")";
+        // Verrou advisory MySQL (Story cle-unique-doli2shop-products-null-fk-product-parent, AC1) :
+        // la course porte sur la séquence DELETE puis INSERT ci-dessous (v2.1.9) — deux appels
+        // concurrents peuvent chacun supprimer la ligne de l'autre avant que l'un des deux INSERT
+        // n'ait eu lieu. Même mécanisme et même scope que
+        // ImportProducts::manageProductMapping() (fk_product + fk_store, entité ajoutée
+        // automatiquement par CronHelperTrait::buildCronLockName()) : les deux méthodes écrivent la
+        // même table et doivent se sérialiser l'une contre l'autre, pas seulement contre
+        // elles-mêmes.
+        $lockName = 'product_map_' . (int)$dolibarrProductId . '_' . $fkStore;
+        // Timeout 3s : cf. justification dans ImportProducts::manageProductMapping() (même
+        // constante, même raisonnement — ni blocage indéfini, ni échec quasi systématique).
+        $lockTimeout = 3;
 
-        $result = $this->db->query($sql);
-
-        if (!$result) {
-            $error = "Erreur sauvegarde mapping produit $dolibarrProductId: " . $this->db->lasterror();
+        if (!$this->acquireCronLock($lockName, $lockTimeout)) {
+            // AC1 : JAMAIS de skip silencieux — un mapping jamais créé serait pire que le doublon
+            // que ce correctif ferme.
+            $error = "Verrou non acquis pour product_map fk_product=$dolibarrProductId fk_store=$fkStore"
+                . " (entity=" . $this->entity . ") : abandon (course avec un autre appelant, verrou"
+                . " déjà détenu au-delà du timeout de {$lockTimeout}s)";
             $this->log($error, LOG_ERR);
             throw new Exception($error);
+        }
+
+        try {
+            // v2.1.9: Stratégie en 2 temps pour contourner la clé unique (fk_product, entity, fk_product_parent)
+            // Si fk_product_parent change, la clé composite change → INSERT au lieu d'UPDATE → doublon.
+            // On supprime d'abord l'ancien mapping du même fk_product pour cette entity.
+            // Story 47-3: filtrer aussi par fk_store pour ne pas effacer les mappings des autres boutiques.
+            // Rétrocompat : en chemin historique/fallback (fkStore=0), NE PAS filtrer sur fk_store —
+            // sinon le DELETE ne matcherait pas les lignes backfillées (fk_store>0) et l'INSERT créerait
+            // un doublon. fkStore=0 ⇒ comportement pré-47-3 (DELETE par fk_product+entity).
+            $sqlDelete = "DELETE FROM " . MAIN_DB_PREFIX . "doli2shop_products";
+            $sqlDelete .= " WHERE fk_product = " . (int)$dolibarrProductId;
+            $sqlDelete .= " AND entity = " . (int)$this->entity;
+            if ($fkStore > 0) {
+                $sqlDelete .= " AND fk_store = " . $fkStore;
+            }
+            $this->db->query($sqlDelete);
+
+            // INSERT le mapping à jour (avec fk_store pour traçabilité par boutique)
+            $sql = "INSERT INTO " . MAIN_DB_PREFIX . "doli2shop_products";
+            $sql .= " (fk_product, shopifyProductId, shopifyVariantId, fk_product_parent, entity, fk_store, last_sync_status, tms)";
+            $sql .= " VALUES (";
+            $sql .= (int)$dolibarrProductId . ", ";
+            $sql .= "'" . $this->db->escape($shopifyProductId) . "', ";
+            $sql .= ($shopifyVariantId ? "'" . $this->db->escape($shopifyVariantId) . "'" : "NULL") . ", ";
+            $sql .= ($parentProductId ? (int)$parentProductId : "NULL") . ", ";
+            $sql .= (int)$this->entity . ", ";
+            $sql .= $fkStore . ", ";
+            $sql .= "'success', ";
+            $sql .= "'" . $this->db->idate(dol_now()) . "'";
+            $sql .= ")";
+
+            $result = $this->db->query($sql);
+
+            if (!$result) {
+                // AC3 : lire lasterrno() IMMÉDIATEMENT — rien d'autre n'a requêté $this->db entre
+                // l'échec du query() et cette lecture. DoliDB normalise l'errno MySQL/MariaDB 1062
+                // en la chaîne 'DB_ERROR_RECORD_ALREADY_EXISTS' (core/db/mysqli.class.php, vérifié
+                // sur Dolibarr 18/23/24) — jamais l'entier 1062 brut.
+                if ($this->db->lasterrno() === 'DB_ERROR_RECORD_ALREADY_EXISTS') {
+                    // Absorption : un appelant concurrent a gagné la course entre notre DELETE et
+                    // notre INSERT (fenêtre résiduelle, ex. un tiers non couvert par ce verrou).
+                    // MEDIUM (review 3 couches, 27/09/2026) : la ligne survivante porte les données
+                    // du GAGNANT, pas forcément les NÔTRES (le nôtre — le perdant — peut avoir reçu
+                    // un shopifyProductId/shopifyVariantId/parentProductId différent, ex. deux
+                    // webhooks quasi simultanés portant des payloads distincts) : réappliquer notre
+                    // propre charge par un UPDATE de secours, symétrique à celui de
+                    // manageProductMapping() sur ce même cas. Filtre fk_store conditionnel comme
+                    // partout ailleurs dans cette méthode (invariant CLAUDE.dolibarr.md §14).
+                    // Best-effort : un échec de CETTE UPDATE ne doit pas faire régresser
+                    // l'absorption en échec de synchro (le mapping existe déjà, c'est l'essentiel).
+                    $sqlUpdateAfterAbsorb = "UPDATE " . MAIN_DB_PREFIX . "doli2shop_products";
+                    $sqlUpdateAfterAbsorb .= " SET shopifyProductId = '" . $this->db->escape($shopifyProductId) . "'";
+                    $sqlUpdateAfterAbsorb .= ", shopifyVariantId = " . ($shopifyVariantId ? "'" . $this->db->escape($shopifyVariantId) . "'" : "NULL");
+                    $sqlUpdateAfterAbsorb .= ", fk_product_parent = " . ($parentProductId ? (int)$parentProductId : "NULL");
+                    $sqlUpdateAfterAbsorb .= ", last_sync_status = 'success'";
+                    $sqlUpdateAfterAbsorb .= ", tms = '" . $this->db->idate(dol_now()) . "'";
+                    $sqlUpdateAfterAbsorb .= " WHERE fk_product = " . (int)$dolibarrProductId;
+                    $sqlUpdateAfterAbsorb .= " AND entity = " . (int)$this->entity;
+                    if ($fkStore > 0) {
+                        $sqlUpdateAfterAbsorb .= " AND fk_store = " . $fkStore;
+                    }
+                    $updateAfterAbsorbResult = $this->db->query($sqlUpdateAfterAbsorb);
+                    if (!$updateAfterAbsorbResult) {
+                        $this->log("saveProductMapping - Échec de la ré-application (best-effort) après absorption"
+                            . " pour fk_product=$dolibarrProductId fk_store=$fkStore : " . $this->db->lasterror(), LOG_WARNING);
+                    }
+
+                    $this->log("saveProductMapping - Collision absorbée (DB_ERROR_RECORD_ALREADY_EXISTS)"
+                        . " pour fk_product=$dolibarrProductId fk_store=$fkStore : mapping déjà recréé"
+                        . " par un appel concurrent, notre charge ré-appliquée sur la ligne survivante", LOG_DEBUG);
+                } else {
+                    // Toute autre erreur remonte comme avant (pas de masquage).
+                    $error = "Erreur sauvegarde mapping produit $dolibarrProductId: " . $this->db->lasterror();
+                    $this->log($error, LOG_ERR);
+                    throw new Exception($error);
+                }
+            }
+        } finally {
+            // Libération garantie sur TOUS les chemins de sortie (succès, absorption, exception).
+            $this->releaseCronLock($lockName);
         }
 
         // ====================================================================

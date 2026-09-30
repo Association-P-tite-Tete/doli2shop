@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.3.2
  * @link        https://doli2shop.ptitetete.org
  */
@@ -274,22 +274,11 @@ function cleanHtmlEntitiesForJsonHealth($data)
     return $data;
 }
 
-/**
- * Masque une valeur sensible pour l'export JSON
- *
- * @param  mixed $value Valeur à masquer
- * @return mixed Valeur masquée
- */
-function maskSensitiveValueHealth($value)
-{
-    if (empty($value) || !is_string($value)) {
-        return $value;
-    }
-    if (strlen($value) >= 12) {
-        return substr($value, 0, 4) . '****' . substr($value, -4);
-    }
-    return '****';
-}
+// Story fix-export-diagnostic-secrets (CRITICAL) : l'ancienne maskSensitiveValueHealth() ci-dessus
+// (substr($value, 0, 4) . '****' . substr($value, -4)) exposait 8 des caractères du secret, et
+// n'était appelée que sur 4 clés figées — `shopify_refresh_token` en sortait EN CLAIR. Remplacée
+// par doli2shopRedactSensitiveConfig() (lib/doli2shop.lib.php), masquage intégral par MOTIF de nom
+// de clé, appliquée à TOUT le rapport juste avant l'export (voir plus bas).
 
 // ── CLASSE DIAGNOSTIC (copie locale de diagnostic.php — Story 49-6 Option B) ──
 
@@ -692,7 +681,9 @@ class ShopifyDiagnosticHealth
             $shopDomain .= '.myshopify.com';
         }
 
-        $apiUrl = 'https://doli2shop.ptitetete.org/api/billing.php?action=get-license-by-shop&shop_domain=' . urlencode($shopDomain);
+        // Review 3 couches 27/09 (finding HIGH n°1) : URL de production rendue surchargeable —
+        // point de résolution unique, cf. doli2shopGetBillingApiEndpoint() (lib/doli2shop.lib.php).
+        $apiUrl = doli2shopGetBillingApiEndpoint() . '?action=get-license-by-shop&shop_domain=' . urlencode($shopDomain);
 
         // Story 50-9 : header X-Dolibarr-Domain omis si non résolu (jamais le littéral générique).
         $checkSupportHeaders = array(
@@ -2738,26 +2729,53 @@ if (isShopifyModuleEnabledHealth($conf)) {
         $timestamp = $fullConfig['historical_import_completed_date'];
         $fullConfig['historical_import_completed_date'] = dol_print_date($timestamp, 'dayhour') . ' (timestamp: ' . $timestamp . ')';
     }
+    // Story fix-export-diagnostic-secrets (CRITICAL) : plus de masquage ici, sur une liste figée de
+    // clés — doli2shopRedactSensitiveConfig() masque TOUT le rapport (donc aussi cette section) par
+    // motif de nom de clé, juste avant l'export JSON ci-dessous.
     $report['configuration'] = $fullConfig;
-    $sensitiveKeys = array('shopify_access_token', 'shopify_api_key', 'shopify_api_secret_key', 'dolibarr_api_key');
-    foreach ($sensitiveKeys as $key) {
-        if (!empty($report['configuration'][$key])) {
-            $report['configuration'][$key] = maskSensitiveValueHealth($report['configuration'][$key]);
-        }
-    }
 }
 
 $report['licence_mode'] = $diagnostic->getLicenceMode();
 
 // ── EXPORT JSON ──────────────────────────────────────────────────────────────
 if ($format === 'json') {
-    $cleanReport = cleanHtmlEntitiesForJsonHealth($report);
-    $filename = 'diagnostic_shopify_' . date('Y-m-d_H-i-s') . '.json';
-    header('Content-Type: application/json; charset=utf-8');
-    header('Content-Disposition: attachment; filename="' . $filename . '"');
-    header('Cache-Control: no-cache, must-revalidate');
-    header('Expires: Sat, 26 Jul 1997 05:00:00 GMT');
-    echo json_encode($cleanReport, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    // Re-review 3 couches (MEDIUM) : le masquage et l'export sont désormais entourés d'un
+    // try/catch(\Throwable) — si le masquage échoue pour une raison quelconque, l'export renvoie
+    // une erreur JSON générique, SANS jamais sortir le rapport non masqué, et journalise l'incident.
+    try {
+        // Story fix-export-diagnostic-secrets (CRITICAL) : masquage de TOUT le rapport (pas
+        // seulement $report['configuration']) juste avant l'export — couvre aussi le numéro de
+        // série de licence porté par les checks 'support' (addCheck()), où qu'il apparaisse dans
+        // l'arborescence.
+        // Story export-diagnostic-detection-hex-elargie (constat 3, LOW) : masquage + encodage
+        // factorisés dans doli2shopBuildRedactedJsonExport() (JSON_THROW_ON_ERROR inclus, lève
+        // désormais une \JsonException interceptée ci-dessous plutôt que de renvoyer `false` en
+        // silence sur une chaîne UTF-8 invalide).
+        $jsonExport = doli2shopBuildRedactedJsonExport(cleanHtmlEntitiesForJsonHealth($report));
+        $filename = 'diagnostic_shopify_' . date('Y-m-d_H-i-s') . '.json';
+        header('Content-Type: application/json; charset=utf-8');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Cache-Control: no-cache, must-revalidate');
+        header('Expires: Sat, 26 Jul 1997 05:00:00 GMT');
+        echo $jsonExport;
+    } catch (\Throwable $e) {
+        dol_syslog(
+            'health.php: échec du masquage/export du diagnostic JSON — export refusé pour ne'
+            . ' jamais risquer de sortir le rapport non masqué : ' . $e->getMessage(),
+            LOG_ERR
+        );
+        if (!headers_sent()) {
+            header('Content-Type: application/json; charset=utf-8');
+        }
+        // Story export-diagnostic-detection-hex-elargie (constat 3, LOW) : http_response_code()
+        // n'émet aucun avertissement après envoi des en-têtes (contrairement à header()), impact
+        // réel négligeable — gardé sous headers_sent() par cohérence avec le header() ci-dessus,
+        // défensif plutôt que correctif d'un défaut observable.
+        if (!headers_sent()) {
+            http_response_code(500);
+        }
+        echo json_encode(array('error' => 'export_failed'));
+    }
     exit;
 }
 

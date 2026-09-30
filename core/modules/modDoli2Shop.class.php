@@ -10,7 +10,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       1.0.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -546,6 +546,74 @@ class modDoli2Shop extends DolibarrModules
 					[
 						'version' => '2.5.4_2.5.5',
 						'file' => dol_buildpath('/doli2shop/sql/update_2.5.4_2.5.5.sql', 0)
+					],
+					// 2.6.0 : journal de RUN sur llx_doli2shop_action_log (run_id, origin,
+					// duration_ms) + index de lecture. Story
+					// journal-de-run-identifiant-et-provenance. Cle de version DISTINCTE et
+					// fichier NEUF (meme regle qu'au-dessus).
+					[
+						'version' => '2.5.5_2.6.0',
+						'file' => dol_buildpath('/doli2shop/sql/update_2.5.5_2.6.0.sql', 0)
+					],
+					// 2.6.0b : dedoublonnage + colonne generee default_key + index unique sur
+					// llx_doli2shop_stores, empechant deux boutiques is_default=1 pour la meme
+					// entity. Story doublon-is-default-boutiques-non-empeche. Cle de version
+					// DISTINCTE et fichier NEUF (meme regle qu'au-dessus) : 2.5.5_2.6.0 est deja
+					// cablee et livree, suffixe "b" comme 2.5.3_2.5.3b (meme cycle 2.6.0 pas
+					// encore publie).
+					[
+						'version' => '2.6.0_2.6.0b',
+						'file' => dol_buildpath('/doli2shop/sql/update_2.6.0_2.6.0b.sql', 0)
+					],
+					// 2.6.0c : colonne de persistance du compteur de cycles consecutifs "reference
+					// de stock non resolue a l'emplacement Shopify configure" sur
+					// llx_doli2shop_products. Story
+					// stock-article-non-active-emplacement-reselection-perpetuelle. Cle de version
+					// DISTINCTE et fichier NEUF (meme regle qu'au-dessus) : 2.6.0_2.6.0b est deja
+					// cablee et livree (meme cycle 2.6.0 pas encore publie).
+					[
+						'version' => '2.6.0b_2.6.0c',
+						'file' => dol_buildpath('/doli2shop/sql/update_2.6.0b_2.6.0c.sql', 0)
+					],
+					// 2.6.0c_2.6.0d : defense en profondeur de la cle unique de
+					// llx_doli2shop_products (colonne generee fk_product_parent_key + index unique),
+					// story cle-unique-doli2shop-products-null-fk-product-parent. Cle de version
+					// DISTINCTE et fichier NEUF (meme regle qu'au-dessus).
+					[
+						'version' => '2.6.0c_2.6.0d',
+						'file' => dol_buildpath('/doli2shop/sql/update_2.6.0c_2.6.0d.sql', 0)
+					],
+					// 2.6.0d_2.6.0e : colonne shopify_media_ids sur llx_doli2shop_products —
+					// provenance EXPLICITE des medias Shopify crees par le module, condition (a)
+					// de ImportProducts::isExistingMediaCreatedByModule(). Review 3 couches
+					// (27/09/2026, HIGH) de la story
+					// apparier-les-images-une-a-une-au-lieu-de-tout-detruire. ORDRE : DOIT
+					// s'executer APRES 2.6.0c_2.6.0d ci-dessus (suite chronologique du cycle 2.6.0),
+					// et comme toutes les migrations DDL de ce fichier, AVANT ensureDefaultStore()
+					// plus bas (invariant migration/seeding, CLAUDE.dolibarr.md paragraphe 14 : le
+					// DDL (ADD COLUMN) reste ici, un eventuel BACKFILL dependant de la boutique par
+					// defaut irait en PHP apres ensureDefaultStore() — sans objet ici, cette colonne
+					// ne depend pas de fk_store). Cle de version DISTINCTE et fichier NEUF : "d_e",
+					// suite de "c_d" ci-dessus (branches fusionnees le 28/09/2026).
+					// fk_store CONDITIONNEL : lecture/ecriture de cette colonne restent, comme le
+					// reste du chemin images, non filtrees par fk_store — motif PREEXISTANT,
+					// documente en story separee (fk-store-absent-du-mapping-produit-shopify-images).
+					[
+						'version' => '2.6.0d_2.6.0e',
+						'file' => dol_buildpath('/doli2shop/sql/update_2.6.0d_2.6.0e.sql', 0)
+					],
+					// 2.6.0e_2.6.0f : colonne images_priority_requeue sur llx_doli2shop_products —
+					// marque un produit DIFFERE (budget de polling images epuise, ou lot precedent
+					// encore en cours) pour un traitement PRIORITAIRE au cycle de contenu/stock
+					// suivant (ORDER BY des requetes de selection de importProducts(), ~488-521 et
+					// ~582-610). Re-review 3 couches (28/09/2026, HIGH) de la story
+					// apparier-les-images-une-a-une-au-lieu-de-tout-detruire. Cle de version
+					// DISTINCTE et fichier NEUF (meme regle qu'au-dessus) : "e_f", suite de "d_e".
+					// fk_store CONDITIONNEL : meme motif preexistant que shopify_media_ids
+					// ci-dessus, non introduit ni corrige ici.
+					[
+						'version' => '2.6.0e_2.6.0f',
+						'file' => dol_buildpath('/doli2shop/sql/update_2.6.0e_2.6.0f.sql', 0)
 					]
 				];
 
@@ -590,6 +658,27 @@ class modDoli2Shop extends DolibarrModules
 				// Échec réparation ne doit pas bloquer l'activation du module (même garde que
 				// le seeding et les backfills suivants)
 				dol_syslog("Doli2Shop: Erreur réparation schéma llx_doli2shop_stores (non bloquant): " . $e->getMessage(), LOG_ERR);
+			}
+
+			// Finding 4 (review 3 couches 2026-09-26, story doublon-is-default-boutiques-non-empeche) :
+			// sur un parc très ancien où is_default/default_key viennent d'être ajoutées par la
+			// réparation ci-dessus (parce que update_2.6.0_2.6.0b.sql avait échoué faute de colonne
+			// is_default), l'index unique uk_doli2shop_stores_default_key restait sinon absent jusqu'à
+			// une SECONDE réactivation du module (seul moment où MigrationManager rejoue une migration
+			// précédemment en échec) — fenêtre sans AUCUNE protection contre le doublon, potentiellement
+			// permanente. Posé ICI, dès CETTE activation, dès que les deux colonnes existent ; no-op si
+			// l'index est déjà là (cas normal) ou si des doublons existent encore (dédoublonnage complet
+			// laissé à la migration rejouée).
+			try {
+				$defaultKeyIndexResult = doli2shopEnsureDefaultKeyUniqueIndex($this->db);
+				if (!$defaultKeyIndexResult['ensured'] && $defaultKeyIndexResult['reason'] === 'duplicates_present') {
+					dol_syslog("Doli2Shop: Index unique uk_doli2shop_stores_default_key non posé (doublons is_default=1 existants) — sera posé à la prochaine réactivation du module", LOG_WARNING);
+				} elseif (!$defaultKeyIndexResult['ensured'] && $defaultKeyIndexResult['reason'] === 'alter_failed') {
+					dol_syslog("Doli2Shop: Échec pose index unique uk_doli2shop_stores_default_key (voir log ci-dessus)", LOG_ERR);
+				}
+			} catch (\Throwable $e) {
+				// Non bloquant, même garde que la réparation de schéma ci-dessus.
+				dol_syslog("Doli2Shop: Erreur pose index uk_doli2shop_stores_default_key (non bloquant): " . $e->getMessage(), LOG_ERR);
 			}
 
 			// Epic 47, Story 47-1: Seeding boutique par défaut depuis les constantes DOLI2SHOP_*

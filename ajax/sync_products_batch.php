@@ -13,7 +13,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.2.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -196,23 +196,23 @@ if ($action == 'get_count') {
 	try {
 		if ($direction == 'shopify_to_dolibarr') {
 			// Shopify -> Dolibarr : count via GraphQL
+			// Story 62-6 (AC1, CRITICAL review 3 couches 2026-09-23) — cf. commentaire jumeau
+			// dans ajax/wizard_sync.php : toute la logique (comptage GraphQL, vérification
+			// `errors`/`data` absent, message d'échec générique) vit désormais dans
+			// ShopifyApi::buildProductsCountAjaxResponse() — point unique partagé, testé à
+			// l'exécution. Avant ce correctif, un jeton mort et un catalogue réellement vide
+			// produisaient exactement le même 'success' => true, 'total' => 0.
 			dol_include_once('/doli2shop/class/shopifyapi.class.php');
 			$shopifyApi = ($scopedStore !== null) ? ShopifyApi::forStore($db, $scopedStore) : new ShopifyApi($db);
-			$countQuery = array('query' => '{ productsCount { count } }');
-			$countResult = $shopifyApi->executeGraphQL($countQuery);
 
-			$total = 0;
-			if (isset($countResult->data->productsCount->count)) {
-				$total = (int) $countResult->data->productsCount->count;
-			} elseif (is_array($countResult) && isset($countResult['data']['productsCount']['count'])) {
-				$total = (int) $countResult['data']['productsCount']['count'];
+			$result = ShopifyApi::buildProductsCountAjaxResponse($shopifyApi, 'sync_products_batch.php (get_count)');
+			if ($result['httpCode'] === 200) {
+				$result['body']['direction'] = 'shopify_to_dolibarr';
 			}
 
-			echo json_encode(array(
-				'success' => true,
-				'total' => $total,
-				'direction' => 'shopify_to_dolibarr',
-			), JSON_HEX_TAG | JSON_HEX_AMP);
+			http_response_code($result['httpCode']);
+			echo json_encode($result['body'], JSON_HEX_TAG | JSON_HEX_AMP);
+			exit;
 
 		} else {
 			// Dolibarr -> Shopify : count via SQL
@@ -337,6 +337,17 @@ if ($action == 'sync_batch') {
 
 			$offset = GETPOSTINT('offset');
 
+			// Journal de RUN, provenance MANUEL. La synchronisation manuelle est découpée en lots
+			// AJAX : chaque lot est un processus distinct, donc l'identifiant de run circule dans la
+			// requête et la réponse plutôt que de vivre en mémoire. Le premier lot ouvre le run, le
+			// dernier le referme.
+			dol_include_once('/doli2shop/class/runjournal.class.php');
+			$incomingRunId = GETPOST('run_id', 'alphanohtml');
+			if (!RunJournal::resume($incomingRunId, RunJournal::ORIGIN_MANUAL)) {
+				RunJournal::start((int) $conf->entity, RunJournal::ORIGIN_MANUAL, 'Synchronisation produits depuis l\'ecran');
+			}
+			$response['runId'] = RunJournal::currentRunId();
+
 			$shopifyApi = ($scopedStore !== null) ? ShopifyApi::forStore($db, $scopedStore) : new ShopifyApi($db);
 			$config = $shopifyApi->getConfig();
 			$defaultCategoryId = isset($config->dolibarr_procate) ? (int) $config->dolibarr_procate : 0;
@@ -402,6 +413,12 @@ if ($action == 'sync_batch') {
 				// invalide/introuvable) — un problème de configuration, pas un simple aléa réseau.
 				$response['stockSyncFailed'] = (int) $importProducts->stockSyncFailedCount;
 				$response['stockSyncLocationErrors'] = (int) $importProducts->stockSyncLocationErrorCount;
+
+				// Story stock-article-non-active-emplacement-reselection-perpetuelle (AC3) : même
+				// convention — articles ACTUELLEMENT plafonnés (référence de stock non résolue
+				// depuis N cycles consécutifs), distinct de stockSyncLocationErrors (erreur GraphQL
+				// GLOBALE d'emplacement, pas ce cas).
+				$response['stockLocationCapped'] = (int) $importProducts->stockLocationCappedCount;
 			}
 
 			// Check if there are more products (L1 fix: alias renamed to 'total')
@@ -419,6 +436,22 @@ if ($action == 'sync_batch') {
 
 			$nextOffset = $offset + count($productIds);
 			$response['hasMore'] = ($nextOffset < $totalProducts);
+
+			// Dernier lot : le run se referme avec son bilan. Sans cette ligne de fin, un run
+			// interrompu et un run terminé seraient indistinguables — la symétrie de la ligne de
+			// démarrage.
+			if (empty($response['hasMore'])) {
+				RunJournal::finish(
+					(int) $conf->entity,
+					array(
+						'produits' => (int) ($response['processed'] ?? 0),
+						'erreurs' => (int) ($response['errors'] ?? 0),
+						'images_renvoyees' => (int) ($response['imagesResyncForced'] ?? 0),
+						'images_sans_source' => (int) ($response['imagesNoSourceFound'] ?? 0),
+					),
+					empty($response['errors']) ? ActionLogger::RESULT_SUCCESS : ActionLogger::RESULT_ERROR
+				);
+			}
 			$response['cursor'] = (string) $nextOffset;
 		}
 

@@ -13,7 +13,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.2.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -86,31 +86,25 @@ $action = GETPOST('action', 'aZ09');
 if ($action == 'get_count') {
 	dol_include_once('/doli2shop/class/shopifyapi.class.php');
 
+	// Story 62-6 (AC1, CRITICAL/MEDIUM review 3 couches 2026-09-23) : toute la logique (comptage
+	// GraphQL, vérification `errors`/`data` absent, message d'échec générique jamais exposé au
+	// client) vit désormais dans ShopifyApi::buildProductsCountAjaxResponse() — point unique
+	// partagé avec ajax/sync_products_batch.php, testé à l'exécution (voir
+	// ShopifyApiGraphQLDataPathTest, AjaxGetCountGraphQLFailureGuardTest). Ce fichier se contente
+	// de construire $shopifyApi et d'échoer le retour tel quel. Avant ce correctif, l'échec
+	// renvoyait $e->getMessage() brut au client, lequel contient le json_encode() intégral de la
+	// réponse Shopify — désormais aligné sur le pattern déjà en place dans
+	// ajax/sync_products_batch.php depuis la Story 63-19/LOW 10 (détail complet en
+	// dol_syslog LOG_ERR, message générique côté JSON).
 	try {
 		$shopifyApi = new ShopifyApi($db);
-		$countQuery = array('query' => '{ productsCount { count } }');
-		$countResult = $shopifyApi->executeGraphQL($countQuery);
-
-		$total = 0;
-		if (isset($countResult->data->productsCount->count)) {
-			$total = (int) $countResult->data->productsCount->count;
-		} elseif (is_array($countResult) && isset($countResult['data']['productsCount']['count'])) {
-			$total = (int) $countResult['data']['productsCount']['count'];
-		}
-
-		echo json_encode(array(
-			'success' => true,
-			'total' => $total,
-		), JSON_HEX_TAG | JSON_HEX_AMP);
-
+		$result = ShopifyApi::buildProductsCountAjaxResponse($shopifyApi, 'wizard_sync.php (get_count)');
 	} catch (Exception $e) {
-		http_response_code(500);
-		echo json_encode(array(
-			'success' => false,
-			'message' => $e->getMessage(),
-		), JSON_HEX_TAG | JSON_HEX_AMP);
+		$result = ShopifyApi::buildProductsCountAjaxFailure('wizard_sync.php (get_count)', $e);
 	}
 
+	http_response_code($result['httpCode']);
+	echo json_encode($result['body'], JSON_HEX_TAG | JSON_HEX_AMP);
 	exit;
 }
 

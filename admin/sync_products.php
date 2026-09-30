@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.0.22
  * @link        https://doli2shop.ptitetete.org
  */
@@ -900,6 +900,9 @@ if ($currentAdminStore !== null) {
         // Hotfix 2.5.7 (re-review 27/09/2026, MEDIUM) : même convention que les 2 clés ci-dessus.
         'syncReportStockSyncFailed' => 'SyncReportStockSyncFailed',
         'syncReportStockLocationErrors' => 'SyncReportStockLocationErrors',
+        // Story stock-article-non-active-emplacement-reselection-perpetuelle (AC3) : même
+        // convention — articles ACTUELLEMENT plafonnés (plafond de cycles consécutifs atteint).
+        'syncReportStockLocationCapped' => 'SyncReportStockLocationCapped',
     );
     $jsTransValues = array();
     foreach ($jsTransKeys as $jsKey => $langKey) {
@@ -914,7 +917,7 @@ if ($currentAdminStore !== null) {
     var storeId = <?php echo json_encode($currentAdminStoreIsSecondary ? (int) $currentAdminStore->rowid : 0); ?>;
 
     // Cumulative stats across all batches
-    var totalStats = { created: 0, updated: 0, skipped: 0, errors: 0, processed: 0, stockSyncEnabled: false, imagesResyncForced: 0, imagesNoSourceFound: 0, imagesNoSourceFoundRefs: [], stockSyncFailed: 0, stockSyncLocationErrors: 0 };
+    var totalStats = { created: 0, updated: 0, skipped: 0, errors: 0, processed: 0, stockSyncEnabled: false, imagesResyncForced: 0, imagesNoSourceFound: 0, imagesNoSourceFoundRefs: [], runId: null, stockSyncFailed: 0, stockSyncLocationErrors: 0, stockLocationCapped: 0 };
     var allErrorDetails = [];
     var totalToSync = 0;
     var isSyncing = false;
@@ -977,7 +980,7 @@ if ($currentAdminStore !== null) {
         if (isSyncing) return;
 
         isSyncing = true;
-        totalStats = { created: 0, updated: 0, skipped: 0, errors: 0, processed: 0, stockSyncEnabled: false, imagesResyncForced: 0, imagesNoSourceFound: 0, imagesNoSourceFoundRefs: [], stockSyncFailed: 0, stockSyncLocationErrors: 0 };
+        totalStats = { created: 0, updated: 0, skipped: 0, errors: 0, processed: 0, stockSyncEnabled: false, imagesResyncForced: 0, imagesNoSourceFound: 0, imagesNoSourceFoundRefs: [], runId: null, stockSyncFailed: 0, stockSyncLocationErrors: 0, stockLocationCapped: 0 };
         allErrorDetails = [];
         totalToSync = 0;
 
@@ -1048,6 +1051,12 @@ if ($currentAdminStore !== null) {
             postData.offset = offset || 0;
         }
 
+        // Journal de run : l'identifiant circule d'un lot à l'autre, chaque lot étant une
+        // requête HTTP distincte. Vide au premier lot — le serveur ouvre alors le run.
+        if (totalStats.runId) {
+            postData.run_id = totalStats.runId;
+        }
+
         jQuery.ajax({
             url: ajaxUrl,
             type: 'POST',
@@ -1068,6 +1077,7 @@ if ($currentAdminStore !== null) {
                 // Story hash-images-survit-a-la-purge-et-bloque-le-renvoi (AC3)
                 totalStats.imagesResyncForced += (data.imagesResyncForced || 0);
             totalStats.imagesNoSourceFound += (data.imagesNoSourceFound || 0);
+            if (data.runId && !totalStats.runId) { totalStats.runId = data.runId; }
             if (Array.isArray(data.imagesNoSourceFoundRefs)) {
                 data.imagesNoSourceFoundRefs.forEach(function (ref) {
                     if (totalStats.imagesNoSourceFoundRefs.length < 20 && totalStats.imagesNoSourceFoundRefs.indexOf(ref) === -1) {
@@ -1079,6 +1089,8 @@ if ($currentAdminStore !== null) {
                 // CRON/journaux, désormais visibles sur cet écran de synchronisation manuelle.
                 totalStats.stockSyncFailed += (data.stockSyncFailed || 0);
                 totalStats.stockSyncLocationErrors += (data.stockSyncLocationErrors || 0);
+                // Story stock-article-non-active-emplacement-reselection-perpetuelle (AC3)
+                totalStats.stockLocationCapped += (data.stockLocationCapped || 0);
 
                 // Track stock sync status (Task 3 — AC4)
                 if (data.stockSyncEnabled) {
@@ -1163,6 +1175,12 @@ if ($currentAdminStore !== null) {
         var oldStockLocationBanners = reportSection.querySelectorAll('.d2s-stock-location-error-banner');
         for (var lb = 0; lb < oldStockLocationBanners.length; lb++) {
             oldStockLocationBanners[lb].parentNode.removeChild(oldStockLocationBanners[lb]);
+        }
+        // Story stock-article-non-active-emplacement-reselection-perpetuelle : idem pour le
+        // bandeau dédié aux articles plafonnés, sur un rerun de synchronisation.
+        var oldStockLocationCappedBanners = reportSection.querySelectorAll('.d2s-stock-location-capped-banner');
+        for (var cb = 0; cb < oldStockLocationCappedBanners.length; cb++) {
+            oldStockLocationCappedBanners[cb].parentNode.removeChild(oldStockLocationCappedBanners[cb]);
         }
 
         // M1 fix: Update progress section title with completion message
@@ -1257,6 +1275,21 @@ if ($currentAdminStore !== null) {
             stockLocationBanner.appendChild(stockLocationIcon);
             stockLocationBanner.appendChild(document.createTextNode(' ' + TRANS.syncReportStockLocationErrors.replace('%s', String(totalStats.stockSyncLocationErrors))));
             reportErrors.parentNode.insertBefore(stockLocationBanner, reportErrors);
+        }
+
+        // Story stock-article-non-active-emplacement-reselection-perpetuelle (AC3) : articles
+        // ACTUELLEMENT plafonnés (référence de stock non résolue depuis N cycles consécutifs,
+        // action manuelle requise côté Shopify) — distinct du bandeau ci-dessus (erreur GraphQL
+        // GLOBALE d'emplacement), ce cas ne produit AUCUNE erreur GraphQL.
+        if (totalStats.stockLocationCapped > 0) {
+            var stockCappedBanner = document.createElement('div');
+            stockCappedBanner.className = 'd2s-alert-banner d2s-alert--warning d2s-stock-location-capped-banner';
+            stockCappedBanner.style.marginBottom = '12px';
+            var stockCappedIcon = document.createElement('i');
+            stockCappedIcon.className = 'fa fa-hourglass-half';
+            stockCappedBanner.appendChild(stockCappedIcon);
+            stockCappedBanner.appendChild(document.createTextNode(' ' + TRANS.syncReportStockLocationCapped.replace('%s', String(totalStats.stockLocationCapped))));
+            reportErrors.parentNode.insertBefore(stockCappedBanner, reportErrors);
         }
 
         // Error details — safe DOM construction

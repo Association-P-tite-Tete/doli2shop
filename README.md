@@ -1,6 +1,6 @@
 # Doli2Shop — Community Edition
 
-**Module version / Version du module : 2.5.7**
+**Module version / Version du module : 2.6.0**
 *(filled in automatically at each sync from `lib/version.lib.php` — never edited by hand /
 renseignée automatiquement à chaque synchronisation depuis `lib/version.lib.php`, jamais à la main)*
 

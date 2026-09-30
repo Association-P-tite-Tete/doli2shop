@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.4.8
+ * @version     2.6.0
  * @since       2.2.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -161,10 +161,33 @@ if ($action == 'export_single_event' && verifToken()) {
                     'date_traitement' => $objExport->date_traitement,
                 );
 
-                header('Content-Type: application/json; charset=utf-8');
-                header('Content-Disposition: attachment; filename="webhook_event_'.$eventRowId.'_'.date('Y-m-d_His').'.json"');
-                header('Cache-Control: no-cache, no-store, must-revalidate');
-                print json_encode($exportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                // Story export-diagnostic-detection-hex-elargie (AC8) : ce point d'export n'était
+                // pas couvert par doli2shopRedactSensitiveConfig() — un jeton hexadécimal brut dans
+                // `payload` (champ Shopify arbitraire imbriqué) ou dans `last_error` (texte libre du
+                // module) partait en clair. Même brique que health.php/diagnostic.php (masquage +
+                // JSON_THROW_ON_ERROR), avec le même repli défensif sur échec d'encodage.
+                try {
+                    $jsonExport = doli2shopBuildRedactedJsonExport($exportData);
+
+                    header('Content-Type: application/json; charset=utf-8');
+                    header('Content-Disposition: attachment; filename="webhook_event_'.$eventRowId.'_'.date('Y-m-d_His').'.json"');
+                    header('Cache-Control: no-cache, no-store, must-revalidate');
+                    print $jsonExport;
+                } catch (\Throwable $e) {
+                    dol_syslog(
+                        'webhook_events.php: échec du masquage/export JSON de l\'événement — export'
+                        . ' refusé pour ne jamais risquer de sortir le rapport non masqué : '
+                        . $e->getMessage(),
+                        LOG_ERR
+                    );
+                    if (!headers_sent()) {
+                        header('Content-Type: application/json; charset=utf-8');
+                    }
+                    if (!headers_sent()) {
+                        http_response_code(500);
+                    }
+                    print json_encode(array('error' => 'export_failed'));
+                }
                 exit;
             }
         }

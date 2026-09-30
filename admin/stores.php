@@ -13,7 +13,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.2.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -473,7 +473,9 @@ if ($action == 'activate_store_serial' && !empty($_POST) && verifToken()) {
 
         $chLink = curl_init();
         curl_setopt_array($chLink, array(
-            CURLOPT_URL            => 'https://doli2shop.ptitetete.org/api/billing.php?action=link-serial',
+            // Review 3 couches 27/09 (finding HIGH n°1) : URL de production rendue surchargeable —
+            // point de résolution unique, cf. doli2shopGetBillingApiEndpoint() (lib/doli2shop.lib.php).
+            CURLOPT_URL            => doli2shopGetBillingApiEndpoint() . '?action=link-serial',
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_POST           => true,
             CURLOPT_POSTFIELDS     => $linkSerialPayload,

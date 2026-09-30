@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.0.23
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -196,16 +196,19 @@ function analyzeMappingTable($db)
     // peuvent provenir que d'une incohérence de fk_product_parent, jamais d'un multi-boutiques
     // légitime.
     //
-    // OBSERVATION (code review 63-16, 24/08, non corrigée ici — hors périmètre de cette story) :
-    // "la clé unique empêche les doublons" est FAUX pour un produit SIMPLE (fk_product_parent =
-    // NULL, sql/llx_doli2shop_products.sql:19). SQL traite NULL comme jamais égal à lui-même dans
-    // une contrainte UNIQUE : deux lignes strictement identiques (même fk_product, entity,
-    // fk_store, fk_product_parent=NULL) NE VIOLENT PAS la clé unique, et INSERT ... ON DUPLICATE
-    // KEY UPDATE ne les bloque pas davantage (chacune est vue comme une ligne "nouvelle"). Cette
-    // requête (GROUP BY fk_product, fk_store) est donc le SEUL filet contre cette classe de
-    // doublon pour les produits sans parent — pas une redondance avec la clé unique. Story de
-    // suivi ouverte : docs/implementation-artifacts/cle-unique-doli2shop-products-null-fk-product-parent.md
-    // (backlog, v2.6.0, MEDIUM).
+    // OBSERVATION (code review 63-16, 24/08 ; mise à jour story
+    // cle-unique-doli2shop-products-null-fk-product-parent, v2.6.0) : "la clé unique empêche les
+    // doublons" était FAUX pour un produit SIMPLE (fk_product_parent = NULL,
+    // sql/llx_doli2shop_products.sql) — SQL traite NULL comme jamais égal à lui-même dans une
+    // contrainte UNIQUE. Ce n'est PLUS le seul filet depuis cette story : le correctif PRINCIPAL
+    // est un verrou applicatif (GET_LOCK, ImportProducts::manageProductMapping()/
+    // ShopifyProductImporter::saveProductMapping()) qui ferme le TOCTOU réel à l'écriture, complété
+    // par une contrainte DB de défense en profondeur (colonne générée fk_product_parent_key +
+    // index unique uk_doli2shop_products_parent_key, sql/update_2.6.0c_2.6.0d.sql). Cette requête
+    // (GROUP BY fk_product, fk_store) reste néanmoins un outil d'audit utile : elle détecte les
+    // doublons HÉRITÉS d'un parc non encore migré vers le durcissement ci-dessus, ou produits par
+    // un chemin d'écriture non couvert par les deux méthodes protégées. Aucun changement de
+    // comportement fonctionnel de cet écran n'est requis par cette story.
     // LOW 1 (code review 63-16, 24/08) : fk_store n'était pas remonté — un produit dupliqué sur
     // deux boutiques DISTINCTES (ce que ce GROUP BY fk_product, fk_store détecte désormais comme
     // deux groupes séparés, chacun légitimement à COUNT(*) = 1, donc jamais un faux doublon) ne

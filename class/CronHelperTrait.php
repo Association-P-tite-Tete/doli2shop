@@ -96,6 +96,16 @@ trait CronHelperTrait
      * event individuel reste protégé par l'atomic claim de WebhookManager ; ce verrou
      * complète au niveau du run complet (évite gaspillage + faux duplicates concurrents).
      *
+     * ⚠️ NON RÉENTRANT (LOW, review 3 couches 27/09/2026) : `GET_LOCK` MySQL/MariaDB n'a **pas**
+     * de compteur de références. Un second `acquireCronLock()` sur le **même nom**, obtenu sur la
+     * même connexion pendant que le premier est encore détenu, réussit silencieusement (MySQL
+     * autorise une connexion à ré-acquérir son propre verrou) — mais un `releaseCronLock()`
+     * imbriqué libère alors le niveau **englobant**, pas seulement le niveau interne : le verrou
+     * extérieur se retrouve libéré alors que son appelant croit toujours le détenir. Ne **jamais**
+     * imbriquer deux `acquireCronLock()`/`releaseCronLock()` portant le **même nom** de verrou sur
+     * un même parcours d'exécution (ex. une méthode qui en appelle une autre protégée par le même
+     * verrou) — scoper des noms distincts si un tel appel imbriqué est un jour nécessaire.
+     *
      * @param  string $lockName Nom logique du job (préfixé/borné en interne)
      * @param  int    $timeout  Secondes d'attente (0 = non bloquant, retour immédiat)
      * @return bool  true si le verrou est acquis, false sinon (déjà détenu ou erreur)

@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.4.8
+ * @version     2.6.0
  * @since       2.3.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -129,6 +129,58 @@ if ($action == 'purge' && verifToken()) {
     exit;
 }
 
+// Export CSV du journal — l'exigence qui fait qu'un client peut NOUS l'envoyer sans manipulation.
+//
+// Format CSV et non JSON : le client l'ouvre dans son tableur, voit ce qu'il nous transmet, et sa
+// messagerie ne le refuse pas. Un journal de diagnostic qu'on ne peut pas envoyer ne sert à rien —
+// c'est le mur rencontré sur deux dossiers de septembre 2026, où le fichier de log de Dolibarr
+// pesait 323 Mo.
+//
+// ⚠️ Le contenu exporté est le MÊME que celui affiché : ni plus (pas de colonne cachée qui
+// sortirait de l'instance sans que le client l'ait vue), ni moins.
+if ($action == 'export') {
+    if (!verifToken()) {
+        dol_syslog("action_log.php: action 'export' refused for user " . $user->login . " (invalid/expired CSRF token)", LOG_WARNING);
+        setEventMessages($langs->trans("ErrorInvalidCSRFTokenRetry"), null, 'errors');
+    } else {
+        $sqlExport = "SELECT date_action, run_id, origin, action_type, object_type, object_id,";
+        $sqlExport .= " result, message, duration_ms, fk_store";
+        $sqlExport .= " FROM " . MAIN_DB_PREFIX . "doli2shop_action_log";
+        $sqlExport .= " WHERE entity = " . ((int) $conf->entity);
+        $sqlExport .= " ORDER BY date_action DESC, rowid DESC";
+        // Borne dure : un export doit rester envoyable par courriel. Au-delà, c'est la purge ou
+        // un filtre qui est la réponse, pas un fichier de plusieurs dizaines de méga-octets.
+        $sqlExport .= " LIMIT 20000";
+
+        $resExport = $db->query($sqlExport);
+        if (!$resExport) {
+            setEventMessages($db->lasterror(), null, 'errors');
+        } else {
+            $filename = 'doli2shop_journal_' . dol_print_date(dol_now(), '%Y-%m-%d_%H%M%S') . '.csv';
+
+            top_httphead('text/csv; charset=UTF-8');
+            header('Content-Disposition: attachment; filename="' . $filename . '"');
+
+            $out = fopen('php://output', 'w');
+            // BOM UTF-8 : sans lui, Excel affiche les accents en mojibake et le client croit le
+            // fichier corrompu.
+            fwrite($out, "\xEF\xBB\xBF");
+            fputcsv($out, array('date', 'run_id', 'provenance', 'type', 'objet_type', 'objet_id', 'resultat', 'message', 'duree_ms', 'boutique'), ';');
+            while ($objExport = $db->fetch_object($resExport)) {
+                // Story export-diagnostic-detection-hex-elargie (AC9) : construction de ligne
+                // extraite dans lib/doli2shop.lib.php pour être testable isolément — la colonne
+                // 'message' (texte libre écrit par le module : résultats d'appel API, erreurs) peut
+                // interpoler un jeton hexadécimal brut, désormais masqué par
+                // doli2shopRedactSensitiveValue() comme le reste des exports du module.
+                fputcsv($out, doli2shopBuildActionLogExportRow($objExport), ';');
+            }
+            fclose($out);
+            $db->free($resExport);
+            exit;
+        }
+    }
+}
+
 // Téléchargement du FICHIER de journal du module.
 //
 // Les traces du module partaient jusqu'ici dans `documents/dolibarr.log`, PARTAGÉ avec le cœur de
@@ -141,21 +193,52 @@ if ($action == 'download_logfile') {
         setEventMessages($langs->trans("ErrorInvalidCSRFTokenRetry"), null, 'errors');
     } else {
         $logPath = ModuleLogFile::path();
-        if ($logPath === null || !is_file($logPath)) {
-            // Un fichier absent n'est pas une panne : c'est un module qui n'a encore rien
-            // journalisé, ou un journal désactivé. Le dire évite au client de croire à une erreur.
+        if ($logPath === null) {
+            // Un journal désactivé n'est pas une panne : le dire évite au client de croire à une
+            // erreur. Distinct du cas 'not_found' ci-dessous (chemin configuré mais fichier absent).
             setEventMessages($langs->trans("ModuleLogFileEmpty"), null, 'warnings');
         } else {
-            $downloadName = 'doli2shop_' . dol_print_date(dol_now(), '%Y-%m-%d_%H%M%S') . '.log';
+            // Re-review 3 couches (H1) : is_file()/is_readable()/fopen() sont désormais vérifiés
+            // AVANT tout en-tête HTTP de succès (Content-Type/Content-Disposition). L'ancien code
+            // envoyait déjà ces en-têtes avant même de tenter fopen() : un fichier devenu illisible
+            // entre les deux (permissions, fichier supprimé par un autre processus, disque hors
+            // ligne) produisait un téléchargement de 0 octet annoncé comme un succès HTTP 200, sans
+            // aucune trace ni message.
+            list($openStatus, $logHandle) = doli2shopOpenLogFileForDownload($logPath);
 
-            top_httphead('text/plain; charset=UTF-8');
-            header('Content-Disposition: attachment; filename="' . $downloadName . '"');
-            header('Content-Length: ' . (string) filesize($logPath));
+            if ($openStatus === 'not_found') {
+                setEventMessages($langs->trans("ModuleLogFileEmpty"), null, 'warnings');
+            } elseif ($openStatus !== 'ok') {
+                // 'unreadable' ou 'open_failed' : problème réel d'accès au fichier, pas une simple
+                // absence — message d'erreur explicite + trace journal pour investigation.
+                dol_syslog("action_log.php: download_logfile impossible (status=$openStatus) for path=$logPath", LOG_ERR);
+                setEventMessages($langs->trans("ModuleLogFileUnreadable"), null, 'errors');
+            } else {
+                $downloadName = 'doli2shop_' . dol_print_date(dol_now(), '%Y-%m-%d_%H%M%S') . '.log';
 
-            // readfile() plutôt que file_get_contents() : le fichier peut approcher les 8 Mo de la
-            // rotation, inutile de le charger entièrement en mémoire pour le recracher.
-            readfile($logPath);
-            exit;
+                top_httphead('text/plain; charset=UTF-8');
+                header('Content-Disposition: attachment; filename="' . $downloadName . '"');
+                // Story export-diagnostic-detection-hex-elargie (AC10) : le Content-Length
+                // précalculé sur la taille du fichier D'ORIGINE est retiré — la taille change après
+                // masquage et ne peut plus être connue avant traitement. PHP enverra la réponse
+                // sans Content-Length, ce qui est déjà le comportement d'autres exports du module
+                // (l'export CSV ci-dessus n'en pose pas non plus).
+
+                // Re-review 3 couches (M1) : lecture par CHUNKS BORNÉS avec fenêtre de
+                // recouvrement (jamais fgets() sans longueur, qui chargerait une seule ligne
+                // pathologique entière en mémoire) — voir doli2shopStreamMaskedLogFileToOutput().
+                $streamStatus = doli2shopStreamMaskedLogFileToOutput(
+                    $logHandle,
+                    'doli2shopMaskAllKnownSensitiveSubstringsInFreeText',
+                    static function (string $chunk): void {
+                        echo $chunk;
+                    }
+                );
+                if ($streamStatus === 'read_error') {
+                    dol_syslog("action_log.php: download_logfile read error mid-stream for path=$logPath", LOG_ERR);
+                }
+                exit;
+            }
         }
     }
 }
@@ -426,6 +509,17 @@ if ($totalPages > 1) {
     }
     print '</div>';
 }
+
+// Export CSV du journal de cycles (base) — ce que le module a fait, cycle par cycle.
+print '<br>';
+print '<div style="margin-top: 10px;">';
+print '<form method="POST" action="'.dol_escape_htmltag($_SERVER["PHP_SELF"]).'">';
+print '<input type="hidden" name="token" value="'.newToken().'">';
+print '<input type="hidden" name="action" value="export">';
+print '<small class="opacitymedium">'.$langs->trans("ActionLogExportInfo").'</small> ';
+print '<input type="submit" class="button" value="'.$langs->trans("ActionLogExportButton").'">';
+print '</form>';
+print '</div>';
 
 // Téléchargement du fichier de journal du module — à joindre à une demande d'assistance.
 print '<br>';

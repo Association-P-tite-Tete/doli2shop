@@ -6,13 +6,23 @@
  * FIX #144 v2.1.2: Empêche la ré-exécution des migrations et la perte de données
  * lors de la réactivation ou mise à jour du module.
  *
+ * Story migrationmanager-prefixe-de-tables-non-substitue (v2.6.0) : executeMigration()
+ * exécutait le contenu brut des fichiers sql/update_*.sql SANS substituer le préfixe
+ * `llx_` par MAIN_DB_PREFIX — contrairement au cœur (run_sql(), core/lib/admin.lib.php,
+ * identique sur Dolibarr 18/23/24), qui applique déjà cette substitution pour tout
+ * fichier chargé via _load_tables(). Chez un client dont MAIN_DB_PREFIX != 'llx_', chaque
+ * migration rejouée par MigrationManager échouait ("Table '<base>.llx_...' doesn't
+ * exist") alors que _load_tables() l'avait déjà appliquée correctement en amont — d'où
+ * le RETRY perpétuel observé (dossier Europe Loisirs, 29/09/2026). Voir
+ * substituteTablePrefix() ci-dessous.
+ *
  * @package     ShopifyIntegration
  * @subpackage  Class
  * @category    migration
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.1.2
+ * @version     2.6.0
  * @since       2.1.2
  * @link        https://doli2shop.ptitetete.org
  */
@@ -233,6 +243,18 @@ class MigrationManager
             // Lire le contenu du fichier SQL
             $sqlContent = file_get_contents($sqlFile);
 
+            // AC1 (story migrationmanager-prefixe-de-tables-non-substitue) : substitution du
+            // préfixe AVANT tout parsing/filtrage — jamais après, jamais requête par requête.
+            // parseSQLContent() (juste en dessous) construit $historyTable = MAIN_DB_PREFIX .
+            // $this->historyTable et compare ce nom PRÉFIXÉ au contenu qu'on lui donne (filtre
+            // DETTE 50-6, cf. son docblock). Si la substitution n'a pas encore eu lieu à ce
+            // moment, le contenu comparé porte encore le littéral `llx_doli2shop_migrations` :
+            // le filtre ne matche plus rien, le marqueur embarqué (entity=1 en dur) n'est plus
+            // neutralisé et serait réellement exécuté après substitution dans la boucle
+            // ci-dessous — réintroduisant le bug multi-entité que DETTE 50-6 corrige,
+            // spécifiquement pour les clients à préfixe personnalisé.
+            $sqlContent = self::substituteTablePrefix($sqlContent);
+
             // Nettoyer et séparer les requêtes
             $queries = $this->parseSQLContent($sqlContent);
 
@@ -273,6 +295,52 @@ class MigrationManager
         $this->recordMigration($version, $filename, $executionTimeMs, $success, $errorMessage);
 
         return $success;
+    }
+
+    /**
+     * Substitue le préfixe de table `llx_` par MAIN_DB_PREFIX dans un contenu SQL brut —
+     * même règle que le cœur (`run_sql()`, core/lib/admin.lib.php, identique sur Dolibarr
+     * 18/23/24) : `preg_replace('/llx_/i', MAIN_DB_PREFIX, $sql)`, appliquée seulement si
+     * MAIN_DB_PREFIX !== 'llx_'. Couvre aussi bien les noms de table en clair que les
+     * littéraux à l'intérieur des chaînes des gardes `SET @sqlstmt := …` / `PREPARE` et des
+     * `TABLE_NAME = 'llx_…'` (substitution de texte brute, sans distinction de contexte SQL —
+     * exactement le comportement du cœur).
+     *
+     * Fonction pure : aucun effet de bord, aucune dépendance à $this — testable isolément.
+     * $prefix est injectable (au lieu de toujours lire MAIN_DB_PREFIX) pour permettre un test
+     * unitaire du comportement de substitution SANS avoir besoin de redéfinir la constante
+     * PHP MAIN_DB_PREFIX dans un process dédié (elle est figée une seule fois par
+     * test/bootstrap.php et ne peut plus être redéfinie ensuite) ; en production, $prefix
+     * reste toujours null et la vraie constante est utilisée.
+     *
+     * ⚠️ Contrainte d'implémentation obligatoire (Validate 29/09/2026) : préfixe ÉCHAPPÉ pour
+     * la chaîne de REMPLACEMENT — `preg_quote()` échappe les métacaractères d'un MOTIF, pas la
+     * syntaxe de référence arrière (`\1`, `$1`, …) interprétée par preg_replace() dans sa
+     * chaîne de REMPLACEMENT. Un préfixe client contenant `$` ou `\` (ex. un `$` littéral)
+     * serait sinon mal interprété. On échappe donc explicitement `\` et `$` avant de les
+     * passer en 2ᵉ argument de preg_replace().
+     *
+     * @param string $sqlContent Contenu SQL brut, AVANT tout parsing/filtrage
+     * @param string|null $prefix Préfixe cible ; null = MAIN_DB_PREFIX (comportement réel)
+     * @return string Contenu SQL avec `llx_` substitué par le préfixe cible
+     */
+    public static function substituteTablePrefix($sqlContent, $prefix = null)
+    {
+        if ($prefix === null) {
+            $prefix = MAIN_DB_PREFIX;
+        }
+
+        if ($prefix === 'llx_') {
+            return $sqlContent;
+        }
+
+        // Échappement de la chaîne de REMPLACEMENT (pas preg_quote(), qui échapperait des
+        // métacaractères de MOTIF sans rapport, comme '.' ou '/') : \ -> \\ puis $ -> \$.
+        // Ordre important — échapper $ en premier doublerait les \ qu'on vient d'introduire.
+        $escapedPrefix = str_replace('\\', '\\\\', $prefix);
+        $escapedPrefix = str_replace('$', '\\$', $escapedPrefix);
+
+        return preg_replace('/llx_/i', $escapedPrefix, $sqlContent);
     }
 
     /**

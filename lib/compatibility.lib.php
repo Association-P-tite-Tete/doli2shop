@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.0.34
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -77,15 +77,21 @@ if (!function_exists('getDolGlobalFloat')) {
 // getDolGlobalBool - Returns boolean value from global configuration
 if (!function_exists('getDolGlobalBool')) {
     /**
-     * Get global boolean constant value
-     * @param string $key Name of constant
-     * @return bool       True if constant exists and is not empty
+     * Get global boolean constant value with fallback
+     *
+     * Story 63-11 : ajout du paramètre $default (aligné sur getDolGlobalString/getDolGlobalInt
+     * ci-dessus, et sur la signature du cœur Dolibarr 16+). Rétrocompatible : tout appel existant
+     * à 1 argument garde exactement le même comportement (défaut = false).
+     *
+     * @param string $key     Name of constant
+     * @param bool   $default Default value if constant doesn't exist
+     * @return bool           True if constant exists and is not empty, $default otherwise
      * @since 2.0.34 Compatibility function for Dolibarr < 21
      */
-    function getDolGlobalBool($key)
+    function getDolGlobalBool($key, $default = false)
     {
         global $conf;
-        return !empty($conf->global->$key);
+        return isset($conf->global->$key) ? !empty($conf->global->$key) : (bool) $default;
     }
 }
 

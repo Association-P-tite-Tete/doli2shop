@@ -15,7 +15,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.2.1
  * @link        https://doli2shop.ptitetete.org
  */
@@ -29,7 +29,7 @@ if (!defined('DOLI2SHOP_MODULE_VERSION')) {
      * Version actuelle du module Doli2Shop
      * Format : MAJOR.MINOR.PATCH (semver)
      */
-    define('DOLI2SHOP_MODULE_VERSION', '2.5.7');
+    define('DOLI2SHOP_MODULE_VERSION', '2.6.0');
 }
 
 if (!defined('DOLI2SHOP_MIN_DOLIBARR_VERSION')) {

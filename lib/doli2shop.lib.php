@@ -11,7 +11,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       1.0.0
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -20,6 +20,44 @@
 // Version centralisée — source unique
 require_once dirname(__FILE__) . '/version.lib.php';
 
+// Story suite-de-tests-appelle-l-api-de-production (AC2) : valeurs par défaut de PRODUCTION,
+// lues par getDolGlobalString() partout ci-dessous où une URL d'API est construite — le SEUL
+// endroit où ces deux littéraux doivent apparaître en dur dans ce fichier (tout autre site
+// fait échouer test/unit/NoHardcodedProductionApiUrlGuardTest.php). test/bootstrap.php définit
+// ces deux constantes AVANT de charger ce fichier, avec une valeur inerte : la garde `!defined()`
+// ci-dessous cède alors la main à cette valeur de test, quel que soit l'ordre d'exécution des
+// tests (contrairement à un override via $conf->global, qu'un `$conf = new \stdClass()` fait
+// dans le setUp() d'un AUTRE fichier de test peut effacer avant que ce fichier ne soit sollicité).
+if (!defined('DOLI2SHOP_BILLING_API_ENDPOINT_DEFAULT')) {
+    define('DOLI2SHOP_BILLING_API_ENDPOINT_DEFAULT', 'https://doli2shop.ptitetete.org/api/billing.php');
+}
+if (!defined('DOLI2SHOP_VERSION_API_ENDPOINT_DEFAULT')) {
+    define('DOLI2SHOP_VERSION_API_ENDPOINT_DEFAULT', 'https://doli2shop.ptitetete.org/api/version.php');
+}
+
+/**
+ * Point de résolution UNIQUE de l'URL de l'API Billing — Review 3 couches 27/09 (finding MEDIUM
+ * n°3) : deux noms de surcharge coexistaient pour le même endpoint, `DOLI2SHOP_BILLING_API_ENDPOINT`
+ * ici et `SHOPIFY_BILLING_API_ENDPOINT` dans `SupportManager::getBillingApiEndpoint()`. Unifiés sur
+ * UN nom canonique — `DOLI2SHOP_BILLING_API_ENDPOINT` — avec l'ancien nom conservé en repli pour ne
+ * casser aucune surcharge déjà déployée chez un client sous l'ancien nom.
+ *
+ * Partagée par lib/doli2shop.lib.php, class/supportmanager.class.php (via
+ * SupportManager::getBillingApiEndpoint()) et tous les écrans admin/ qui appellent billing.php
+ * (stores.php, shopify_license.php, diagnostic.php, health.php). Tout appel curl vers billing.php
+ * DOIT passer par cette fonction, jamais par un littéral en dur ni par un getDolGlobalString()
+ * direct — cf. test/unit/NoHardcodedProductionApiUrlGuardTest.php (garde-fou, périmètre étendu à
+ * admin/ le 27/09).
+ *
+ * @return string URL de base de l'API Billing (sans query string)
+ */
+function doli2shopGetBillingApiEndpoint()
+{
+    return getDolGlobalString(
+        'DOLI2SHOP_BILLING_API_ENDPOINT',
+        getDolGlobalString('SHOPIFY_BILLING_API_ENDPOINT', DOLI2SHOP_BILLING_API_ENDPOINT_DEFAULT)
+    );
+}
 
 /**
  * Lit le cache de statut de licence d'un domaine, et refuse ce qu'il ne peut pas avoir ecrit.
@@ -333,7 +371,7 @@ function doli2shopStoreSwitchDroppedParams()
  * @param  DoliDB $db Connexion base de données
  * @return void
  * @since  2.3.10
- * @version     2.5.7
+ * @version     2.6.0
  */
 function doli2shopRenderAdminTopBar($db)
 {
@@ -810,7 +848,7 @@ function doli2shopGetLicenseStatus($shopDomain = null)
         // POST billing avec CE domaine (pas la constante globale)
         // Story 50-9 : télémétrie (domaine/version Dolibarr/version module/version PHP)
         // construite via doli2shopBuildTelemetry() — jamais 'unknown', clé omise si non résolue.
-        $apiUrl   = 'https://doli2shop.ptitetete.org/api/billing.php?action=validate-dolibarr';
+        $apiUrl   = doli2shopGetBillingApiEndpoint() . '?action=validate-dolibarr';
         $postData = json_encode(array_merge(
             [
                 'action'      => 'validate-dolibarr',
@@ -899,7 +937,7 @@ function doli2shopGetLicenseStatus($shopDomain = null)
     // car PHP ne remplit pas $_POST pour Content-Type: application/json)
     // Story 50-9 : télémétrie construite via doli2shopBuildTelemetry() — jamais 'unknown',
     // clé omise si non résolue.
-    $apiUrl = 'https://doli2shop.ptitetete.org/api/billing.php?action=validate-dolibarr';
+    $apiUrl = doli2shopGetBillingApiEndpoint() . '?action=validate-dolibarr';
     $postData = json_encode(array_merge(
         [
             'action' => 'validate-dolibarr',
@@ -1338,7 +1376,7 @@ function doli2shopGetLatestVersion()
         return $cached;
     }
 
-    $ch = curl_init('https://doli2shop.ptitetete.org/api/version.php?format=json');
+    $ch = curl_init(getDolGlobalString('DOLI2SHOP_VERSION_API_ENDPOINT', DOLI2SHOP_VERSION_API_ENDPOINT_DEFAULT) . '?format=json');
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_HTTPHEADER => ['User-Agent: ShopifyIntegration/' . DOLI2SHOP_MODULE_VERSION],
@@ -1419,7 +1457,7 @@ function doli2shopRequestDownloadUrl()
         'shop_domain' => $shopDomain,
     ]);
 
-    $ch = curl_init('https://doli2shop.ptitetete.org/api/billing.php?action=generate-download-token');
+    $ch = curl_init(doli2shopGetBillingApiEndpoint() . '?action=generate-download-token');
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_POST => true,
@@ -1988,9 +2026,9 @@ function doli2shopCheckStoresTableSchema($db): array
     $expectedColumns = array(
         'rowid', 'entity', 'label', 'shop_domain', 'access_token', 'api_key', 'api_secret',
         'location_id', 'fk_categorie', 'fk_categorie_order', 'fk_categorie_invoice',
-        'fk_categorie_proposal', 'is_default', 'active', 'license_status', 'license_checked',
-        'serial_number', 'token_expires_at', 'refresh_token', 'token_reconnect_required',
-        'datec', 'tms',
+        'fk_categorie_proposal', 'is_default', 'default_key', 'active', 'license_status',
+        'license_checked', 'serial_number', 'token_expires_at', 'refresh_token',
+        'token_reconnect_required', 'datec', 'tms',
     );
 
     $sql  = 'SELECT COLUMN_NAME FROM information_schema.COLUMNS';
@@ -2016,7 +2054,7 @@ function doli2shopCheckStoresTableSchema($db): array
     }
 
     // Aucune colonne remontée = la table n'existe pas du tout (une table réelle a toujours au
-    // moins une colonne). Review 3 couches (MEDIUM) : ne pas annoncer « 22 colonnes manquantes »
+    // moins une colonne). Review 3 couches (MEDIUM) : ne pas annoncer « 23 colonnes manquantes »
     // sur une install où la table n'a simplement jamais été créée — le diagnostic serait exact
     // mais illisible, et la cause (table absente) est différente d'une migration partielle.
     if (empty($existingColumns)) {
@@ -2049,6 +2087,17 @@ function doli2shopCheckStoresTableSchema($db): array
  * `doli2shopCheckStoresTableSchema()` — toute colonne ajoutée à l'un sans l'autre fait échouer ce
  * test (AC3).
  *
+ * ⚠️ `default_key` (story doublon-is-default-boutiques-non-empeche) est une colonne GÉNÉRÉE
+ * dépendant de `is_default`/`entity` : son `ADD COLUMN` échouerait si `is_default` n'existait pas
+ * encore. `doli2shopCheckStoresTableSchema()::$expectedColumns` place `default_key`
+ * IMMÉDIATEMENT après `is_default` — `array_diff()` y préserve l'ordre, donc la boucle de
+ * `doli2shopRepairStoresTableSchema()` ajoute toujours `is_default` avant `default_key` sur une
+ * table amputée des deux. Ne jamais réordonner `$expectedColumns` sans revérifier cette dépendance.
+ * Cette réparation n'ajoute JAMAIS l'index unique associé (`uk_doli2shop_stores_default_key`) :
+ * comme `idx_doli2shop_stores_entity`/`uk_doli2shop_stores_domain`, les index restent hors du
+ * périmètre colonne-par-colonne de cette fonction — portés par leurs propres blocs gardés
+ * (`sql/llx_doli2shop_stores.sql`, `sql/update_2.6.0_2.6.0b.sql`).
+ *
  * @return array<string,string> Colonne => fragment DDL complet (sans `ALTER TABLE … ADD COLUMN`)
  * @since  2.5.3
  */
@@ -2064,6 +2113,7 @@ function doli2shopStoresTableColumnDefinitions(): array
         'fk_categorie_invoice' => "fk_categorie_invoice INT(11) DEFAULT NULL COMMENT 'Catégorie Dolibarr factures (TYPE_INVOICE) boutique (Story 47-5)'",
         'fk_categorie_proposal' => "fk_categorie_proposal INT(11) DEFAULT NULL COMMENT 'Catégorie Dolibarr devis (TYPE_PROPOSAL) boutique (Story 48-2)'",
         'is_default' => "is_default TINYINT(1) NOT NULL DEFAULT 0",
+        'default_key' => "default_key INT(11) GENERATED ALWAYS AS (IF(is_default = 1, entity, NULL)) VIRTUAL",
         'active' => "active TINYINT(1) NOT NULL DEFAULT 1",
         'license_status' => "license_status VARCHAR(20) NOT NULL DEFAULT 'unknown' COMMENT 'Statut licence boutique : valid|invalid|unknown (Story 47-6)'",
         'license_checked' => "license_checked DATETIME DEFAULT NULL COMMENT 'Dernière vérification licence (Story 47-6)'",
@@ -2162,6 +2212,106 @@ function doli2shopRepairStoresTableSchema($db): array
 }
 
 /**
+ * Pose l'index unique `uk_doli2shop_stores_default_key` — protection contre deux boutiques
+ * `is_default=1` pour la même `entity` (story doublon-is-default-boutiques-non-empeche) — DÈS LA
+ * PREMIÈRE ACTIVATION du module sur un parc très ancien (finding 4, review 3 couches 2026-09-26).
+ *
+ * Sur une installation dont `llx_doli2shop_stores` ne portait pas encore la colonne `is_default`
+ * (schéma antérieur à 2.3.x), `update_2.6.0_2.6.0b.sql` échoue purement et simplement — son UPDATE
+ * de dédoublonnage référence `is_default`, colonne absente à ce moment-là. `MigrationManager`
+ * n'enregistre alors PAS cette migration comme appliquée (`success=0`, cf. `recordMigration()`) :
+ * elle sera rejouée au PROCHAIN `init()`, mais ce prochain `init()` n'a lieu que si le module est
+ * réactivé une seconde fois. Entre les deux, `doli2shopRepairStoresTableSchema()` (appelée juste
+ * avant CETTE fonction) a déjà ajouté `is_default` ET `default_key` par simple `ADD COLUMN` — sans
+ * cette fonction, l'index unique resterait absent, potentiellement de façon PERMANENTE si l'admin
+ * ne réactive jamais une seconde fois : aucune protection contre le doublon que toute cette story
+ * corrige.
+ *
+ * Idempotente et défensive :
+ * - no-op si `is_default` ou `default_key` sont encore absentes (rien à indexer — la migration/
+ *   réparation d'un prochain `init()` s'en chargera, cf. ci-dessus) ;
+ * - no-op si l'index existe déjà (cas normal : migration appliquée avec succès du premier coup) ;
+ * - REFUSE de poser l'index si des doublons `is_default=1` existent déjà pour une même entity —
+ *   l'ALTER échouerait de toute façon sur une violation de contrainte à la création de l'index,
+ *   et un simple échec SQL journalisé serait moins clair que ce diagnostic explicite. Le
+ *   dédoublonnage complet (règle de départage sur DOLI2SHOP_STORE_HOSTNAME, cf.
+ *   `update_2.6.0_2.6.0b.sql`) reste porté par la migration, rejouée à la prochaine réactivation.
+ *
+ * @param  DoliDB $db Connexion base de données
+ * @return array{ensured:bool, reason:string} `ensured` = vrai si l'index est posé après cet appel
+ *         (déjà présent, ou posé à l'instant) ; `reason` = motif (log) quand `ensured` est faux :
+ *         `'absent'`/`'unknown'` (statut schéma), `'columns_missing'` (is_default/default_key pas
+ *         encore là), `'duplicates_present'` (doublons existants, ALTER non tenté),
+ *         `'index_check_failed'`/`'alter_failed'` (erreur SQL, détail dans le log)
+ * @since  2.6.0
+ */
+function doli2shopEnsureDefaultKeyUniqueIndex($db): array
+{
+    $schemaCheck = doli2shopCheckStoresTableSchema($db);
+
+    if ($schemaCheck['status'] === 'absent' || $schemaCheck['status'] === 'unknown') {
+        return array('ensured' => false, 'reason' => $schemaCheck['status']);
+    }
+
+    if (in_array('is_default', $schemaCheck['missing'], true) || in_array('default_key', $schemaCheck['missing'], true)) {
+        dol_syslog(
+            'doli2shopEnsureDefaultKeyUniqueIndex() - Colonne(s) is_default/default_key pas encore'
+            . ' présente(s), pose de l\'index reportée',
+            LOG_DEBUG
+        );
+        return array('ensured' => false, 'reason' => 'columns_missing');
+    }
+
+    $sqlIndexExists = 'SELECT COUNT(*) AS n FROM information_schema.STATISTICS';
+    $sqlIndexExists .= " WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '" . $db->escape(MAIN_DB_PREFIX . 'doli2shop_stores') . "'";
+    $sqlIndexExists .= " AND INDEX_NAME = 'uk_doli2shop_stores_default_key'";
+    $resultIndex = $db->query($sqlIndexExists);
+    if (!$resultIndex) {
+        dol_syslog('doli2shopEnsureDefaultKeyUniqueIndex() - Erreur vérification index: ' . $db->lasterror(), LOG_WARNING);
+        return array('ensured' => false, 'reason' => 'index_check_failed');
+    }
+    $indexRow = $db->fetch_object($resultIndex);
+    if ((int) ($indexRow->n ?? 0) > 0) {
+        // Déjà posé (cas normal : migration appliquée avec succès, ou appel précédent de cette
+        // même fonction) — rien à faire, aucun log alarmant.
+        return array('ensured' => true, 'reason' => '');
+    }
+
+    // fetch_object() plutôt que num_rows() : même surface DoliDB restreinte que
+    // doli2shopCheckStoresTableSchema()/doli2shopRepairStoresTableSchema() ci-dessus (portable
+    // sur l'adaptateur mysqli minimal des tests d'intégration, qui n'expose pas num_rows()).
+    $sqlDuplicateCheck = 'SELECT entity FROM ' . MAIN_DB_PREFIX . 'doli2shop_stores';
+    $sqlDuplicateCheck .= ' WHERE is_default = 1 GROUP BY entity HAVING COUNT(*) > 1 LIMIT 1';
+    $resultDuplicate = $db->query($sqlDuplicateCheck);
+    if ($resultDuplicate && $db->fetch_object($resultDuplicate)) {
+        dol_syslog(
+            'doli2shopEnsureDefaultKeyUniqueIndex() - Doublons is_default=1 détectés pour au moins'
+            . ' une entity : pose de l\'index unique reportée à la prochaine réactivation du module'
+            . ' (migration update_2.6.0_2.6.0b.sql rejouée par MigrationManager, dédoublonnage'
+            . ' complet avant l\'ALTER)',
+            LOG_WARNING
+        );
+        return array('ensured' => false, 'reason' => 'duplicates_present');
+    }
+
+    $sqlAddIndex = 'ALTER TABLE ' . MAIN_DB_PREFIX . 'doli2shop_stores';
+    $sqlAddIndex .= ' ADD UNIQUE INDEX uk_doli2shop_stores_default_key (default_key)';
+    $resultAdd = $db->query($sqlAddIndex);
+    if (!$resultAdd) {
+        dol_syslog('doli2shopEnsureDefaultKeyUniqueIndex() - Échec ADD UNIQUE INDEX uk_doli2shop_stores_default_key: ' . $db->lasterror(), LOG_ERR);
+        return array('ensured' => false, 'reason' => 'alter_failed');
+    }
+
+    dol_syslog(
+        'doli2shopEnsureDefaultKeyUniqueIndex() - Index unique uk_doli2shop_stores_default_key posé'
+        . ' (réparation automatique, protection dès la première activation — finding 4, review 3'
+        . ' couches 2026-09-26)',
+        LOG_WARNING
+    );
+    return array('ensured' => true, 'reason' => '');
+}
+
+/**
  * Assemble le message affiché à l'utilisateur quand l'enregistrement des credentials OAuth
  * échoue (hotfix 2.4.5) : libellé traduit + cause SQL réelle + état du schéma.
  *
@@ -2229,6 +2379,133 @@ function doli2shopBuildOAuthStoreFailureMessage($langs, $storeFailureDetail, arr
 function doli2shopIsOAuthConstantWriteFailure(string $value, int $writeResult): bool
 {
     return $value !== '' && $writeResult <= 0;
+}
+
+/**
+ * Vérifie la signature ASYMÉTRIQUE du canal OAuth de BASE (`shop|access_token|scope`), en
+ * fail-closed strict — Story 34-6b (cutover : retrait du HMAC legacy).
+ *
+ * Fonction PURE, extraite d'`admin/oauth_receive.php` (non exécutable en PHPUnit — cf. son propre
+ * PHPDoc et `test/unit/OauthPickupModuleWiringGuardTest.php`) : reçoit la clé publique DÉJÀ
+ * résolue (`doli2shopFetchOAuthPublicKey()`, réseau/cache, reste hors de cette fonction) et rend
+ * un verdict + MOTIF explicite, jamais un booléen nu — pour que l'appelant distingue « clé
+ * publique injoignable » (message actionnable dédié, décision 1 de la story) de « signature
+ * invalide » (message générique existant).
+ *
+ * AUCUN repli HMAC : signature absente, OpenSSL absent, clé publique introuvable, ou
+ * `openssl_verify()` != 1 sont TOUS des motifs de rejet — jamais de branche alternative. Même
+ * patron que `doli2shopVerifySyncGateSignature()` ci-dessus, avec un motif de rejet en plus (le
+ * gate de synchronisation n'a pas de message d'erreur admin à différencier).
+ *
+ * @param  string      $shopDomain       Domaine boutique reçu (`shop`)
+ * @param  string      $accessToken      Jeton d'accès reçu (`access_token`)
+ * @param  string      $scope            Scopes reçus (`scope`)
+ * @param  string      $signatureAsymHex Signature hex RSA reçue (`signature_asym`), '' si absente
+ * @param  string|null $publicKeyPem     PEM déjà résolu par doli2shopFetchOAuthPublicKey(), ou null
+ * @param  bool        $opensslAvailable function_exists('openssl_verify')
+ * @return array{valid: bool, reason: string} `reason` ∈ 'ok' | 'missing_signature' |
+ *                    'openssl_unavailable' | 'public_key_unreachable' | 'invalid_signature'
+ * @since  2.6.0 Story 34-6b — cutover retrait HMAC legacy
+ */
+function doli2shopVerifyOAuthBaseSignature(
+    $shopDomain,
+    $accessToken,
+    $scope,
+    $signatureAsymHex,
+    $publicKeyPem,
+    $opensslAvailable
+): array {
+    if (empty($signatureAsymHex)) {
+        return array('valid' => false, 'reason' => 'missing_signature');
+    }
+    if (!$opensslAvailable) {
+        return array('valid' => false, 'reason' => 'openssl_unavailable');
+    }
+    if ($publicKeyPem === null || $publicKeyPem === '') {
+        return array('valid' => false, 'reason' => 'public_key_unreachable');
+    }
+
+    $dataToVerify = (string) $shopDomain . '|' . (string) $accessToken . '|' . (string) $scope;
+    $rawSig = @hex2bin((string) $signatureAsymHex);
+    $verify = ($rawSig !== false)
+        ? openssl_verify($dataToVerify, $rawSig, $publicKeyPem, OPENSSL_ALGO_SHA256)
+        : -1;
+
+    if ($verify !== 1) { // 1 = OK ; 0 = invalide ; -1 = erreur
+        return array('valid' => false, 'reason' => 'invalid_signature');
+    }
+
+    return array('valid' => true, 'reason' => 'ok');
+}
+
+/**
+ * Vérifie la signature ASYMÉTRIQUE du canal ÉTENDU (jetons expirables, Story 51-1) —
+ * `shop|access_token|scope|expires_in|refresh_token|timestamp` — Story 34-6b (cutover).
+ *
+ * Fonction PURE, même motif que `doli2shopVerifyOAuthBaseSignature()` ci-dessus, avec un
+ * paramètre `$now` INJECTÉ (jamais `time()` interne) pour rendre la fraîcheur du timestamp
+ * (anti-replay, >300s = rejet) testable déterministiquement.
+ *
+ * Un échec ici ne bloque JAMAIS tout le flux OAuth (AC3 de la story) : l'appelant se contente
+ * d'ignorer `expires_in`/`refresh_token`, comme si Shopify ne les avait pas renvoyés. AUCUN repli
+ * HMAC (`signature_ext`, retiré par cette story) : seul `signature_asym_ext` authentifie ces deux
+ * champs.
+ *
+ * @param  string      $shopDomain
+ * @param  string      $accessToken
+ * @param  string      $scope
+ * @param  int         $expiresIn
+ * @param  string      $refreshToken
+ * @param  int         $timestamp
+ * @param  string      $signatureAsymExtHex Signature hex RSA reçue, '' si absente
+ * @param  string|null $publicKeyPem        PEM déjà résolu par doli2shopFetchOAuthPublicKey(), ou null
+ * @param  bool        $opensslAvailable    function_exists('openssl_verify')
+ * @param  int         $now                 `time()` injecté par l'appelant
+ * @return array{valid: bool, reason: string} `reason` ∈ 'ok' | 'missing_signature' |
+ *                    'missing_timestamp' | 'stale_timestamp' | 'openssl_unavailable' |
+ *                    'public_key_unreachable' | 'invalid_signature'
+ * @since  2.6.0 Story 34-6b — cutover retrait HMAC legacy
+ */
+function doli2shopVerifyOAuthExtendedSignature(
+    $shopDomain,
+    $accessToken,
+    $scope,
+    $expiresIn,
+    $refreshToken,
+    $timestamp,
+    $signatureAsymExtHex,
+    $publicKeyPem,
+    $opensslAvailable,
+    $now
+): array {
+    if (empty($signatureAsymExtHex)) {
+        return array('valid' => false, 'reason' => 'missing_signature');
+    }
+    if (empty($timestamp)) {
+        return array('valid' => false, 'reason' => 'missing_timestamp');
+    }
+    if (($now - (int) $timestamp) > 300) {
+        return array('valid' => false, 'reason' => 'stale_timestamp');
+    }
+    if (!$opensslAvailable) {
+        return array('valid' => false, 'reason' => 'openssl_unavailable');
+    }
+    if ($publicKeyPem === null || $publicKeyPem === '') {
+        return array('valid' => false, 'reason' => 'public_key_unreachable');
+    }
+
+    $dataToVerify = (string) $shopDomain . '|' . (string) $accessToken . '|' . (string) $scope
+        . '|' . (string) $expiresIn . '|' . (string) $refreshToken . '|' . (string) $timestamp;
+    $rawSig = @hex2bin((string) $signatureAsymExtHex);
+    $verify = ($rawSig !== false)
+        ? openssl_verify($dataToVerify, $rawSig, $publicKeyPem, OPENSSL_ALGO_SHA256)
+        : -1;
+
+    if ($verify !== 1) {
+        return array('valid' => false, 'reason' => 'invalid_signature');
+    }
+
+    return array('valid' => true, 'reason' => 'ok');
 }
 
 /**
@@ -2416,6 +2693,202 @@ function doli2shopBuildOAuthDomainRetargetedMessage($langs, string $shop, $store
     $rowid = (int) ($store->rowid ?? 0);
 
     return $langs->trans('OAuthStoreDomainRetargeted', $shop, $label, $rowid);
+}
+
+/**
+ * Décide si les appels Shopify post-connexion (`getLocations`/`getShopInfo`/`syncWebhooks`/
+ * `createWebhookWithDatabase`) d'`admin/oauth_receive.php` doivent s'exécuter après une
+ * reconnexion OAuth par ailleurs commitée avec succès.
+ *
+ * Re-review 2026-09-23 (MEDIUM, finding 3) : si le refetch de la boutique reconnectée échoue
+ * (transitoire, juste après le commit de la transaction principale) ET que la cible n'est PAS la
+ * boutique par défaut, ces appels ne doivent PAS retomber sur le chemin legacy (`new
+ * ShopifyApi($db)` / constantes globales `DOLI2SHOP_*`) : ce chemin viserait alors la boutique PAR
+ * DÉFAUT au lieu de la boutique secondaire/nouvelle réellement reconnectée — violation de
+ * l'isolation Epic 47, et source potentielle d'un flag `token_reconnect_required` reposé sur la
+ * MAUVAISE boutique par un 401 transitoire de ces appels. Le repli legacy reste légitime
+ * UNIQUEMENT quand la cible EST la boutique par défaut : les constantes globales qu'il utilise
+ * viennent alors d'être écrites, à l'instant, par CETTE même requête, pour CETTE même boutique.
+ *
+ * Fonction PURE, testable sans DB (même motif que `doli2shopBuildOAuthDomainRetargetedMessage()`
+ * ci-dessus).
+ *
+ * @param  object|null $reconnectedStore    Boutique rechargée après le commit (`StoreService::fetch()`),
+ *                                          ou `null` si le refetch a échoué ou n'a pas pu être tenté.
+ * @param  bool        $targetsDefaultStore Cible de cette reconnexion = boutique par défaut ?
+ * @return bool
+ * @since  2.6.0
+ */
+function doli2shopShouldRunPostConnectionShopifyCalls($reconnectedStore, bool $targetsDefaultStore): bool
+{
+    return ($reconnectedStore !== null) || $targetsDefaultStore;
+}
+
+/**
+ * Message d'avertissement non bloquant affiché à l'admin quand
+ * `doli2shopShouldRunPostConnectionShopifyCalls()` renvoie `false` (finding 3 ci-dessus) : la
+ * reconnexion OAuth elle-même a réussi, mais l'auto-configuration de l'emplacement/des webhooks
+ * n'a pas pu être tentée pour la boutique concernée.
+ *
+ * Fonction PURE, testable sans DB.
+ *
+ * @param  object $langs      Objet Translate Dolibarr (ou stub de test exposant trans())
+ * @param  string $storeLabel Libellé d'affichage de la boutique concernée (`doli2shopStoreDisplayLabel()`)
+ * @param  int    $storeRowid Identifiant de la boutique concernée
+ * @return string
+ * @since  2.6.0
+ */
+function doli2shopBuildOAuthPostConnectionSkippedMessage($langs, string $storeLabel, int $storeRowid): string
+{
+    return $langs->trans('OAuthPostConnectionSkippedStoreRefetchFailed', $storeLabel, $storeRowid);
+}
+
+/**
+ * Compte le nombre de boutiques marquées `is_default = 1` dans un tableau de boutiques déjà
+ * chargé (`StoreService::getAll()`/résultat de `StoreService::getDefault()` sans `LIMIT`).
+ *
+ * Fonction PURE partagée — story `doublon-is-default-boutiques-non-empeche` (AC3/AC6, Validate
+ * 2026-09-23, point 6) : `StoreService::getDefault()` et `admin/disconnect_oauth.php` avaient
+ * chacun leur PROPRE boucle de comptage ad hoc pour la même anomalie (plus d'une ligne
+ * `is_default=1` par entity). La migration `update_2.6.0_2.6.0b.sql` ajoute une contrainte unique
+ * (`uk_doli2shop_stores_default_key`) qui rend ce cas normalement impossible pour toute écriture
+ * postérieure à son application — cette fonction reste une défense en profondeur pour une
+ * installation restée en état incohérent AVANT cette migration (ou un état antérieur à toute
+ * migration). Les deux appelants gardent leur propre journalisation contextuelle (message et
+ * niveau de log différents selon l'écran) ; seule la RÈGLE DE COMPTAGE est mutualisée ici
+ * (cf. mémoire projet « corriger la classe pas l'endroit »).
+ *
+ * @param  object[] $stores Boutiques (au minimum la propriété `is_default`)
+ * @return int               Nombre de boutiques `is_default = 1` dans ce tableau
+ * @since  2.6.0
+ */
+function doli2shopCountDefaultStores(array $stores): int
+{
+    $count = 0;
+    foreach ($stores as $store) {
+        if (!empty($store->is_default)) {
+            $count++;
+        }
+    }
+    return $count;
+}
+
+/**
+ * Détermine si une boutique VIENT RÉELLEMENT d'être créée comme boutique par défaut, en relisant
+ * son état RÉEL après l'INSERT plutôt qu'en faisant confiance à ce qui avait été demandé AVANT
+ * (story doublon-is-default-boutiques-non-empeche, Validate 2026-09-23 point 3) :
+ * `StoreService::create()` peut avoir SILENCIEUSEMENT démoté la boutique en SECONDAIRE
+ * (`is_default=0`) si une AUTRE requête concurrente est devenue défaut entre-temps — race TOCTOU
+ * sur l'index unique `uk_doli2shop_stores_default_key` (deux onglets complétant l'OAuth pour deux
+ * boutiques DIFFÉRENTES au même instant). Ne jamais faire confiance à une variable calculée AVANT
+ * l'INSERT pour décider d'écrire les constantes globales `DOLI2SHOP_*` — sinon une boutique
+ * démotée en secondaire ferait quand même pointer les constantes globales vers SON shop,
+ * réintroduisant exactement le défaut « deux sources de vérité » du hotfix 2.5.2.
+ *
+ * Fonction PURE, extraite de `admin/oauth_receive.php` (même motif que les fonctions voisines de
+ * ce fichier) : le script top-level n'est pas exécutable en test, cette décision l'est.
+ *
+ * @param  object|null $createdStoreCheck Relecture de la boutique via `StoreService::fetch()`
+ *                                        juste après `create()` (`null` = relecture elle-même
+ *                                        échouée, ex. incident transitoire de base)
+ * @return bool                           `true` UNIQUEMENT si la boutique relue existe ET porte
+ *                                        réellement `is_default = 1`
+ * @since  2.6.0
+ */
+function doli2shopResolveTargetsDefaultStoreAfterCreate($createdStoreCheck): bool
+{
+    return $createdStoreCheck !== null && (int) ($createdStoreCheck->is_default ?? 0) === 1;
+}
+
+/**
+ * Décide, après un `create()` ayant demandé `is_default=1`, l'état FINAL de `$targetsDefaultStore`
+ * ET quel message (s'il y en a un) doit être affiché à l'admin (findings 1 et 5, review 3 couches
+ * 2026-09-26, story doublon-is-default-boutiques-non-empeche).
+ *
+ * Fonction PURE, extraite de `admin/oauth_receive.php` (même motif que les fonctions voisines de
+ * ce fichier : ce script top-level, avec `header()`/`exit`, n'est pas exécutable en test unitaire —
+ * cette DÉCISION, elle, doit rester vérifiable indépendamment des accès DB qui l'alimentent).
+ *
+ * Trois issues possibles :
+ * - `'no_race'` : soit `create()` a réussi du premier coup en `is_default=1` (aucune relecture
+ *   nécessaire), soit — cas dégénéré non observé en pratique — la relecture après un retry annoncé
+ *   montre malgré tout `is_default=1`. Dans les deux cas, `targetsDefaultStore=true`, aucun message.
+ * - `'demoted'` : le retry est confirmé par une relecture réussie (`is_default=0`) —
+ *   `targetsDefaultStore=false`, message visible (finding 5).
+ * - `'unconfirmed'` : le retry a eu lieu mais les DEUX relectures ont échoué (incident transitoire
+ *   distinct de la race elle-même, déjà tranchée par `create()`) — `targetsDefaultStore=false` par
+ *   prudence (sûr : le retry de `create()` a de toute façon écrit `is_default=0`), message visible
+ *   distinct, JAMAIS de bascule silencieuse (finding 1).
+ *
+ * @param  bool        $wasDemotedByRace `StoreService::lastCreateWasDemotedByDefaultKeyRace()`
+ * @param  object|null $firstReread      1er `StoreService::fetch()` — n'a de sens que si
+ *                                       `$wasDemotedByRace` est vrai, ignoré sinon
+ * @param  object|null $secondReread     2e `StoreService::fetch()`, tenté UNIQUEMENT si
+ *                                       `$firstReread === null` — ignoré si `$firstReread` n'est
+ *                                       pas `null`
+ * @return array{targetsDefaultStore:bool, outcome:'no_race'|'demoted'|'unconfirmed'}
+ * @since  2.6.0
+ */
+function doli2shopResolveDefaultStoreOutcomeAfterCreate(bool $wasDemotedByRace, $firstReread, $secondReread): array
+{
+    if (!$wasDemotedByRace) {
+        return array('targetsDefaultStore' => true, 'outcome' => 'no_race');
+    }
+
+    $confirmedReread = ($firstReread !== null) ? $firstReread : $secondReread;
+
+    if ($confirmedReread === null) {
+        return array('targetsDefaultStore' => false, 'outcome' => 'unconfirmed');
+    }
+
+    $targetsDefaultStore = doli2shopResolveTargetsDefaultStoreAfterCreate($confirmedReread);
+
+    return array(
+        'targetsDefaultStore' => $targetsDefaultStore,
+        'outcome' => $targetsDefaultStore ? 'no_race' : 'demoted',
+    );
+}
+
+/**
+ * Message d'avertissement VISIBLE À L'ÉCRAN (pas seulement dans dolibarr.log) quand la boutique
+ * nouvellement créée avec is_default demandé a été CONFIRMÉE comme démotée en secondaire par une
+ * race TOCTOU sur l'index unique uk_doli2shop_stores_default_key (finding 5, review 3 couches
+ * 2026-09-26, story doublon-is-default-boutiques-non-empeche) : une autre requête concurrente est
+ * devenue boutique par défaut entre-temps. Sans ce message, seul dolibarr.log portait
+ * l'information — l'admin croyait avoir connecté SA boutique par défaut.
+ *
+ * Fonction PURE, testable sans DB (même motif que les fonctions voisines de ce fichier).
+ *
+ * @param  object $langs      Objet Translate Dolibarr (ou stub de test exposant trans())
+ * @param  string $shop       Domaine Shopify de la boutique concernée
+ * @param  int    $storeRowid Identifiant de la boutique concernée
+ * @return string
+ * @since  2.6.0
+ */
+function doli2shopBuildOAuthDefaultStoreDemotedMessage($langs, string $shop, int $storeRowid): string
+{
+    return $langs->trans('OAuthDefaultStoreDemotedByRace', $shop, $storeRowid);
+}
+
+/**
+ * Message d'avertissement VISIBLE À L'ÉCRAN quand l'état réel (par défaut ou secondaire) de la
+ * boutique nouvellement créée n'a PAS pu être confirmé après une race TOCTOU sur l'index unique
+ * uk_doli2shop_stores_default_key : la relecture post-création (`StoreService::fetch()`) a échoué
+ * DEUX fois de suite — incident de base distinct de la race elle-même (finding 1, review 3
+ * couches 2026-09-26). La boutique est traitée en SECONDAIRE par prudence (create() a de toute
+ * façon écrit is_default=0 pour cette ligne dans son propre retry), mais l'admin doit en être
+ * informé explicitement plutôt que de laisser une bascule silencieuse.
+ *
+ * Fonction PURE, testable sans DB.
+ *
+ * @param  object $langs      Objet Translate Dolibarr (ou stub de test exposant trans())
+ * @param  int    $storeRowid Identifiant de la boutique concernée
+ * @return string
+ * @since  2.6.0
+ */
+function doli2shopBuildOAuthDefaultStoreRaceUnconfirmedMessage($langs, int $storeRowid): string
+{
+    return $langs->trans('OAuthDefaultStoreRaceUnconfirmed', $storeRowid);
 }
 
 /**
@@ -4486,4 +4959,1861 @@ function doli2shopFindAmbiguousShopDomains($db)
     }
 
     return $ambiguous;
+}
+
+/**
+ * Remet le flag « reconnexion requise » à zéro après une reconnexion OAuth complète RÉUSSIE
+ * (`admin/oauth_receive.php`).
+ *
+ * Story `reconnect-flag-jamais-remis-a-zero-disconnect-oauth.md` (AC1) : ni
+ * `disconnect_oauth.php` ni `oauth_receive.php` ne remettaient jamais `token_reconnect_required`
+ * à 0 — un admin qui reconnectait une boutique après un signal « reconnexion requise » continuait
+ * à le voir affiché jusqu'au premier refresh automatique réussi qui suivait, alors que la
+ * reconnexion venait précisément de réparer la boutique.
+ *
+ * Régime BEST-EFFORT JOURNALISÉ (AC5, ajout Validate 2026-09-23), symétrique à
+ * `DOLI2SHOP_OAUTH_CONNECTED_AT` : un échec isolé de CETTE remise à zéro ne doit JAMAIS faire
+ * échouer/rollback une reconnexion OAuth par ailleurs réussie — d'où l'appel de cette fonction
+ * APRÈS le commit de la transaction principale d'`oauth_receive.php`, jamais dans le même
+ * `$errors`/rollback qui gouverne STORE_HOSTNAME/ACCESS_TOKEN/API_KEY/API_SECRET_KEY/
+ * OAUTH_SCOPES (ceux-là restent stricts, inchangés). Chaque échec est journalisé `LOG_ERR`,
+ * distinctement de ces échecs stricts.
+ *
+ * Invariant Epic 47 (inchangé) : la constante `DOLI2SHOP_TOKEN_RECONNECT_REQUIRED` n'est écrite
+ * QUE pour la boutique par défaut (`$targetsDefaultStore`) ; une boutique secondaire ne voit sa
+ * remise à zéro que sur sa ligne `stores`, jamais sur les constantes globales.
+ *
+ * Fonction extraite pour rester testable unitairement — `admin/oauth_receive.php` est un point
+ * d'entrée top-level (session, `header()`, `exit`) non exécutable en test, même contrainte que
+ * `doli2shopResolveOAuthDomainConflict()` ci-dessus. `StoreService::setReconnectRequired()` gère
+ * sa propre sous-transaction (begin/commit imbriqués, comme le reste de StoreService) ;
+ * `dolibarr_set_const()` la sienne : cette fonction n'a donc pas à ouvrir de transaction propre.
+ *
+ * @param  DoliDB       $db                  Handler base (requis par `dolibarr_set_const()`)
+ * @param  StoreService $storeService        Service déjà instancié par `oauth_receive.php`
+ * @param  object|null  $targetStore         Boutique réellement écrite par CETTE reconnexion
+ *                                            (après résolution/reciblage éventuel), ou `null` si
+ *                                            la ligne vient d'être CRÉÉE — son flag est alors déjà
+ *                                            à 0 par défaut de schéma, rien à remettre à zéro.
+ * @param  bool         $targetsDefaultStore Calculé par `oauth_receive.php` — pilote l'écriture
+ *                                            de la constante (invariant Epic 47 ci-dessus).
+ * @param  int          $entity              Entité Dolibarr courante
+ * @return array{storeRowOk:bool,constantOk:bool} État des deux écritures best-effort — `true`
+ *                    quand l'écriture correspondante n'était pas due (rien à faire) ou a réussi ;
+ *                    `false` uniquement sur échec réel (déjà journalisé LOG_ERR à ce point).
+ * @since  2.6.0
+ */
+function doli2shopResetReconnectRequiredAfterOAuth($db, $storeService, $targetStore, bool $targetsDefaultStore, int $entity): array
+{
+    $storeRowOk = true;
+    $constantOk = true;
+
+    // Review 3 couches 2026-09-23 (MEDIUM, finding 4) : AC5 promet qu'un échec isolé de cette
+    // remise à zéro ne fait JAMAIS échouer une reconnexion OAuth par ailleurs commitée — avant ce
+    // correctif, seul un retour négatif de setReconnectRequired()/dolibarr_set_const() était
+    // couvert ; un \Throwable inattendu (panne du driver, TypeError d'une dépendance) se serait
+    // propagé hors de cette fonction, appelée APRÈS le commit principal — donc en pleine réponse
+    // HTTP de succès, cassant l'écran alors que la reconnexion elle-même a déjà réussi.
+    if ($targetStore !== null) {
+        try {
+            $result = $storeService->setReconnectRequired((int) $targetStore->rowid, false);
+            // Contrat StoreService::update() (relayé par setReconnectRequired()) : 1 = ligne
+            // modifiée, 0 = no-op légitime (déjà à 0), -1/-2 = échec réel. Seul un résultat négatif
+            // est un échec.
+            if ($result < 0) {
+                $storeRowOk = false;
+                dol_syslog(
+                    'doli2shopResetReconnectRequiredAfterOAuth - échec remise à zéro token_reconnect_required'
+                    . ' (ligne stores) pour la boutique #' . (int) $targetStore->rowid
+                    . ' — non bloquant (AC5, best-effort, reconnexion OAuth déjà commitée)',
+                    LOG_ERR
+                );
+            }
+        } catch (\Throwable $e) {
+            $storeRowOk = false;
+            dol_syslog(
+                'doli2shopResetReconnectRequiredAfterOAuth - exception lors de la remise à zéro'
+                . ' token_reconnect_required (ligne stores) pour la boutique #' . (int) $targetStore->rowid
+                . ' — non bloquant (AC5/finding 4, best-effort, reconnexion OAuth déjà commitée) : '
+                . $e->getMessage(),
+                LOG_ERR
+            );
+        }
+    }
+
+    if ($targetsDefaultStore) {
+        try {
+            dol_include_once('/core/lib/admin.lib.php');
+            $writeResult = dolibarr_set_const($db, 'DOLI2SHOP_TOKEN_RECONNECT_REQUIRED', '0', 'yesno', 0, '', $entity);
+            if ($writeResult <= 0) {
+                $constantOk = false;
+                dol_syslog(
+                    'doli2shopResetReconnectRequiredAfterOAuth - échec remise à zéro'
+                    . ' DOLI2SHOP_TOKEN_RECONNECT_REQUIRED — non bloquant (AC5, best-effort, reconnexion'
+                    . ' OAuth déjà commitée)',
+                    LOG_ERR
+                );
+            }
+        } catch (\Throwable $e) {
+            $constantOk = false;
+            dol_syslog(
+                'doli2shopResetReconnectRequiredAfterOAuth - exception lors de la remise à zéro'
+                . ' DOLI2SHOP_TOKEN_RECONNECT_REQUIRED — non bloquant (AC5/finding 4, best-effort,'
+                . ' reconnexion OAuth déjà commitée) : ' . $e->getMessage(),
+                LOG_ERR
+            );
+        }
+    }
+
+    return array('storeRowOk' => $storeRowOk, 'constantOk' => $constantOk);
+}
+
+/**
+ * Remet le flag « reconnexion requise » à zéro à la DÉCONNEXION OAuth explicite
+ * (`admin/disconnect_oauth.php`).
+ *
+ * Story `reconnect-flag-jamais-remis-a-zero-disconnect-oauth.md` (AC2 — DÉCISION DU MAINTENEUR,
+ * review 3 couches 2026-09-23) : le choix initial de la story (Task 1/AC2 — ne jamais toucher le
+ * flag au disconnect, cf. Dev Agent Record) est remplacé par une décision explicite du
+ * mainteneur : le flag est désormais remis à 0 aussi à la déconnexion, sur la boutique
+ * EXPLICITEMENT ciblée par CETTE déconnexion (`admin/disconnect_oauth.php` résout toujours une
+ * boutique nommée, jamais un contexte implicite — cf. `doli2shopResolveOAuthDisconnectStore()`).
+ *
+ * Même régime BEST-EFFORT JOURNALISÉ que `doli2shopResetReconnectRequiredAfterOAuth()` (AC5) : un
+ * échec isolé ne doit jamais faire échouer/rollback un disconnect par ailleurs réussi — appelée
+ * APRÈS le commit de la transaction principale de `disconnect_oauth.php`, jamais dans le même
+ * `$error`/rollback qui gouverne la suppression des constantes et la purge des commandes.
+ *
+ * Invariant Epic 47 (inchangé) : la constante `DOLI2SHOP_TOKEN_RECONNECT_REQUIRED` n'est effacée
+ * QUE pour la boutique par défaut (`$targetIsDefault`) ; une boutique secondaire ne voit sa remise
+ * à zéro que sur sa ligne `stores`, jamais sur les constantes globales.
+ *
+ * Fonction séparée de `doli2shopResetReconnectRequiredAfterOAuth()` (plutôt qu'un simple alias) :
+ * un disconnect n'est PAS une reconnexion, et les messages `LOG_ERR` de l'autre fonction
+ * annoncent explicitement « reconnexion OAuth déjà commitée » — les réutiliser tels quels pour un
+ * disconnect produirait un diagnostic trompeur en cas d'échec.
+ *
+ * @param  DoliDB       $db            Handler base (requis par `dolibarr_set_const()`)
+ * @param  StoreService $storeService  Service déjà instancié par `disconnect_oauth.php`
+ * @param  object|null  $targetStore   Boutique EXPLICITEMENT résolue par CE disconnect
+ *                                      (`doli2shopResolveOAuthDisconnectStore()` ne renvoie jamais
+ *                                      null à ce point de l'appel — `disconnect_oauth.php` refuse
+ *                                      l'action avant si c'est le cas — mais la signature reste
+ *                                      tolérante par symétrie avec l'autre fonction).
+ * @param  bool         $targetIsDefault Boutique ciblée = boutique par défaut ? Pilote l'effacement
+ *                                      de la constante (invariant Epic 47 ci-dessus).
+ * @param  int          $entity        Entité Dolibarr courante
+ * @return array{storeRowOk:bool,constantOk:bool} État des deux écritures best-effort — mêmes
+ *                    conventions que `doli2shopResetReconnectRequiredAfterOAuth()`.
+ * @since  2.6.0
+ */
+function doli2shopResetReconnectRequiredAfterDisconnect($db, $storeService, $targetStore, bool $targetIsDefault, int $entity): array
+{
+    $storeRowOk = true;
+    $constantOk = true;
+
+    if ($targetStore !== null) {
+        try {
+            $result = $storeService->setReconnectRequired((int) $targetStore->rowid, false);
+            if ($result < 0) {
+                $storeRowOk = false;
+                dol_syslog(
+                    'doli2shopResetReconnectRequiredAfterDisconnect - échec remise à zéro'
+                    . ' token_reconnect_required (ligne stores) pour la boutique #'
+                    . (int) $targetStore->rowid . ' — non bloquant (best-effort, déconnexion OAuth'
+                    . ' déjà commitée)',
+                    LOG_ERR
+                );
+            }
+        } catch (\Throwable $e) {
+            $storeRowOk = false;
+            dol_syslog(
+                'doli2shopResetReconnectRequiredAfterDisconnect - exception lors de la remise à'
+                . ' zéro token_reconnect_required (ligne stores) pour la boutique #'
+                . (int) $targetStore->rowid . ' — non bloquant (finding 4, best-effort, déconnexion'
+                . ' OAuth déjà commitée) : ' . $e->getMessage(),
+                LOG_ERR
+            );
+        }
+    }
+
+    if ($targetIsDefault) {
+        try {
+            dol_include_once('/core/lib/admin.lib.php');
+            $writeResult = dolibarr_set_const($db, 'DOLI2SHOP_TOKEN_RECONNECT_REQUIRED', '0', 'yesno', 0, '', $entity);
+            if ($writeResult <= 0) {
+                $constantOk = false;
+                dol_syslog(
+                    'doli2shopResetReconnectRequiredAfterDisconnect - échec remise à zéro'
+                    . ' DOLI2SHOP_TOKEN_RECONNECT_REQUIRED — non bloquant (best-effort, déconnexion'
+                    . ' OAuth déjà commitée)',
+                    LOG_ERR
+                );
+            }
+        } catch (\Throwable $e) {
+            $constantOk = false;
+            dol_syslog(
+                'doli2shopResetReconnectRequiredAfterDisconnect - exception lors de la remise à'
+                . ' zéro DOLI2SHOP_TOKEN_RECONNECT_REQUIRED — non bloquant (finding 4, best-effort,'
+                . ' déconnexion OAuth déjà commitée) : ' . $e->getMessage(),
+                LOG_ERR
+            );
+        }
+    }
+
+    return array('storeRowOk' => $storeRowOk, 'constantOk' => $constantOk);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// Story fix-export-diagnostic-secrets (CRITICAL) — masquage des exports de diagnostic support
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// health.php et diagnostic.php exportent toute la configuration du module (fieldsMapping de
+// ConfigurationMigrator) dans le JSON « Exporter diagnostic », précisément le fichier qu'on demande
+// aux clients d'envoyer au support. Une liste FIGÉE de 4 clés masquait `shopify_access_token`,
+// `shopify_api_key`, `shopify_api_secret_key` et `dolibarr_api_key` (cette dernière morte, retirée
+// de fieldsMapping) — mais PAS `shopify_refresh_token`, qui sortait EN CLAIR.
+//
+// Correctif sur la CLASSE du défaut, pas sur l'endroit : masquage par MOTIF de nom de clé (et par
+// motif de valeur pour les jetons connus), récursif, appliqué à TOUT le rapport juste avant export
+// — pas seulement à `configuration`. Un futur champ sensible ajouté à fieldsMapping (ou à tout
+// autre tableau exporté) est ainsi couvert d'office, sans qu'aucune liste ne doive être tenue à
+// jour.
+
+/**
+ * Motifs de nom de clé considérés sensibles, insensibles à la casse. Volontairement larges et par
+ * MOTIF plutôt que par liste de clés figées.
+ *
+ * @return string[]
+ * @since  2.6.0
+ */
+function doli2shopSensitiveKeyPatterns(): array
+{
+    return array(
+        'token', 'secret', 'password', 'passwd', 'pwd', 'api_key', 'apikey', 'private',
+        'credential', 'signature', 'hmac', 'cookie', 'session', 'authorization', 'bearer',
+    );
+}
+
+/**
+ * Préfixes/motifs de VALEUR ressemblant à un jeton connu — détecte une valeur sensible même
+ * portée par une clé au nom anodin (ex. rejouée dans un message d'erreur).
+ *
+ * @return string[]
+ * @since  2.6.0
+ */
+function doli2shopKnownTokenValuePatterns(): array
+{
+    return array(
+        'shpat_', 'shpca_', 'shpss_', 'shppa_', 'ghp_', 'github_pat_', 'sk_', '-----BEGIN',
+    );
+}
+
+/**
+ * Un nom de clé (nom de champ `fieldsMapping`, nom de constante, ou toute autre clé de tableau)
+ * est-il sensible au sens de `doli2shopSensitiveKeyPatterns()` ?
+ *
+ * @param  string $key Nom de clé à tester
+ * @return bool
+ * @since  2.6.0
+ */
+function doli2shopKeyNameLooksSensitive(string $key): bool
+{
+    $keyLower = strtolower($key);
+    foreach (doli2shopSensitiveKeyPatterns() as $pattern) {
+        if (strpos($keyLower, $pattern) !== false) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Review 3 couches (HIGH) : `shopify_token_expires_at` matchait le motif « token » de
+ * `doli2shopSensitiveKeyPatterns()` par accident — ce n'est pas un secret, c'est une date dont le
+ * support a besoin pour le badge « reconnexion requise » (health.php:541, diagnostic.php:644).
+ *
+ * Un nom de clé qui décrit une DATE ou un ÉTAT (jamais un secret par nature) : suffixes
+ * `_expires_at`/`_expiry`/`_ttl`/`_date`/`_at`, ou drapeau booléen (`is_…`, `has_…`,
+ * `…_enabled`, `…_completed`, `…_active` — cf. les champs `type => 'yesno'` de
+ * `ConfigurationMigrator::$fieldsMapping`).
+ *
+ * ⚠️ Ne PAS utiliser seule, et ne JAMAIS l'interpréter comme « exempter dès que la valeur ne
+ * ressemble à rien de sensible » (re-review 3 couches, HIGH — c'est exactement ce qu'une première
+ * version de ce correctif faisait, et un jeton hexadécimal BRUT placé dans un tel champ en sortait
+ * en clair, faute de motif de valeur SPÉCIFIQUE à lui trouver un air suspect). La règle exacte est
+ * en LISTE POSITIVE, portée par `doli2shopValueLooksLikeDateOrState()` juste en dessous : une clé
+ * qui matche ce motif ET `doli2shopSensitiveKeyPatterns()` n'est exemptée du masquage QUE si sa
+ * VALEUR a VRAIMENT l'allure d'une date/d'un état — toute autre valeur (y compris un jeton brut
+ * sans le moindre motif reconnu) est masquée par défaut.
+ *
+ * @param  string $key Nom de clé à tester
+ * @return bool
+ * @since  2.6.0
+ */
+function doli2shopKeyNameLooksLikeDateOrStateField(string $key): bool
+{
+    $keyLower = strtolower($key);
+
+    $suffixes = array('_expires_at', '_expiry', '_ttl', '_date', '_at', '_enabled', '_completed', '_active');
+    foreach ($suffixes as $suffix) {
+        if (substr($keyLower, -strlen($suffix)) === $suffix) {
+            return true;
+        }
+    }
+
+    $prefixes = array('is_', 'has_');
+    foreach ($prefixes as $prefix) {
+        if (strncmp($keyLower, $prefix, strlen($prefix)) === 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Re-review 3 couches (HIGH) : liste POSITIVE de ce qu'une date ou un état peut valoir — remplace
+ * l'ancienne logique « exemptée si la valeur ne ressemble à rien de CONNU comme sensible », qui
+ * laissait passer en clair tout ce qui n'était pas explicitement un jeton préfixé ou (sous une clé
+ * anodine) un hexadécimal brut. Un jeton hexadécimal brut placé dans `shopify_token_expires_at`
+ * (`['shopify_token_expires_at' => '<32 hex>']`) n'a ni préfixe connu ni clé anodine : il passait
+ * intégralement en clair. Désormais, `doli2shopRedactSensitiveValue()` n'exempte QUE les valeurs
+ * reconnues ici — toute autre valeur, quelle qu'elle soit, est masquée par défaut.
+ *
+ * Formes reconnues : vide, horodatage numérique (borné à 11 chiffres — story
+ * export-diagnostic-detection-hex-elargie, constat 3 LOW : tous les usages réels identifiés dans
+ * ce dépôt, `historical_import_completed_date`/`shopify_token_expires_at`, sont des timestamps
+ * Unix en SECONDES, jamais en millisecondes/nanosecondes — 11 chiffres couvre un timestamp Unix
+ * jusqu'à l'an 5138. L'ancien seuil de 20 chiffres ne servait qu'à exempter à tort un éventuel
+ * secret purement numérique placé sous une clé qui matche à la fois un motif sensible ET un
+ * suffixe de date/état — corrigé en resserrant la fenêtre, bien en dessous du seuil de 32+
+ * caractères d'un jeton hexadécimal — `doli2shopValueContainsBareHexToken()`), date ISO avec ou
+ * sans heure (y compris le sentinel legacy `0000-00-00…`), booléen littéral.
+ *
+ * @param  string $value Valeur à tester
+ * @return bool
+ * @since  2.6.0
+ */
+function doli2shopValueLooksLikeDateOrState(string $value): bool
+{
+    $trimmed = trim($value);
+
+    if ($trimmed === '') {
+        return true;
+    }
+
+    if (preg_match('/^\d{1,11}$/', $trimmed) === 1) {
+        return true;
+    }
+
+    if (preg_match('/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}:\d{2})?$/', $trimmed) === 1) {
+        return true;
+    }
+
+    if (preg_match('/^(true|false)$/i', $trimmed) === 1) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * La valeur ressemble-t-elle à un jeton connu (préfixe Shopify/GitHub/générique, ou bloc PEM) ?
+ *
+ * @param  string $value Valeur à tester
+ * @return bool
+ * @since  2.6.0
+ */
+function doli2shopValueLooksLikeKnownToken(string $value): bool
+{
+    if ($value === '') {
+        return false;
+    }
+    foreach (doli2shopKnownTokenValuePatterns() as $pattern) {
+        if (stripos($value, $pattern) !== false) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Review 3 couches (LOW, puis re-review HIGH) : un jeton Shopify brut, SANS préfixe connu (32
+ * caractères hexadécimaux ou plus), échappait au filet de `doli2shopValueLooksLikeKnownToken()`.
+ *
+ * Story export-diagnostic-detection-hex-elargie (MEDIUM) : la première version restreignait cette
+ * détection aux clés au nom ANODIN (`value`, `message`, `note`, `details`). Un futur champ au nom
+ * hors de cette liste (`context`, `debug`, `raw_response`, `payload`, `reason`…) laissait alors
+ * passer un jeton hexadécimal brut en clair — la distinction n'était pas la bonne : c'est le
+ * FORMAT porté par la valeur qui doit décider, pas le nom de la clé qui la porte. La détection
+ * s'applique désormais à TOUTE clé, sauf celles listées en EXEMPTION explicite
+ * (`doli2shopKeyNameIsExemptFromBareHexDetection()`) pour les identifiants hexadécimaux LÉGITIMES
+ * que le support doit continuer à voir en clair — ex. les MD5 de fichiers de
+ * `doli2shopVerifyPackageIntegrity()` (clé `md5`) et les empreintes de build tronquées à 8
+ * caractères (`substr(md5_file(...), 0, 8)`, admin/health.php, en dessous du seuil de 32 de toute
+ * façon).
+ *
+ * ⚠️ Re-review 3 couches (HIGH) : la première version était ANCRÉE sur la valeur ENTIÈRE
+ * (`^[0-9a-fA-F]{32,}$`), alors que le cas visé est justement un jeton pris dans un message
+ * d'erreur plus large (« Erreur API: jeton <32 hex> invalide »). Recherche en SOUS-CHAÎNE.
+ *
+ * Story export-diagnostic-detection-hex-elargie (constat 2) : la frontière `\b…\b` ne détectait
+ * pas un jeton collé par underscore (`token_<hex>`, `id_<hex>_suffix`), puisque `_` est un
+ * caractère de mot en PCRE — donc pas de frontière entre `_` et le premier/dernier caractère
+ * hexadécimal. Remplacée par des assertions de voisinage explicites (lookaround négatif sur
+ * `[0-9a-fA-F]` des deux côtés), qui détectent aussi ce cas. Seule la sous-chaîne détectée est
+ * masquée par `doli2shopMaskBareHexTokenSubstrings()`, le reste du message reste lisible — même
+ * logique que `doli2shopMaskLicenseSerialSubstrings()` pour un numéro de série.
+ *
+ * @param  string $value Valeur à tester
+ * @return bool
+ * @since  2.6.0
+ */
+function doli2shopValueContainsBareHexToken(string $value): bool
+{
+    return $value !== '' && preg_match('/(?<![0-9a-fA-F])[0-9a-fA-F]{32,}(?![0-9a-fA-F])/', $value) === 1;
+}
+
+/**
+ * Masque UNIQUEMENT la ou les sous-chaînes ressemblant à un jeton hexadécimal brut détectées par
+ * `doli2shopValueContainsBareHexToken()`, en conservant intact le reste du message — même logique
+ * que `doli2shopMaskLicenseSerialSubstrings()` pour un numéro de série.
+ *
+ * Le motif doit rester STRICTEMENT identique à celui de `doli2shopValueContainsBareHexToken()`
+ * (voir constat 2, story export-diagnostic-detection-hex-elargie) : les deux basculent ensemble.
+ *
+ * @param  string $value Valeur (message libre ou non) à assainir
+ * @return string Valeur avec chaque jeton brut détecté masqué ; inchangée si aucun trouvé
+ * @since  2.6.0
+ */
+function doli2shopMaskBareHexTokenSubstrings(string $value): string
+{
+    $masked = preg_replace_callback(
+        '/(?<![0-9a-fA-F])[0-9a-fA-F]{32,}(?![0-9a-fA-F])/',
+        static function (array $matches): string {
+            return doli2shopMaskSensitiveScalar($matches[0]);
+        },
+        $value
+    );
+
+    // Repli défensif identique à doli2shopMaskLicenseSerialSubstrings() : ne jamais renvoyer la
+    // valeur d'origine sur une erreur PCRE improbable.
+    return $masked === null ? doli2shopMaskSensitiveScalar($value) : $masked;
+}
+
+/**
+ * Story export-diagnostic-detection-hex-elargie (constat 1) : liste d'EXEMPTION positive, portée
+ * par le NOM de clé, pour les identifiants hexadécimaux légitimes que le support doit continuer à
+ * voir en clair — remplace l'ancienne liste POSITIVE d'application (`value`/`message`/`note`/
+ * `details`), qui laissait passer en clair tout jeton brut porté par une clé absente de cette
+ * liste.
+ *
+ * Re-review 3 couches (M2) : la correspondance était en SOUS-CHAÎNE (`strpos()`), ce qui exemptait
+ * à tort une clé qui contient seulement l'un des motifs sans en porter le SENS — ex.
+ * `checksum_note` (un commentaire libre, pas une empreinte) échappait au masquage uniquement parce
+ * que la sous-chaîne `checksum` y apparaît. Remplacée par une correspondance EXACTE (`md5` ===
+ * `md5`) OU un SUFFIXE explicite (`_md5`, `_sha1`, `_sha256`, `_checksum`, `_build_id` — ex.
+ * `file_checksum`, `legacy_md5`), insensible à la casse. `checksum_note`/`file_checksum_value`
+ * (le motif en PRÉFIXE ou au milieu, jamais en suffixe) ne sont plus exemptés.
+ *
+ * ⚠️ Re-review 3 couches (M2, second point) : cette exemption ne doit JAMAIS s'appliquer à une clé
+ * dont l'ORIGINE est une donnée externe non maîtrisée (le champ `payload` d'un webhook Shopify,
+ * `admin/webhooks.php`/`admin/webhook_events.php`) — un tiers qui contrôle le NOM des clés de son
+ * JSON pourrait sinon nommer délibérément un champ `checksum` ou `md5` pour y glisser un secret et
+ * le faire ressortir en clair. Ce n'est PAS cette fonction qui porte cette garantie : c'est
+ * `doli2shopRedactSensitiveValue()`/`doli2shopRedactSensitiveConfig()`, qui désactivent tout appel
+ * à cette fonction (paramètre `$exemptionsAllowed`) dès qu'elles descendent dans la valeur portée
+ * par une clé nommée exactement `payload` — voir leur documentation.
+ *
+ * Pourquoi cette liste et pas une détection par entropie : les seuls cas réels rencontrés dans ce
+ * dépôt sont des empreintes de FORMAT connu et de LONGUEUR fixe (MD5 = 32 hex, SHA1 = 40 hex,
+ * SHA256 = 64 hex) — toutes ≥ 32, donc toutes seraient interceptées par le motif universel sans
+ * cette exemption.
+ *
+ * ⚠️ Re-review 3 couches (L2) : un GID Shopify (`gid://shopify/Product/1234567890`) n'entre pas en
+ * jeu, mais PAS parce qu'il ne contiendrait « jamais de a-f » — les chiffres 0-9 sont eux-mêmes des
+ * caractères hexadécimaux valides au sens du motif (`[0-9a-fA-F]`), un identifiant purement
+ * numérique de 32+ chiffres serait donc intercepté comme n'importe quelle autre valeur. Ce qui
+ * l'exempte réellement, c'est sa LONGUEUR : un identifiant Shopify est un entier 64 bits, donc au
+ * plus ~19-20 chiffres — largement sous le seuil de 32. Vérifié, pas de cas réel dans les exports
+ * actuels.
+ *
+ * **À ajouter à cette liste si un futur champ hexadécimal légitime apparaît** (ex. un SHA de
+ * commit sous une clé `commit`/`git_sha`) — ne pas oublier de la compléter à ce moment-là plutôt
+ * que d'élargir le motif de détection lui-même.
+ *
+ * @see doli2shopValueContainsBareHexToken()
+ *
+ * @param  string $key Nom de clé à tester
+ * @return bool
+ * @since  2.6.0
+ */
+function doli2shopKeyNameIsExemptFromBareHexDetection(string $key): bool
+{
+    $keyLower = strtolower($key);
+    $exemptKeyNames = array('md5', 'sha1', 'sha256', 'checksum', 'build_id');
+
+    if (in_array($keyLower, $exemptKeyNames, true)) {
+        return true;
+    }
+
+    foreach ($exemptKeyNames as $exemptKeyName) {
+        $suffix = '_' . $exemptKeyName;
+        if (substr($keyLower, -strlen($suffix)) === $suffix) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * La valeur a-t-elle le format d'un numéro de série de licence (`SI-YYYY-XXXX-XXXX`) ? Même
+ * convention que le masquage déjà utilisé côté site (`maskSerialNumber()`, website/api/billing.php) :
+ * un numéro de série n'est pas un secret d'authentification, mais reste une donnée à ne pas exposer
+ * intégralement dans un fichier destiné au support.
+ *
+ * @param  string $value Valeur à tester
+ * @return bool
+ * @since  2.6.0
+ */
+function doli2shopValueLooksLikeLicenseSerial(string $value): bool
+{
+    return $value !== '' && preg_match('/^SI-\d{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$/', trim($value)) === 1;
+}
+
+/**
+ * Masque partiellement un numéro de série de licence : seul le second groupe est occulté
+ * (`SI-2026-****-XXXX`), le préfixe et le dernier groupe restent identifiables par le support.
+ * Si la valeur ne correspond finalement pas au format attendu (défense en profondeur), repli sur le
+ * masquage intégral.
+ *
+ * @param  string $serialNumber Numéro de série à masquer
+ * @return string
+ * @since  2.6.0
+ */
+function doli2shopMaskLicenseSerialNumber(string $serialNumber): string
+{
+    if (preg_match('/^(SI-\d{4}-)[A-Za-z0-9]{4}(-[A-Za-z0-9]{4})$/', trim($serialNumber), $matches) === 1) {
+        return $matches[1] . '****' . $matches[2];
+    }
+    return doli2shopMaskSensitiveScalar($serialNumber);
+}
+
+/**
+ * Review 3 couches (LOW) : `doli2shopValueLooksLikeLicenseSerial()` n'exigeait qu'un numéro de
+ * série seul dans toute la valeur — un message qui l'INTERPOLE (ex. « Erreur pour la licence
+ * SI-YYYY-XXXX-XXXX : déjà liée à une autre boutique ») en laissait sortir la totalité en clair.
+ *
+ * Masque chaque occurrence du motif en SOUS-CHAÎNE, avec la même convention partielle
+ * (`SI-2026-****-1234`), en conservant intact le reste du message.
+ *
+ * @param  string $value Valeur (message libre ou non) à assainir
+ * @return string Valeur avec chaque numéro de série repéré masqué ; inchangée si aucun trouvé
+ * @since  2.6.0
+ */
+function doli2shopMaskLicenseSerialSubstrings(string $value): string
+{
+    $masked = preg_replace_callback(
+        '/SI-\d{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}/',
+        static function (array $matches): string {
+            return doli2shopMaskLicenseSerialNumber($matches[0]);
+        },
+        $value
+    );
+
+    // preg_replace_callback() ne renvoie null qu'en cas d'erreur PCRE (motif simple, sans
+    // backtracking pathologique — non attendu ici). Repli défensif : ne jamais renvoyer la valeur
+    // d'origine dans ce cas, au cas où elle contenait justement un numéro à masquer.
+    return $masked === null ? doli2shopMaskSensitiveScalar($value) : $masked;
+}
+
+/**
+ * Masquage intégral d'une valeur scalaire sensible : jamais un seul caractère d'origine ne survit.
+ * `'***' . longueur` si non vide (ex. `***42`), `'vide'` sinon — jamais la chaîne vide telle quelle,
+ * pour ne jamais laisser deviner si le masquage a eu lieu ou si le champ est simplement absent.
+ *
+ * @param  string $value Valeur à masquer
+ * @return string
+ * @since  2.6.0
+ */
+function doli2shopMaskSensitiveScalar(string $value): string
+{
+    return $value === '' ? 'vide' : ('***' . strlen($value));
+}
+
+/**
+ * Review 3 couches (MEDIUM) : une référence circulaire (tableau auto-référencé par référence, ou
+ * objet dont une propriété pointe vers lui-même, directement ou via un cycle plus long) faisait
+ * planter la fonction par dépassement de pile — récursion non bornée.
+ *
+ * Profondeur maximale de récursion. Volontairement large (aucune structure de configuration ou de
+ * rapport de diagnostic légitime ne s'imbrique sur plus de quelques niveaux) mais bornée : au-delà,
+ * on arrête plutôt que de faire confiance à l'appelant.
+ *
+ * @return int
+ * @since  2.6.0
+ */
+function doli2shopRedactSensitiveMaxDepth(): int
+{
+    return 32;
+}
+
+/**
+ * Valeur de repli quand la profondeur maximale (`doli2shopRedactSensitiveMaxDepth()`) est atteinte
+ * avant d'avoir pu assainir un scalaire — jamais un fragment de la structure d'origine.
+ *
+ * @return string
+ * @since  2.6.0
+ */
+function doli2shopRedactDepthExceededPlaceholder(): string
+{
+    return '(structure trop profonde — valeur non exportée)';
+}
+
+/**
+ * Valeur de repli quand un objet déjà présent dans la pile d'appel courante (`SplObjectStorage`) est
+ * rencontré à nouveau — référence circulaire détectée avant même d'atteindre la profondeur maximale.
+ *
+ * @return string
+ * @since  2.6.0
+ */
+function doli2shopRedactCircularReferencePlaceholder(): string
+{
+    return '(référence circulaire détectée — valeur non exportée)';
+}
+
+/**
+ * Cellule élémentaire de `doli2shopRedactSensitiveConfig()`, appliquée à une paire clé/valeur.
+ * Récursive sur les tableaux et objets imbriqués — fonction séparée pour rester appelable
+ * directement sur une valeur isolée (ex. le numéro de série d'un `addCheck()` de health.php/
+ * diagnostic.php) sans reconstruire tout un tableau autour.
+ *
+ * Garde de récursion (Story fix-export-diagnostic-secrets, MEDIUM) : `$depth` est incrémenté à
+ * chaque entrée dans un tableau ou un objet et borné par `doli2shopRedactSensitiveMaxDepth()` — pour
+ * un tableau auto-référencé PAR RÉFÉRENCE, la profondeur suffit à arrêter la récursion (le même
+ * tableau redevient simplement un niveau de plus, jusqu'à la borne). Pour un OBJET, `$seenObjects`
+ * détecte le cycle dès qu'il revient sur lui-même dans la pile d'appel COURANTE (attach/detach
+ * autour de la récursion : un même objet référencé deux fois dans des branches DIFFÉRENTES,
+ * jamais un cycle réel, n'est pas signalé à tort).
+ *
+ * Re-review 3 couches (M2) : `$exemptionsAllowed` porte la garantie que la liste d'exemption
+ * (`doli2shopKeyNameIsExemptFromBareHexDetection()`) ne s'applique JAMAIS à une valeur issue d'une
+ * donnée EXTERNE non maîtrisée. Dès que la clé COURANTE vaut exactement `payload` (insensible à la
+ * casse — le champ qui porte le JSON webhook Shopify brut dans `admin/webhooks.php`/
+ * `admin/webhook_events.php`), l'exemption est désactivée pour TOUTE la valeur qui en dépend,
+ * récursivement, quel que soit le nom des clés rencontrées plus bas dans cette branche (un tiers
+ * qui contrôle le nom de ses propres clés JSON ne doit jamais pouvoir se nommer `checksum`/`md5`
+ * pour faire ressortir un secret en clair). Une fois désactivée dans une branche, elle ne se
+ * réactive jamais en redescendant — c'est une propriété de la BRANCHE, pas d'un niveau isolé.
+ *
+ * @param  string               $key         Nom de la clé porteuse (chaîne vide si aucun nom
+ *                                            pertinent, ex. valeur isolée)
+ * @param  mixed                $value       Valeur à assainir
+ * @param  int                  $depth       Profondeur de récursion courante (usage interne)
+ * @param  \SplObjectStorage|null $seenObjects Objets déjà visités dans la branche courante (usage
+ *                                            interne — instancié automatiquement si omis)
+ * @param  bool                 $exemptionsAllowed Si false, `doli2shopKeyNameIsExemptFromBareHexDetection()`
+ *                                            n'est jamais consultée dans cette branche (donnée
+ *                                            externe non maîtrisée) — voir ci-dessus.
+ * @return mixed Valeur assainie — array/objet préservés (récursion), scalaire éventuellement masqué
+ * @since  2.6.0
+ */
+function doli2shopRedactSensitiveValue(string $key, $value, int $depth = 0, ?\SplObjectStorage $seenObjects = null, bool $exemptionsAllowed = true)
+{
+    if ($seenObjects === null) {
+        $seenObjects = new \SplObjectStorage();
+    }
+
+    // M2 : une fois entré dans la valeur portée par une clé 'payload' (donnée externe non
+    // maîtrisée), l'exemption reste désactivée pour toute la branche — jamais réactivée en
+    // redescendant, même si une sous-clé s'appelle elle aussi 'payload'.
+    $childExemptionsAllowed = $exemptionsAllowed && strtolower($key) !== 'payload';
+
+    if (is_array($value)) {
+        if ($depth >= doli2shopRedactSensitiveMaxDepth()) {
+            return doli2shopRedactDepthExceededPlaceholder();
+        }
+        return doli2shopRedactSensitiveConfig($value, $depth + 1, $seenObjects, $childExemptionsAllowed);
+    }
+
+    if (is_object($value)) {
+        if ($depth >= doli2shopRedactSensitiveMaxDepth()) {
+            return doli2shopRedactDepthExceededPlaceholder();
+        }
+        if ($seenObjects->contains($value)) {
+            return doli2shopRedactCircularReferencePlaceholder();
+        }
+        // Re-review 3 couches (MEDIUM) : attach()/detach() dans un try/finally — si la récursion sur
+        // une propriété lève une exception, $seenObjects gardait cet objet marqué "vu" pour de bon,
+        // faussant la détection de cycle pour tout appel ultérieur qui recevrait le même objet dans
+        // une branche pourtant différente et légitime.
+        $seenObjects->attach($value);
+        try {
+            $redacted = clone $value;
+            foreach (get_object_vars($value) as $propName => $propValue) {
+                $redacted->$propName = doli2shopRedactSensitiveValue((string) $propName, $propValue, $depth + 1, $seenObjects, $childExemptionsAllowed);
+            }
+        } finally {
+            $seenObjects->detach($value);
+        }
+        return $redacted;
+    }
+
+    if (!is_string($value)) {
+        return $value;
+    }
+
+    if (doli2shopValueLooksLikeLicenseSerial($value)) {
+        return doli2shopMaskLicenseSerialNumber($value);
+    }
+
+    // Review 3 couches (LOW), puis re-review (HIGH), puis story export-diagnostic-detection-hex-
+    // elargie (constat 1, MEDIUM) : un jeton Shopify brut (32+ caractères hexadécimaux, sans
+    // préfixe connu) est traité comme un motif de VALEUR — appliqué désormais à TOUTE clé, SAUF la
+    // liste d'EXEMPTION explicite (doli2shopKeyNameIsExemptFromBareHexDetection()) des
+    // identifiants hexadécimaux légitimes (md5/sha1/sha256/checksum/build_id), et SAUF si
+    // $exemptionsAllowed est false (donnée externe non maîtrisée, M2). Détection en SOUS-CHAÎNE
+    // (doli2shopValueContainsBareHexToken()), jamais ancrée sur la valeur entière.
+    $valueLooksLikeFullSecret = doli2shopValueLooksLikeKnownToken($value);
+    $hasBareHexSubstring = (!$exemptionsAllowed || !doli2shopKeyNameIsExemptFromBareHexDetection($key))
+        && doli2shopValueContainsBareHexToken($value);
+
+    if (doli2shopKeyNameLooksSensitive($key)) {
+        // Re-review 3 couches (HIGH) : une clé dont le nom matche un motif sensible PAR ACCIDENT
+        // parce qu'elle décrit en réalité une date ou un état (ex. shopify_token_expires_at, qui
+        // contient "token") n'est exemptée du masquage intégral QUE si sa VALEUR a VRAIMENT l'allure
+        // d'une date/d'un état (liste POSITIVE, doli2shopValueLooksLikeDateOrState()) — jamais sur la
+        // seule absence d'un motif connu. Un jeton hexadécimal brut, qui n'a ni préfixe connu ni date
+        // reconnue, échoue ce test et tombe donc dans le masquage intégral par défaut ci-dessous :
+        // pas besoin d'y dupliquer la détection hexadécimale, la liste positive s'en charge déjà.
+        if (doli2shopKeyNameLooksLikeDateOrStateField($key) && doli2shopValueLooksLikeDateOrState($value)) {
+            return doli2shopMaskLicenseSerialSubstrings($value);
+        }
+        return doli2shopMaskSensitiveScalar($value);
+    }
+
+    if ($valueLooksLikeFullSecret) {
+        return doli2shopMaskSensitiveScalar($value);
+    }
+
+    if ($hasBareHexSubstring) {
+        // Ne masquer QUE la sous-chaîne détectée (jeton brut), pas tout le message — puis passer
+        // par le masquage de numéro de série en sous-chaîne au cas où les deux motifs coexistent.
+        return doli2shopMaskLicenseSerialSubstrings(doli2shopMaskBareHexTokenSubstrings($value));
+    }
+
+    // Review 3 couches (LOW) : un numéro de série de licence peut apparaître en SOUS-CHAÎNE d'un
+    // message plus large (ex. une erreur qui l'interpole) — masquer aussi ce cas.
+    return doli2shopMaskLicenseSerialSubstrings($value);
+}
+
+/**
+ * Masque récursivement, par MOTIF de nom de clé (et par motif de valeur pour les jetons connus et
+ * les numéros de série de licence), toute donnée sensible d'un tableau avant qu'il ne parte dans un
+ * export de diagnostic envoyé au support (Story fix-export-diagnostic-secrets, CRITICAL).
+ *
+ * Contrat :
+ *  - Clé dont le nom contient (insensible à la casse) l'un des motifs de
+ *    `doli2shopSensitiveKeyPatterns()` → valeur masquée intégralement via
+ *    `doli2shopMaskSensitiveScalar()`, aucun caractère d'origine ne survit — SAUF si la clé décrit
+ *    une date/un état (`doli2shopKeyNameLooksLikeDateOrStateField()`) ET que sa valeur a VRAIMENT
+ *    l'allure d'une date/d'un état, liste POSITIVE (`doli2shopValueLooksLikeDateOrState()` — faux
+ *    positif corrigé en review, ex. `shopify_token_expires_at` ; re-review : un jeton hexadécimal
+ *    brut placé dans un tel champ échoue cette liste positive et reste masqué par défaut).
+ *  - Valeur ressemblant à un jeton connu préfixé (`doli2shopValueLooksLikeKnownToken()`) → masquée
+ *    intégralement, quel que soit le nom de la clé porteuse. Valeur contenant un jeton hexadécimal
+ *    BRUT (`doli2shopValueContainsBareHexToken()`), sous TOUTE clé SAUF celles listées en
+ *    exemption (`doli2shopKeyNameIsExemptFromBareHexDetection()` : `md5`/`sha1`/`sha256`/
+ *    `checksum`/`build_id`, correspondance exacte ou en SUFFIXE, jamais en sous-chaîne — M2) → seule
+ *    la sous-chaîne détectée est masquée (`doli2shopMaskBareHexTokenSubstrings()`), pas tout le
+ *    message. Cette exemption est elle-même désactivée dès que la branche courante descend dans la
+ *    valeur d'une clé `payload` (donnée externe non maîtrisée, M2 — voir
+ *    `doli2shopRedactSensitiveValue()`).
+ *  - Valeur (entière OU en sous-chaîne d'un message) au format d'un numéro de série de licence →
+ *    masquage PARTIEL (`doli2shopMaskLicenseSerialNumber()`/`doli2shopMaskLicenseSerialSubstrings()`).
+ *  - Récursif sur les tableaux et objets imbriqués, borné en profondeur et protégé contre les
+ *    références circulaires (`doli2shopRedactSensitiveMaxDepth()`, `SplObjectStorage`, attach/detach
+ *    en try/finally) — jamais un dépassement de pile, jamais la structure d'origine renvoyée telle
+ *    quelle dans ce cas, jamais de détection de cycle faussée par une exception.
+ *  - N'importe pas en place : renvoie toujours une copie.
+ *
+ * Appelée sur le rapport COMPLET (pas seulement `$report['configuration']`) par health.php et
+ * diagnostic.php juste avant `json_encode()` : couvre aussi bien la configuration
+ * (`ConfigurationMigrator::$fieldsMapping`) que le numéro de série de licence porté par les checks
+ * `support` (`addCheck()`), où qu'il apparaisse dans l'arborescence.
+ *
+ * @param  array                  $config      Tableau (configuration ou rapport complet) à assainir
+ * @param  int                    $depth       Profondeur de récursion courante (usage interne)
+ * @param  \SplObjectStorage|null $seenObjects Objets déjà visités dans la branche courante (usage
+ *                                             interne — instancié automatiquement si omis)
+ * @param  bool                   $exemptionsAllowed Voir `doli2shopRedactSensitiveValue()` (M2) —
+ *                                             propagé tel quel à chaque clé de ce niveau.
+ * @return array Copie assainie
+ * @since  2.6.0
+ */
+function doli2shopRedactSensitiveConfig(array $config, int $depth = 0, ?\SplObjectStorage $seenObjects = null, bool $exemptionsAllowed = true): array
+{
+    if ($seenObjects === null) {
+        $seenObjects = new \SplObjectStorage();
+    }
+
+    $result = array();
+    foreach ($config as $key => $value) {
+        $result[$key] = doli2shopRedactSensitiveValue((string) $key, $value, $depth, $seenObjects, $exemptionsAllowed);
+    }
+    return $result;
+}
+
+/**
+ * Story export-diagnostic-detection-hex-elargie (constat 3, LOW) : construit l'export JSON assaini
+ * d'un rapport de diagnostic — factorise la logique auparavant DUPLIQUÉE entre `admin/health.php`
+ * et `admin/diagnostic.php`. Une seule fonction à garder alignée avec le garde-fou statique
+ * (`ExportRedactionInventoryGuardTest`) au lieu de deux sites d'appel à surveiller séparément —
+ * et la même brique sert désormais aux points d'export découverts par l'inventaire de cette story
+ * (`admin/webhooks.php`, `admin/webhook_events.php`).
+ *
+ * `JSON_THROW_ON_ERROR` fait lever une `\JsonException` sur toute erreur d'encodage (ex. une
+ * chaîne UTF-8 invalide dans le rapport) au lieu de renvoyer silencieusement `false` — l'ancien
+ * comportement faisait partir un export VIDE plutôt que l'erreur générique documentée, puisque
+ * `json_encode()` qui échoue sans cette option ne lève aucune exception (le `try/catch(\Throwable)`
+ * déjà en place dans les deux fichiers appelants ne se déclenchait donc jamais dans ce cas).
+ *
+ * @param  array $report Rapport de diagnostic complet (déjà nettoyé des entités HTML par
+ *                        l'appelant si nécessaire) à assainir puis encoder
+ * @return string JSON assaini, indenté, UTF-8/slashes non échappés
+ * @throws \JsonException Si l'encodage échoue (ex. chaîne UTF-8 invalide dans le rapport)
+ * @since  2.6.0
+ */
+function doli2shopBuildRedactedJsonExport(array $report): string
+{
+    $cleanReport = doli2shopRedactSensitiveConfig($report);
+    return json_encode(
+        $cleanReport,
+        JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
+    );
+}
+
+/**
+ * Story export-diagnostic-detection-hex-elargie (Task 4) : masque, en SOUS-CHAÎNE, tout fragment
+ * de texte libre commençant par un des préfixes de `doli2shopKnownTokenValuePatterns()`
+ * (`shpat_`, `shpca_`, `ghp_`, `sk_`…) suivi d'une suite de caractères de jeton plausible.
+ *
+ * Distinct de `doli2shopValueLooksLikeKnownToken()` (qui reste inchangé pour le chemin structuré
+ * existant, masquage INTÉGRAL de la valeur porteuse) : celui-ci sert au téléchargement du fichier
+ * de journal, où la ligne entière ne doit JAMAIS être masquée intégralement — seul le jeton doit
+ * disparaître, le reste de la ligne de log reste lisible par le support. Ce n'est PAS un
+ * remplacement du masquage intégral existant, seulement un ajout pour le texte libre — voir la
+ * story `export-diagnostic-masquage-integral-vs-sous-chaine` (backlog) pour l'incohérence entre
+ * les deux comportements, volontairement non traitée ici.
+ *
+ * Re-review 3 couches (M3) : le repli défensif précédent, sur une erreur PCRE improbable, gardait
+ * silencieusement la valeur du tour de boucle PRÉCÉDENT au lieu de basculer en FAIL-CLOSED — un
+ * comportement moins strict que les deux autres maskers de sous-chaîne
+ * (`doli2shopMaskBareHexTokenSubstrings()`/`doli2shopMaskLicenseSerialSubstrings()`), qui masquent
+ * l'INTÉGRALITÉ de la valeur dans ce cas plutôt que de risquer de renvoyer un fragment
+ * partiellement traité pouvant encore porter un secret en clair. Corrigé : sur la moindre erreur
+ * PCRE, la fonction retourne désormais le masquage INTÉGRAL de la valeur D'ORIGINE (celle passée en
+ * paramètre, pas un état intermédiaire) et arrête la boucle immédiatement.
+ *
+ * @param  string $value Valeur (ligne de texte libre) à assainir
+ * @return string Valeur avec chaque jeton préfixé connu masqué en sous-chaîne ; inchangée si aucun
+ *                trouvé ; masquée INTÉGRALEMENT sur erreur PCRE (fail-closed, M3)
+ * @since  2.6.0
+ */
+function doli2shopMaskKnownTokenPrefixSubstrings(string $value): string
+{
+    if ($value === '') {
+        return $value;
+    }
+
+    $original = $value;
+
+    foreach (doli2shopKnownTokenValuePatterns() as $prefix) {
+        $pattern = '/' . preg_quote($prefix, '/') . '[A-Za-z0-9_]{6,}/i';
+        $result = doli2shopMaskPatternSubstringsOrNullOnPcreError($pattern, $value);
+        if ($result === null) {
+            // Fail-closed (M3) : ne jamais renvoyer un résultat partiellement traité qui pourrait
+            // encore porter un secret en clair — masquer l'INTÉGRALITÉ de la valeur D'ORIGINE.
+            return doli2shopMaskSensitiveScalar($original);
+        }
+        $value = $result;
+    }
+
+    return $value;
+}
+
+/**
+ * Re-review 3 couches (M3) : primitive PARTAGÉE « masque un motif PCRE en sous-chaîne, ou renvoie
+ * `null` sur échec » — extraite de `doli2shopMaskKnownTokenPrefixSubstrings()` pour que le contrat
+ * fail-closed de l'appelant soit testable directement, avec un motif PCRE délibérément invalide
+ * (ex. `'/(/'`), sans dépendre de `doli2shopKnownTokenValuePatterns()` (liste de production, non
+ * falsifiable depuis un test sans effet de bord sur les autres appelants) et sans avoir à provoquer
+ * une erreur PCRE RÉELLE sur le motif `prefix[A-Za-z0-9_]{6,}` — improbable en pratique (pas de
+ * récursion, pas de backtracking pathologique, vérifié empiriquement avec
+ * `pcre.backtrack_limit`/`pcre.recursion_limit` abaissés). C'est la MÊME fonction qui s'exécute en
+ * production : le test qui l'appelle avec un motif invalide exerce le code réel, pas une
+ * réplique.
+ *
+ * @param  string $pattern Motif PCRE complet (délimiteurs inclus)
+ * @param  string $value   Valeur sur laquelle appliquer le motif
+ * @return string|null La valeur avec chaque occurrence du motif masquée, ou `null` si
+ *                      `preg_replace_callback()` a échoué (erreur PCRE) — l'appelant décide alors du
+ *                      repli fail-closed
+ * @since  2.6.0
+ */
+function doli2shopMaskPatternSubstringsOrNullOnPcreError(string $pattern, string $value): ?string
+{
+    return preg_replace_callback(
+        $pattern,
+        static function (array $matches): string {
+            return doli2shopMaskSensitiveScalar($matches[0]);
+        },
+        $value
+    );
+}
+
+/**
+ * Re-review 3 couches (L3) : masque un bloc PEM complet (`-----BEGIN ... -----` jusqu'à
+ * `-----END ... -----` inclus, corps compris) apparaissant dans un texte libre — un tel bloc peut
+ * embarquer une clé privée entière si un message d'exception ou un champ libre venait à
+ * l'interpoler. Le corps base64 d'un bloc PEM n'est hexadécimal qu'accidentellement et dépasse
+ * largement les seuils des autres motifs de cette suite — un bloc ENTIER, pas un simple fragment,
+ * doit disparaître.
+ *
+ * Fail-closed (même convention que les autres maskers de sous-chaîne) : sur une erreur PCRE
+ * improbable, l'INTÉGRALITÉ de la valeur d'origine est masquée plutôt qu'un résultat partiel.
+ *
+ * ⚠️ Limite assumée : ne détecte un bloc que s'il apparaît ENTIER dans la chaîne passée en
+ * paramètre (marqueurs BEGIN et END tous deux présents dans le MÊME appel). Un bloc PEM qui
+ * s'étendrait, dans le fichier de journal réel, sur une plage plus large que la fenêtre de
+ * recouvrement entre deux chunks (voir `doli2shopStreamMaskedLogFileToOutput()`) ne serait pas
+ * nécessairement reconstitué avant masquage — limite documentée, cohérente avec les autres limites
+ * déjà actées de ce garde-fou (encodage/obfuscation, AC12).
+ *
+ * @param  string $value Valeur (texte libre) à assainir
+ * @return string Valeur avec chaque bloc PEM entier masqué ; inchangée si aucun trouvé
+ * @since  2.6.0
+ */
+function doli2shopMaskPemBlockSubstrings(string $value): string
+{
+    if ($value === '' || stripos($value, '-----BEGIN') === false) {
+        return $value;
+    }
+
+    $masked = preg_replace_callback(
+        '/-----BEGIN\s+[A-Z0-9 ]+-----.*?-----END\s+[A-Z0-9 ]+-----/s',
+        static function (array $matches): string {
+            return doli2shopMaskSensitiveScalar($matches[0]);
+        },
+        $value
+    );
+
+    return $masked === null ? doli2shopMaskSensitiveScalar($value) : $masked;
+}
+
+/**
+ * Story export-diagnostic-detection-hex-elargie (Task 4), étendue par re-review 3 couches (L3) :
+ * compose les QUATRE maskers de sous-chaîne (bloc PEM, jeton préfixé connu, jeton hexadécimal
+ * brut, numéro de série de licence) sur une ligne de texte libre, sans jamais toucher au reste de
+ * la ligne. Utilisée par le téléchargement du fichier de journal dédié (`admin/action_log.php`,
+ * action `download_logfile`), par chunks — un `readfile()` ne peut pas passer par une fonction qui
+ * attend un tableau PHP.
+ *
+ * Ordre volontaire : le bloc PEM est masqué EN PREMIER (un bloc entier, potentiellement le plus
+ * gros fragment) pour que les passes suivantes n'aient plus à examiner son corps base64 — sans
+ * incidence sur la justesse (un fragment déjà masqué produit un remplacement court, jamais
+ * re-détecté par une passe suivante).
+ *
+ * Composition sans risque de collision entre les passes : chaque masque produit un remplacement
+ * court (`***N` ou `vide`), bien en dessous des seuils de déclenchement des autres motifs (32+
+ * caractères hexadécimaux, format `SI-XXXX-XXXX-XXXX`, bloc `-----BEGIN…-----END…-----`) — un
+ * fragment déjà masqué par une passe ne peut donc jamais être re-détecté par une passe suivante.
+ *
+ * ⚠️ Limite documentée (AC12, point 3 des limites « Hors périmètre » de la story) : un
+ * `$e->getMessage()` d'une bibliothèque HTTP tierce qui embarquerait un jeton ENCODÉ (base64,
+ * URL-encodé) plutôt que sous une forme hexadécimale brute ou un préfixe connu ne serait PAS
+ * détecté par cette fonction — dépend du comportement interne de la bibliothèque HTTP utilisée,
+ * non traité par cette story.
+ *
+ * @param  string $line Ligne (ou fragment de plusieurs lignes, voir `doli2shopMaskPemBlockSubstrings()`)
+ *                       de texte libre à assainir
+ * @return string Ligne avec chaque secret connu masqué en sous-chaîne ; inchangée si aucun trouvé
+ * @since  2.6.0
+ */
+function doli2shopMaskAllKnownSensitiveSubstringsInFreeText(string $line): string
+{
+    $masked = doli2shopMaskPemBlockSubstrings($line);
+    $masked = doli2shopMaskKnownTokenPrefixSubstrings($masked);
+    $masked = doli2shopMaskBareHexTokenSubstrings($masked);
+    $masked = doli2shopMaskLicenseSerialSubstrings($masked);
+    return $masked;
+}
+
+/**
+ * Story export-diagnostic-detection-hex-elargie (AC9) : construit la ligne CSV de l'export du
+ * journal des actions (`admin/action_log.php`, action `export`) — extrait du site d'appel pour
+ * être testable isolément, sans connexion base. La colonne `message` (texte libre écrit par le
+ * code du module : résultats d'appel API, erreurs) peut interpoler un jeton hexadécimal brut ou un
+ * fragment d'exception ; elle passe désormais par `doli2shopRedactSensitiveValue()` comme le reste
+ * des exports du module — clé `'message'` déjà couverte par la détection hex universelle (constat
+ * 1), aucune liste supplémentaire à tenir à jour.
+ *
+ * @param  object $objExport Ligne brute retournée par `$db->fetch_object()` sur
+ *                           `llx_doli2shop_action_log` (ou tout objet portant les mêmes propriétés,
+ *                           ex. un `stdClass` de test)
+ * @return array Ligne prête pour `fputcsv()`, dans l'ordre : date, run_id, provenance, type,
+ *               objet_type, objet_id, resultat, message (assaini), duree_ms, boutique
+ * @since  2.6.0
+ */
+function doli2shopBuildActionLogExportRow(object $objExport): array
+{
+    return array(
+        $objExport->date_action,
+        $objExport->run_id,
+        $objExport->origin,
+        $objExport->action_type,
+        $objExport->object_type,
+        $objExport->object_id,
+        $objExport->result,
+        doli2shopRedactSensitiveValue('message', (string) $objExport->message),
+        $objExport->duration_ms,
+        $objExport->fk_store,
+    );
+}
+
+/**
+ * Re-review 3 couches (H1) : ouvre le fichier de journal du module en vue de son téléchargement
+ * (`admin/action_log.php`, action `download_logfile`) — extrait dans `lib/` pour être testable
+ * isolément (fichier absent, illisible, non ouvrable) et surtout pour que l'appelant puisse
+ * vérifier le succès de l'ouverture AVANT d'émettre le moindre en-tête HTTP de succès. L'ancien
+ * code envoyait déjà `Content-Type`/`Content-Disposition` (une réponse HTTP 200) avant même de
+ * tenter `fopen()` : un fichier devenu illisible entre les deux (permissions changées, disque hors
+ * ligne, fichier supprimé par un autre processus) produisait un téléchargement de 0 octet MAIS
+ * annoncé comme un succès — aucune trace, aucun message à l'utilisateur.
+ *
+ * Trois vérifications, dans cet ordre, chacune pouvant échouer indépendamment des deux autres :
+ * `is_file()` (absence), `is_readable()` (permissions), puis `fopen()` lui-même (dernier filet —
+ * une disparition du fichier entre les deux premiers contrôles et l'ouverture réelle, ou toute
+ * autre raison système, y est encore interceptée).
+ *
+ * @param  string $path Chemin du fichier à ouvrir
+ * @return array{0: string, 1: resource|null} Tuple [statut, handle] — statut parmi 'not_found',
+ *               'unreadable', 'open_failed' (handle toujours `null` dans ces trois cas) ou 'ok'
+ *               (handle non `null`, à `fclose()` par l'appelant après usage)
+ * @since  2.6.0
+ */
+function doli2shopOpenLogFileForDownload(string $path): array
+{
+    if (!is_file($path)) {
+        return array('not_found', null);
+    }
+
+    if (!is_readable($path)) {
+        return array('unreadable', null);
+    }
+
+    $handle = @fopen($path, 'rb');
+    if ($handle === false) {
+        return array('open_failed', null);
+    }
+
+    return array('ok', $handle);
+}
+
+/**
+ * Taille de chunk (en octets) utilisée par `doli2shopStreamMaskedLogFileToOutput()` — borne HAUTE
+ * de ce qu'une seule lecture peut charger en mémoire, quelle que soit la longueur réelle d'une
+ * ligne du fichier source.
+ *
+ * @return int
+ * @since  2.6.0
+ */
+function doli2shopLogStreamChunkSize(): int
+{
+    return 65536;
+}
+
+/**
+ * Re-review 3 couches (deuxième passe, HIGH 1/HIGH 2) : borne de SÉCURITÉ (pas une fenêtre de
+ * masquage) sur la taille que peut atteindre un fragment « en attente » (`$carry`, voir
+ * `doli2shopStreamMaskedLogFileToOutput()`) avant d'être forcé à se vider.
+ *
+ * ⚠️ Cette fonction NE PORTE PLUS l'hypothèse (invalidée en review) qu'un jeton préfixé connu fait
+ * toujours moins de 200 caractères — un jeton de plusieurs milliers de caractères, à cheval sur la
+ * frontière de plusieurs chunks, est désormais correctement reconstitué QUELLE QUE SOIT sa
+ * longueur (voir `doli2shopFindSafeMaskableCutoff()`), sans dépendre d'une taille de fenêtre fixe.
+ * Ce plafond ne sert plus qu'à borner un cas dégénéré/adversarial (une seule « ligne » de plusieurs
+ * Mo composée uniquement de caractères de jeton plausibles, sans jamais de caractère de coupure) :
+ * au-delà, le fragment en attente est masqué et vidé de force plutôt que de laisser la mémoire
+ * croître sans limite — fail-closed (un fragment ainsi vidé prématurément qui s'avérerait être un
+ * VRAI secret encore plus long reste masqué intégralement, jamais exposé en clair).
+ *
+ * @return int
+ * @since  2.6.0
+ */
+function doli2shopLogStreamCarryOverSize(): int
+{
+    return 1048576; // 1 Mio
+}
+
+/**
+ * Re-review 3 couches (deuxième passe, HIGH 1/HIGH 2) : marqueur fixe qui remplace CHAQUE ligne
+ * d'un bloc PEM détecté en flux (voir `doli2shopStreamMaskedLogFileToOutput()`), corps compris —
+ * jamais un fragment du contenu réel, quelle que soit sa forme.
+ *
+ * @param  bool $withTrailingNewline Ajoute un retour à la ligne après le marqueur (ligne PEM
+ *                                   normale, terminée) — omis pour un fragment sans retour à la
+ *                                   ligne (dernière ligne du fichier, ou ligne PEM anormalement
+ *                                   longue qui dépasse `doli2shopLogStreamChunkSize()`).
+ * @return string
+ * @since  2.6.0
+ */
+function doli2shopPemBlockMarker(bool $withTrailingNewline = true): string
+{
+    return '***PEM***' . ($withTrailingNewline ? "\n" : '');
+}
+
+/**
+ * Re-review 3 couches (troisième passe) : les DEUX marqueurs de délimitation PEM
+ * (`-----BEGIN ` et `-----END `), utilisés à la fois par `doli2shopFindSafeMaskableCutoff()` (pour
+ * ne jamais laisser le marqueur BEGIN lui-même se faire couper par une frontière de chunk, HIGH) et
+ * par `doli2shopProcessBufferInsidePemBlock()` (pour le marqueur END, MEDIUM 1).
+ *
+ * @return string[]
+ * @since  2.6.0
+ */
+function doli2shopPemBoundaryMarkers(): array
+{
+    return array('-----BEGIN ', '-----END ');
+}
+
+/**
+ * Re-review 3 couches (troisième passe, HIGH + MEDIUM 1) : calcule, pour UN marqueur PEM donné
+ * (`-----BEGIN ` ou `-----END `), le point à partir duquel la fin du buffer pourrait encore porter
+ * une AMORCE ou une CONTINUATION non confirmée de CE marqueur — même mécanique que les familles
+ * (2)/(3) de `doli2shopFindSafeMaskableCutoff()` pour un jeton préfixé connu, mais avec le jeu de
+ * caractères d'une étiquette PEM (`[A-Z0-9 ]`, jamais de `-` avant la fermeture `-----`).
+ *
+ * Deux familles, comme pour un jeton préfixé :
+ *  (a) Amorce STRICTE du marqueur lui-même (ex. `-----BEG` avant `IN ...` dans le chunk suivant) —
+ *      le plus long suffixe du buffer qui soit un préfixe incomplet du marqueur.
+ *  (b) Marqueur COMPLET déjà trouvé, mais son étiquette n'est pas encore refermée par `-----` avant
+ *      la fin du buffer (ex. `-----BEGIN RSA PRIVATE KE` sans plus rien derrière) — retenu depuis
+ *      le DÉBUT du marqueur, pour que le prochain chunk puisse reconstituer l'étiquette ENTIÈRE et
+ *      la reconnaissance du bloc se fasse sur la chaîne complète.
+ *
+ * @param  string $buffer Fragment à analyser
+ * @param  string $marker Marqueur PEM complet à rechercher (avec l'espace de fin), ex.
+ *                        `-----BEGIN ` ou `-----END `
+ * @return int Offset à partir duquel retenir (== strlen($buffer) si rien n'est en cours)
+ * @since  2.6.0
+ */
+function doli2shopFindPemMarkerCutoff(string $buffer, string $marker): int
+{
+    $len = strlen($buffer);
+    $cutoff = $len;
+    $markerLen = strlen($marker);
+
+    // (a) Amorce stricte du marqueur.
+    for ($suffixLen = min($markerLen - 1, $len); $suffixLen > 0; $suffixLen--) {
+        if (strncmp($marker, substr($buffer, $len - $suffixLen), $suffixLen) === 0) {
+            $cutoff = min($cutoff, $len - $suffixLen);
+            break;
+        }
+    }
+
+    // (b) Marqueur complet, étiquette pas encore refermée par "-----".
+    $searchFrom = 0;
+    while (($pos = strpos($buffer, $marker, $searchFrom)) !== false) {
+        $afterMarker = substr($buffer, $pos + $markerLen);
+        if (strpos($afterMarker, '-----') === false && preg_match('/^[A-Z0-9 ]*$/', $afterMarker) === 1) {
+            $cutoff = min($cutoff, $pos);
+        }
+        $searchFrom = $pos + 1;
+    }
+
+    return $cutoff;
+}
+
+/**
+ * Re-review 3 couches (troisième passe, MEDIUM 2 ; corrigé en quatrième passe, HIGH) : une ligne
+ * reçue en état « bloc PEM » ressemble-t-elle réellement à du contenu PEM (ligne vide, en-tête
+ * RFC 1421/OpenSSL — `Proc-Type:`, `DEK-Info:`, `Comment:` — ou une de leurs lignes de
+ * continuation, ou un corps encodé en base64) ?
+ *
+ * Sert à distinguer un VRAI bloc PEM multi-lignes d'un FAUX POSITIF — un message de log qui
+ * mentionne littéralement `-----BEGIN CERTIFICATE-----` (ex. une erreur de parsing) sans être
+ * réellement suivi d'un corps de clé. Dès qu'une ligne ne ressemble à AUCUNE de ces formes, l'appelant
+ * doit sortir de l'état PEM et traiter cette ligne normalement — le fail-closed jusqu'à EOF ne vaut
+ * donc que tant que les lignes reçues continuent de ressembler à du PEM.
+ *
+ * ⚠️ Re-review 3 couches (quatrième passe, HIGH) : la première version de cette fonction limitait
+ * le corps base64 à 76 caractères (« une vraie ligne PEM ne dépasse jamais 76 caractères »),
+ * affirmation FAUSSE — un outil qui écrit son corps SANS enroulement (une seule ligne de plusieurs
+ * Mo) ou avec un enroulement plus large que la convention (80 colonnes, voire davantage) produit un
+ * PEM parfaitement valide que RFC 1421/OpenSSL savent relire. Avec cette limite, un tel corps
+ * sortait de l'état PEM dès sa première ligne (ou même avant, sur un corps non enroulé) et fuyait
+ * INTÉGRALEMENT en clair — reproduit par les scripts `repro_unwrapped_singleline_body.php`
+ * (corps sur une seule ligne : 97,7 % du contenu en clair) et `repro_80col_wrap.php` (enroulement à
+ * 80 colonnes : 15 lignes sur 15 en clair). Aucune limite de longueur n'est donc plus imposée ici :
+ * seul le JEU DE CARACTÈRES fait foi. Ce n'est pas un relâchement du filet — MEDIUM 2 reste
+ * pleinement actif sur le jeu de caractères (un message de log ordinaire, avec espaces internes,
+ * ponctuation ou lettres minoritaires hors alphabet base64, continue de faire sortir l'état PEM dès
+ * la ligne suivante).
+ *
+ * @param  string $line Ligne UNIQUE (retour à la ligne éventuel en fin de chaîne, ignoré ici)
+ * @return bool
+ * @since  2.6.0
+ */
+function doli2shopLineLooksLikePemBodyOrHeader(string $line): bool
+{
+    $trimmed = rtrim($line, "\n");
+
+    if ($trimmed === '') {
+        return true;
+    }
+
+    // En-têtes PEM d'une clé chiffrée (RFC 1421 / format historique OpenSSL).
+    if (preg_match('/^(Proc-Type|DEK-Info|Comment):/', $trimmed) === 1) {
+        return true;
+    }
+    // Continuation d'un en-tête précédent : indentation, ou barre oblique inverse de poursuite.
+    if (preg_match('/^[ \t]/', $trimmed) === 1 || substr($trimmed, -1) === '\\') {
+        return true;
+    }
+
+    // Corps encodé en base64 : uniquement son alphabet (espaces/tabulations de FIN tolérés, ex. un
+    // éditeur qui laisse un espace parasite en bout de ligne) — AUCUNE limite de longueur (voir
+    // docblock, quatrième passe HIGH) : un corps non enroulé, ou enroulé plus large que la
+    // convention, reste du PEM valide.
+    $core = rtrim($trimmed, " \t");
+    if ($core === '' || preg_match('/^[A-Za-z0-9+\/=]*$/', $core) === 1) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Re-review 3 couches (deuxième passe HIGH 1, troisième passe MEDIUM 1/MEDIUM 2) : traite un
+ * fragment reçu alors que le flux est DÉJÀ à l'intérieur d'un bloc PEM multi-lignes non encore
+ * refermé.
+ *
+ * Trois issues possibles pour la partie CONFIRMÉE du fragment (voir `doli2shopFindPemMarkerCutoff()`
+ * pour la partie encore incertaine, retenue en report) :
+ *  1. Elle referme le bloc (`-----END ... -----`) : marqueur, puis le texte QUI SUIT ce marqueur
+ *     sur la MÊME ligne (rare, mais possible) repasse par le masquage NORMAL.
+ *  2. Elle ressemble à du contenu PEM (`doli2shopLineLooksLikePemBodyOrHeader()`) : marqueur, le
+ *     flux reste en état PEM.
+ *  3. Elle NE ressemble à RIEN de tout ça (MEDIUM 2, faux positif de BEGIN — ex. un message de log
+ *     qui mentionne littéralement `-----BEGIN CERTIFICATE-----` sans être suivi d'un vrai corps de
+ *     clé) : le flux SORT de l'état PEM, et cette ligne repasse par le masquage NORMAL — le
+ *     fail-closed jusqu'à EOF ne s'applique donc que tant que les lignes reçues continuent de
+ *     ressembler à du PEM, jamais indéfiniment sur la seule foi d'un BEGIN initial.
+ *
+ * @param  string                  $buffer       Fragment reçu pendant l'état PEM (report du fragment
+ *                                                précédent déjà concaténé par l'appelant)
+ * @param  callable(string):string $lineMasker   Masqueur normal, appliqué au texte qui sort de
+ *                                                l'état PEM (issues 1 et 3 ci-dessus)
+ * @param  callable(string):void   $outputWriter Fonction d'écriture
+ * @return array{0: bool, 1: string} [reste en état PEM ?, report pour le fragment suivant — non vide
+ *               UNIQUEMENT si le flux reste en état PEM ET qu'une amorce/continuation de END est en
+ *               cours (MEDIUM 1) ; toujours vide dans les issues 1 et 3]
+ * @since  2.6.0
+ */
+function doli2shopProcessBufferInsidePemBlock(string $buffer, callable $lineMasker, callable $outputWriter): array
+{
+    if (preg_match('/-----END\s+[A-Z0-9 ]*-----/', $buffer, $endMatch, PREG_OFFSET_CAPTURE) === 1) {
+        $endMatchEnd = $endMatch[0][1] + strlen($endMatch[0][0]);
+        $after = substr($buffer, $endMatchEnd);
+
+        // Parité octet à octet (re-review 3 couches, troisième passe) : le marqueur ne doit JAMAIS
+        // ajouter son propre retour à la ligne ici — celui d'origine (s'il existe) est déjà porté
+        // par `$after` (la portion de la ligne après la fermeture `-----`) et serait sinon dupliqué
+        // (une ligne vide parasite entre le marqueur et la suite).
+        $outputWriter(doli2shopPemBlockMarker(false));
+        if ($after !== '') {
+            $outputWriter($lineMasker($after));
+        }
+        return array(false, '');
+    }
+
+    // MEDIUM 1 : le marqueur END (ou son amorce) pourrait lui-même être coupé par la frontière du
+    // chunk — retenir cette queue plutôt que la traiter comme un corps de clé ordinaire, sans quoi
+    // le END ne serait plus jamais reconnu une fois amputé de son début.
+    $cutoff = doli2shopFindPemMarkerCutoff($buffer, '-----END ');
+    $confirmedPart = substr($buffer, 0, $cutoff);
+    $carry = substr($buffer, $cutoff);
+
+    if ($confirmedPart === '') {
+        return array(true, $carry);
+    }
+
+    // Un `fgets()` borné ramène au plus UN `\n`, toujours en dernière position s'il est présent :
+    // si ce fragment ne se termine PAS par un retour à la ligne réel, ce n'est pas encore une ligne
+    // ACHEVÉE — juste une portion d'une ligne en cours, plus longue que ce qu'un seul fragment a pu
+    // ramener. Re-review 3 couches (quatrième passe, HIGH) : ce n'est PAS un cas dégénéré/
+    // adversarial réservé à un contenu corrompu — un corps PEM RÉEL peut légitimement dépasser
+    // `doli2shopLogStreamChunkSize()` (un corps non enroulé sur une seule ligne, ou un outil qui
+    // enroule plus large que la convention). MEDIUM 2 ne juge que des lignes TERMINÉES : trop tôt
+    // pour statuer ici, fail-closed comme avant ce correctif — marqueur ÉMIS IMMÉDIATEMENT pour la
+    // partie confirmée (rien n'est accumulé d'un appel à l'autre : chaque fragment devient son
+    // propre marqueur, mémoire bornée par construction même sur un corps de plusieurs Mo), le flux
+    // reste en état PEM, en attente de la suite.
+    if (substr($confirmedPart, -1) !== "\n") {
+        $outputWriter(doli2shopPemBlockMarker(false));
+        return array(true, $carry);
+    }
+
+    // MEDIUM 2 : la partie confirmée EST une ligne complète — seule une ligne qui RESSEMBLE
+    // réellement à du contenu PEM reste en état PEM. Le fail-closed jusqu'à EOF (HIGH 1) ne vaut
+    // donc que tant que les lignes reçues continuent d'y ressembler, jamais indéfiniment sur la
+    // seule foi du BEGIN initial.
+    if (doli2shopLineLooksLikePemBodyOrHeader($confirmedPart)) {
+        $outputWriter(doli2shopPemBlockMarker(true));
+        return array(true, $carry);
+    }
+
+    // Faux positif (MEDIUM 2) : ce n'était pas un vrai bloc PEM — sortie de l'état, et CE fragment
+    // (report inclus : il ne peut plus s'agir d'une amorce de END puisqu'on vient de décider que ce
+    // contexte n'est pas du PEM) repasse par le masquage normal.
+    $outputWriter($lineMasker($confirmedPart . $carry));
+    return array(false, '');
+}
+
+/**
+ * Re-review 3 couches (deuxième passe, HIGH 2) : calcule, pour un fragment de texte libre PAS
+ * ENCORE confirmé comme complet (la suite pourrait arriver dans un fragment ultérieur), le point
+ * de coupure au-delà duquel AUCUNE classification de motif sensible ne peut plus être remise en
+ * cause par les octets qui suivront. Tout ce qui précède ce point peut être masqué et émis
+ * immédiatement ; tout ce qui suit doit être retenu (`$carry`) et représenté au prochain appel,
+ * concaténé en tête du fragment suivant.
+ *
+ * Remplace l'ancienne fenêtre de recouvrement à TAILLE FIXE (512 octets), qui supposait qu'aucun
+ * jeton préfixé connu ne dépasse ~200 caractères — invalidée en review par un jeton de 3000
+ * caractères : au-delà de 512 octets retenus, la partie du jeton restée dans la portion « sûre à
+ * masquer » ressortait comme `***N` (N = longueur tronquée), tandis que sa QUEUE, désormais privée
+ * de son préfixe reconnu, ressortait en clair au chunk suivant. Cette fonction ne dépend plus
+ * d'AUCUNE taille de fenêtre : elle retient EXACTEMENT et SEULEMENT ce qui pourrait encore faire
+ * partie d'un motif en cours, quelle que soit sa longueur réelle.
+ *
+ * Quatre familles de motifs « en cours » recherchées, dont on retient le point de départ le plus à
+ * GAUCHE (le plus conservateur) :
+ *  1. Un jeton hexadécimal BRUT en cours : la plus longue suite de caractères hexadécimaux qui
+ *     touche la toute fin du buffer (même un seul caractère — pourrait atteindre 32+ avec la
+ *     suite).
+ *  2. Un jeton PRÉFIXÉ connu (`doli2shopKnownTokenValuePatterns()`, hors `-----BEGIN` — ce
+ *     marqueur PEM a son jeu de caractères de continuation propre, traité séparément en famille 4)
+ *     déjà commencé, dont la suite jusqu'à la fin du buffer est entièrement composée de caractères
+ *     de jeton plausibles (`[A-Za-z0-9_]`) : la continuation pourrait encore s'allonger.
+ *  3. Une AMORCE de préfixe connu, coupée par la frontière (ex. `...shp` avant `at_…` dans le
+ *     chunk suivant) : le plus long SUFFIXE du buffer qui soit un préfixe STRICT (donc incomplet)
+ *     d'un des motifs connus.
+ *  4. Re-review 3 couches (troisième passe, HIGH) : une amorce ou un début non encore refermé d'un
+ *     marqueur de délimitation PEM (`-----BEGIN `/`-----END `, `doli2shopFindPemMarkerCutoff()`) —
+ *     sans cette famille, le marqueur `-----BEGIN` LUI-MÊME pouvait se faire couper par une
+ *     frontière de chunk (ex. `…-----BEG` | `IN RSA PRIVATE KEY-----`) : ni la détection d'état PEM
+ *     du buffer courant (motif incomplet) ni aucune des familles 1-3 (aucun rapport avec un jeton)
+ *     ne retenaient alors ce fragment, qui partait tel quel dans la sortie — le flux ne basculait
+ *     JAMAIS en état PEM, et tout le corps de la clé fuyait en clair. Cette famille retient la
+ *     amorce/continuation du marqueur EXACTEMENT comme la famille 2/3 le fait pour un jeton
+ *     préfixé, avec le jeu de caractères d'une étiquette PEM (`[A-Z0-9 ]`).
+ *
+ * Un buffer qui se termine par un retour à la ligne réel (`\n`) — le cas de très loin le plus
+ * fréquent, puisqu'un `fgets()` borné ramène presque toujours une ligne complète — ne déclenche
+ * aucune des quatre familles ci-dessus (`\n` n'est ni un caractère hexadécimal, ni un caractère de
+ * jeton, ni le début d'aucun motif connu) : le point de coupure retourné est alors la longueur
+ * totale du buffer, et rien n'est retenu.
+ *
+ * @param  string $buffer Fragment de texte libre à analyser
+ * @return int Offset de coupure sûr (0 à `strlen($buffer)`)
+ * @since  2.6.0
+ */
+function doli2shopFindSafeMaskableCutoff(string $buffer): int
+{
+    $len = strlen($buffer);
+    if ($len === 0) {
+        return 0;
+    }
+
+    $cutoff = $len;
+
+    // (1) Run hexadécimal en cours en fin de buffer.
+    $i = $len;
+    while ($i > 0 && ctype_xdigit($buffer[$i - 1])) {
+        $i--;
+    }
+    if ($i < $len) {
+        $cutoff = min($cutoff, $i);
+    }
+
+    $knownPrefixes = array();
+    foreach (doli2shopKnownTokenValuePatterns() as $prefix) {
+        if ($prefix === '-----BEGIN') {
+            // Exclu de la liste générique de jetons : son jeu de caractères de continuation n'est
+            // PAS `[A-Za-z0-9_]` (une étiquette PEM contient des espaces et se referme par `-----`,
+            // jamais par une frontière de mot) — traité séparément par la famille 4 ci-dessous, PAS
+            // ignoré (re-review 3 couches, troisième passe : l'ancien commentaire ici affirmait à
+            // tort qu'il n'était traité « jamais ici », alors qu'aucun autre mécanisme ne le
+            // couvrait non plus avant ce correctif — le marqueur BEGIN lui-même pouvait donc être
+            // coupé par une frontière de chunk sans jamais être reconnu).
+            continue;
+        }
+        $knownPrefixes[] = $prefix;
+    }
+
+    // (2) Jeton préfixé connu déjà commencé, dont la continuation atteint la fin du buffer.
+    foreach ($knownPrefixes as $prefix) {
+        $searchFrom = 0;
+        while (($pos = stripos($buffer, $prefix, $searchFrom)) !== false) {
+            $tail = substr($buffer, $pos + strlen($prefix));
+            if ($tail === '' || preg_match('/^[A-Za-z0-9_]*$/', $tail) === 1) {
+                $cutoff = min($cutoff, $pos);
+            }
+            $searchFrom = $pos + 1;
+        }
+    }
+
+    // (3) Amorce de préfixe connu coupée par la frontière : plus long suffixe du buffer qui soit
+    // un préfixe STRICT (incomplet) d'un motif connu.
+    $maxPrefixLen = 0;
+    foreach ($knownPrefixes as $prefix) {
+        $maxPrefixLen = max($maxPrefixLen, strlen($prefix));
+    }
+    for ($suffixLen = min($maxPrefixLen - 1, $len); $suffixLen > 0; $suffixLen--) {
+        $suffix = substr($buffer, $len - $suffixLen);
+        $matched = false;
+        foreach ($knownPrefixes as $prefix) {
+            if ($suffixLen < strlen($prefix) && strncasecmp($prefix, $suffix, $suffixLen) === 0) {
+                $matched = true;
+                break;
+            }
+        }
+        if ($matched) {
+            $cutoff = min($cutoff, $len - $suffixLen);
+            break; // Suffixe le plus long trouvé en premier (boucle décroissante) : le plus
+                   // conservateur pour cette famille, inutile de chercher plus court.
+        }
+    }
+
+    // (4) Amorce ou début non encore refermé d'un marqueur de délimitation PEM (HIGH, troisième
+    // passe) — voir doli2shopFindPemMarkerCutoff().
+    foreach (doli2shopPemBoundaryMarkers() as $pemMarker) {
+        $cutoff = min($cutoff, doli2shopFindPemMarkerCutoff($buffer, $pemMarker));
+    }
+
+    return $cutoff;
+}
+
+/**
+ * Re-review 3 couches (M1, puis deuxième passe HIGH 1/HIGH 2) : diffuse le contenu MASQUÉ d'un
+ * fichier de journal déjà ouvert (`doli2shopOpenLogFileForDownload()`) vers un flux de sortie, PAR
+ * CHUNKS BORNÉS plutôt que par `fgets()` sans longueur — l'ancien code chargeait une ligne entière
+ * en mémoire quelle que soit sa taille.
+ *
+ * **Deux mécanismes À ÉTAT, orthogonaux, qui ne dépendent d'AUCUNE taille de fenêtre fixe** :
+ *
+ *  1. **Bloc PEM multi-lignes** (`$inPemBlock`) : un bloc PEM (clé privée, certificat…) commencé
+ *     sur une ligne (`-----BEGIN ... -----`) sans que la MÊME ligne ne le referme
+ *     (`-----END ... -----`) faisait auparavant fuir tout son CORPS en clair — chaque ligne étant
+ *     masquée indépendamment, et le motif PEM `doli2shopMaskPemBlockSubstrings()` exigeant BEGIN
+ *     et END dans la MÊME chaîne pour matcher. Corrigé : dès qu'un BEGIN sans END correspondant
+ *     est détecté, le flux bascule en état « bloc PEM » — CHAQUE ligne suivante (corps inclus) est
+ *     remplacée par `doli2shopPemBlockMarker()`, jusqu'à la ligne qui referme le bloc (INCLUSE), ou
+ *     jusqu'à la fin du fichier si le END n'arrive jamais (fail-closed). Le texte AVANT le BEGIN
+ *     sur la première ligne, et APRÈS le END sur la dernière, repassent par le masquage NORMAL.
+ *     Re-review 3 couches (troisième passe) : le marqueur BEGIN lui-même, ou le marqueur END en
+ *     état PEM, peuvent être coupés par une frontière de chunk — voir la famille 4 de
+ *     `doli2shopFindSafeMaskableCutoff()` (HIGH) et `doli2shopFindPemMarkerCutoff()` dans
+ *     `doli2shopProcessBufferInsidePemBlock()` (MEDIUM 1). Le fail-closed jusqu'à EOF ne vaut en
+ *     outre que tant que les lignes reçues RESSEMBLENT à du contenu PEM
+ *     (`doli2shopLineLooksLikePemBodyOrHeader()`, MEDIUM 2) : un simple message de log qui
+ *     mentionne `-----BEGIN CERTIFICATE-----` sans être suivi d'un vrai corps de clé fait sortir le
+ *     flux de l'état PEM dès la ligne suivante, au lieu d'engloutir tout le reste du fichier.
+ *  2. **Motif sensible en cours** (`$carry`, via `doli2shopFindSafeMaskableCutoff()`) : un jeton
+ *     préfixé connu ou un jeton hexadécimal brut qui atteint la fin d'un chunk SANS caractère de
+ *     coupure derrière lui n'est PLUS masqué immédiatement pour sa portion déjà lue — la coupure
+ *     sûre est calculée dynamiquement (aucune fenêtre de taille fixe), et la portion encore
+ *     « ouverte » est reportée telle quelle en tête du chunk suivant, où le masquage se rejoue sur
+ *     le motif RECONSTITUÉ dans son ensemble. Se répète autant de fois que nécessaire tant que le
+ *     motif continue de toucher la fin du chunk. Une amorce de préfixe coupée par la frontière
+ *     (ex. `...shp` avant `at_…`) est retenue de la même façon. `doli2shopLogStreamCarryOverSize()`
+ *     reste un garde-fou de MÉMOIRE (pas de masquage) pour le cas dégénéré d'un fragment qui ne
+ *     se termine jamais.
+ *
+ * Un chunk qui se termine par un `\n` réel marque une frontière de ligne certaine : rien ne peut
+ * continuer au-delà, tout le buffer accumulé (report précédent inclus) est alors masqué et émis
+ * immédiatement, sans passer par le calcul de coupure.
+ *
+ * **Erreur de lecture en cours de flux** (H1, première passe) : `fgets()` renvoie `false` aussi
+ * bien sur une fin de fichier normale que sur une erreur de lecture — la seule façon de les
+ * distinguer est d'appeler `feof()` APRÈS la tentative de lecture, jamais avant. Sur une erreur
+ * réelle, une ligne explicite de fin anormale est ajoutée à la sortie et le statut `'read_error'`
+ * est renvoyé.
+ *
+ * @param  resource $handle       Handle de fichier déjà ouvert en lecture binaire (voir
+ *                                `doli2shopOpenLogFileForDownload()`) — fermé par cette fonction
+ *                                dans tous les cas normaux ci-dessous
+ * @param  callable(string):string $lineMasker  Fonction de masquage appliquée à chaque fragment
+ *                                (typiquement `doli2shopMaskAllKnownSensitiveSubstringsInFreeText`)
+ * @param  callable(string):void   $outputWriter Fonction d'écriture (`echo`, ou accumulation dans
+ *                                un test)
+ * @return string Statut : `'ok'` (tout lu jusqu'à la fin sans incident) ou `'read_error'` (le flux
+ *               a été partiellement écrit avant l'erreur — une ligne explicite de fin anormale a
+ *               déjà été passée à `$outputWriter`)
+ * @since  2.6.0
+ */
+function doli2shopStreamMaskedLogFileToOutput($handle, callable $lineMasker, callable $outputWriter): string
+{
+    $chunkSize = doli2shopLogStreamChunkSize();
+    $maxCarrySize = doli2shopLogStreamCarryOverSize();
+    $carry = '';
+    $inPemBlock = false;
+    $readError = false;
+
+    while (true) {
+        $chunk = fgets($handle, $chunkSize + 1);
+
+        if ($chunk === false) {
+            // fgets() renvoie false à la fois sur EOF propre et sur erreur de lecture — feof()
+            // les distingue seulement APRÈS la tentative (jamais avant).
+            if (!feof($handle)) {
+                $readError = true;
+            }
+            break;
+        }
+
+        $buffer = $carry . $chunk;
+        $carry = '';
+
+        if ($inPemBlock) {
+            list($inPemBlock, $carry) = doli2shopProcessBufferInsidePemBlock($buffer, $lineMasker, $outputWriter);
+            continue;
+        }
+
+        // Amorce d'un bloc PEM NON refermé sur ce même buffer : bascule en état PEM (HIGH 1).
+        if (preg_match('/-----BEGIN\s+[A-Z0-9 ]*-----/', $buffer, $beginMatch, PREG_OFFSET_CAPTURE) === 1) {
+            $beginPos = $beginMatch[0][1];
+            $beginMarkerEnd = $beginPos + strlen($beginMatch[0][0]);
+            $hasEndOnSameBuffer = preg_match('/-----END\s+[A-Z0-9 ]*-----/', substr($buffer, $beginMarkerEnd)) === 1;
+
+            if (!$hasEndOnSameBuffer) {
+                $before = substr($buffer, 0, $beginPos);
+                if ($before !== '') {
+                    $outputWriter($lineMasker($before));
+                }
+                $outputWriter(doli2shopPemBlockMarker(substr($buffer, -1) === "\n"));
+                $inPemBlock = true;
+                continue;
+            }
+            // BEGIN et END dans le MÊME buffer : cas déjà couvert par le masqueur normal
+            // (doli2shopMaskPemBlockSubstrings(), composé dans $lineMasker) — traitement normal
+            // ci-dessous, pas de bascule d'état.
+        }
+
+        if (substr($buffer, -1) === "\n") {
+            // Frontière de ligne RÉELLE : tout le buffer (report précédent inclus) peut être
+            // masqué et émis sans risque de couper un motif en deux.
+            $outputWriter($lineMasker($buffer));
+            continue;
+        }
+
+        // Le fragment s'arrête SANS retour à la ligne (ligne plus longue que $chunkSize, ou toute
+        // dernière ligne du fichier sans retour à la ligne final) : calcule la coupure sûre
+        // (HIGH 2) plutôt que de se fier à une fenêtre de taille fixe.
+        $cutoff = doli2shopFindSafeMaskableCutoff($buffer);
+        if ($cutoff > 0) {
+            $outputWriter($lineMasker(substr($buffer, 0, $cutoff)));
+        }
+        $carry = substr($buffer, $cutoff);
+
+        if (strlen($carry) > $maxCarrySize) {
+            // Garde-fou de MÉMOIRE (pas de masquage) : un fragment qui ne se termine jamais ne
+            // doit pas faire croître la mémoire indéfiniment — fail-closed, masqué et vidé de
+            // force plutôt que de continuer à grossir.
+            $outputWriter($lineMasker($carry));
+            $carry = '';
+        }
+    }
+
+    if ($carry !== '') {
+        if ($inPemBlock) {
+            // Re-review 3 couches (troisième passe, MEDIUM 1) : fin de flux alors qu'une
+            // amorce/continuation du marqueur END restait en attente — fail-closed, comme
+            // n'importe quelle autre ligne de corps PEM jamais confirmée (le doute profite au
+            // secret, jamais à la lisibilité).
+            $outputWriter(doli2shopPemBlockMarker(false));
+        } else {
+            // Fin de flux : plus rien à attendre, ce qui restait en attente est maintenant
+            // définitif — masqué normalement (motif réellement complet, ou simple texte anodin).
+            $outputWriter($lineMasker($carry));
+        }
+    }
+
+    if ($readError) {
+        $outputWriter(
+            "\n[doli2shop] ERREUR : lecture du journal du module interrompue de façon anormale — "
+            . "le contenu ci-dessus est TRONQUÉ par rapport au fichier d'origine.\n"
+        );
+    }
+
+    fclose($handle);
+
+    return $readError ? 'read_error' : 'ok';
+}
+
+// ============================================================================
+// Story secret-app-affiche-en-clair-setup — masquage des 3 credentials Shopify affichés en clair
+// dans admin/setup.php (DOLI2SHOP_ACCESS_TOKEN / DOLI2SHOP_API_KEY / DOLI2SHOP_API_SECRET_KEY),
+// pour les 2 modes (OAuth connecté / manuel). Source unique de vérité (nom de champ HTML → nom de
+// constante Dolibarr → libellé/aide de traduction), utilisée à la fois par admin/setup.php (rendu)
+// et par le garde-fou de CLASSE de test/unit/SetupCredentialFieldsNeverExposedGuardTest.php (AC10)
+// — un 4ᵉ champ credential ajouté un jour à cette liste est automatiquement couvert par le rendu
+// masqué et par le garde-fou, sans qu'aucun des deux n'ait à être retouché à la main.
+// ============================================================================
+
+/**
+ * Définition des 3 champs credential Shopify affichés dans l'onglet `settings` de
+ * `admin/setup.php` : nom de champ HTML (`name="..."`) => nom de constante Dolibarr, clé de
+ * traduction du libellé, clé de traduction de l'aide. Story secret-app-affiche-en-clair-setup.
+ *
+ * @return array<string,array{const:string,label:string,help:string}>
+ * @since  2.6.0
+ */
+function doli2shopSetupCredentialFieldDefinitions(): array
+{
+    return array(
+        'shopify_access_token' => array(
+            'const' => 'DOLI2SHOP_ACCESS_TOKEN',
+            'label' => 'ShopifyAccessToken',
+            'help'  => 'ShopifyAccessTokenHelp',
+        ),
+        'shopify_api_key' => array(
+            'const' => 'DOLI2SHOP_API_KEY',
+            'label' => 'ShopifyApiKey',
+            'help'  => 'ShopifyApiKeyHelp',
+        ),
+        'shopify_api_secret_key' => array(
+            'const' => 'DOLI2SHOP_API_SECRET_KEY',
+            'label' => 'ShopifyApiSecretKey',
+            'help'  => 'ShopifyApiSecretKeyHelp',
+        ),
+    );
+}
+
+/**
+ * Un credential Shopify (constante Dolibarr) est-il configuré (valeur non vide) ? **Seul point du
+ * module, dans `admin/` et `ajax/`, autorisé à lire la valeur RÉELLE d'une constante sensible via
+ * `getDolGlobalString()`** — cf. re-review 3 couches (HIGH AC10) de la story
+ * secret-app-affiche-en-clair-setup : `admin/setup.php` ne doit plus JAMAIS appeler
+ * `getDolGlobalString()` lui-même sur `DOLI2SHOP_ACCESS_TOKEN`/`DOLI2SHOP_API_KEY`/
+ * `DOLI2SHOP_API_SECRET_KEY` (ou tout futur credential) — seulement cette fonction, qui ne
+ * renvoie JAMAIS la valeur elle-même, uniquement un booléen. C'est ce qui rend le rendu de
+ * `admin/setup.php` structurellement incapable de fuiter une valeur : ELLE NE LA REÇOIT JAMAIS,
+ * pas seulement « elle choisit de ne pas l'afficher » (propriété plus forte qu'une discipline de
+ * code — cf. `test/unit/SetupCredentialFieldsNeverExposedGuardTest.php`, garde-fou par PROPRIÉTÉ
+ * plutôt que par forme syntaxique, qui verrouille cette liste blanche).
+ *
+ * @param  string $constName Nom de la constante Dolibarr (ex. `DOLI2SHOP_ACCESS_TOKEN`)
+ * @return bool true si une valeur non vide est actuellement enregistrée
+ * @since  2.6.0
+ */
+function doli2shopCredentialIsConfigured(string $constName): bool
+{
+    return getDolGlobalString($constName) !== '';
+}
+
+/**
+ * `trim()` étendu aux espaces UNICODE que la fonction native PHP `trim()` ne retire PAS (elle ne
+ * connaît que l'ASCII : ` \t\n\r\0\x0B`). Re-review 3 couches (MEDIUM, 2ᵉ passe) : un secret
+ * copié-collé depuis certaines sources (PDF, page web, certains éditeurs) peut porter un espace
+ * INSÉCABLE (U+00A0), un espace tabulaire de chiffre (U+2007), un espace fine insécable (U+202F)
+ * ou une marque d'ordre d'octets/BOM résiduelle (U+FEFF) en tête ou en fin de valeur — visuellement
+ * indiscernable d'un espace ordinaire, mais qu'un `trim()` classique laisse en place, avec le même
+ * risque qu'un espace ASCII non retiré (constante enregistrée avec un caractère parasite,
+ * authentification Shopify cassée silencieusement au prochain appel API).
+ *
+ * @param  string $value Valeur à nettoyer
+ * @return string Valeur sans espace (ASCII ou Unicode listé ci-dessus) de bord
+ * @since  2.6.0
+ */
+function doli2shopTrimUnicodeWhitespace(string $value): string
+{
+    $trimmed = preg_replace('/^[\s\x{00A0}\x{2007}\x{202F}\x{FEFF}]+|[\s\x{00A0}\x{2007}\x{202F}\x{FEFF}]+$/u', '', $value);
+    return $trimmed === null ? $value : $trimmed;
+}
+
+/**
+ * Calcule, à partir des valeurs brutes POSTées pour les 3 champs credential Shopify, le
+ * sous-ensemble à fusionner dans `$values` (`admin/setup.php`, action `updateConfig`) — RÈGLE :
+ * un champ POST vide (ou ne contenant QUE des espaces, `trim()`é) signifie « ne pas y toucher »,
+ * JAMAIS « écraser par une chaîne vide ». `ConfigurationMigrator::saveConfigurationValue()` force
+ * l'écriture même pour une valeur vide (`DELETE` puis réinsertion, cf. constat de la story) : c'est
+ * l'OMISSION de la clé, pas un test sur sa valeur, qui protège le secret déjà en base (Task 2,
+ * décision n°5, AC2/AC3).
+ *
+ * Re-review 3 couches (MEDIUM) : la valeur retenue est elle-même `trim()`ée avant d'être renvoyée
+ * — un secret collé avec un espace ou un retour à la ligne parasite (copier-coller depuis un
+ * terminal, un fichier `.env`, ou un champ de formulaire tiers) ne doit pas être enregistré tel
+ * quel, ce qui casserait silencieusement l'authentification Shopify au prochain appel API.
+ *
+ * Fonction PURE, extraite pour rester testable sans démarrer `admin/setup.php` (contexte admin
+ * Dolibarr complet non disponible en test unitaire, cf. décision de conception n°8).
+ *
+ * @param  array<string,string> $postValues Valeurs brutes GETPOST() par nom de champ (les clés de
+ *                                           `doli2shopSetupCredentialFieldDefinitions()`)
+ * @return array<string,string> Sous-ensemble TRIMMÉ à fusionner dans `$values` — les clés omises
+ *                               signifient « ne pas toucher à la constante existante »
+ * @since  2.6.0
+ */
+function doli2shopFilterNonEmptyCredentialPostValues(array $postValues): array
+{
+    $result = array();
+    foreach (doli2shopSetupCredentialFieldDefinitions() as $fieldName => $def) {
+        $posted = doli2shopTrimUnicodeWhitespace((string) ($postValues[$fieldName] ?? ''));
+        if ($posted !== '') {
+            $result[$fieldName] = $posted;
+        }
+    }
+    return $result;
+}
+
+/**
+ * Valide, PAR CHAMP et INDÉPENDAMMENT pour chacun des 3 credentials Shopify, la règle de
+ * remplacement (Task 3, décision n°6 amendée Validate 29/09, AC6/AC6bis) : pour CHAQUE champ,
+ * (valeur déjà en base) OU (POST non vide, hors espaces, pour ce champ précis) est requis — sinon
+ * ce champ est manquant. **JAMAIS un OR global sur les 3** : une lecture « au moins un des 3
+ * existe déjà en base » laisserait tourner indéfiniment une configuration avec 2 des 3 credentials
+ * jamais renseignés dès qu'un seul a reçu une valeur un jour (cf. correction Validate 29/09 dans
+ * la décision de conception n°6 de la story). Ne s'applique qu'à la boutique par défaut / aucune
+ * boutique (l'appelant conditionne l'appel, comme pour `shopify_location_id`) — une boutique
+ * secondaire n'écrit de toute façon jamais ces constantes globales (garde-fou existant,
+ * `admin/setup.php` ~:1137-1149).
+ *
+ * Re-review 3 couches (HIGH AC10) : ce paramètre est désormais un tableau de BOOLÉENS
+ * (déjà-configuré ou non), jamais la valeur réelle — construit par l'appelant via
+ * `doli2shopCredentialIsConfigured()`, seule fonction autorisée à lire la valeur. Re-review
+ * (MEDIUM) : le test de vacuité du POST est `trim()`é, symétrique à
+ * `doli2shopFilterNonEmptyCredentialPostValues()` (une valeur postée composée uniquement
+ * d'espaces doit être traitée comme vide, pas comme une soumission valide).
+ *
+ * @param  array<string,bool>   $currentDbConfigured Par nom de CONSTANTE, `true` si une valeur non
+ *                                                    vide est déjà enregistrée (résultat de
+ *                                                    `doli2shopCredentialIsConfigured()`)
+ * @param  array<string,string> $postValues          Valeurs brutes GETPOST() par nom de champ
+ * @return string[] Noms des champs (clés HTML) encore manquants — vide = validation réussie
+ * @since  2.6.0
+ */
+function doli2shopValidateCredentialReplacement(array $currentDbConfigured, array $postValues): array
+{
+    $missingFields = array();
+    foreach (doli2shopSetupCredentialFieldDefinitions() as $fieldName => $def) {
+        $alreadyInDb = !empty($currentDbConfigured[$def['const']]);
+        $postedNow = doli2shopTrimUnicodeWhitespace((string) ($postValues[$fieldName] ?? '')) !== '';
+        if (!$alreadyInDb && !$postedNow) {
+            $missingFields[] = $fieldName;
+        }
+    }
+    return $missingFields;
+}
+
+/**
+ * Rend UNE ligne `<tr>` de champ credential Shopify (statut Configuré/Non configuré + champ de
+ * saisie VIDE + aide), sans jamais recevoir la valeur réelle de la constante. Story
+ * secret-app-affiche-en-clair-setup (AC1, AC10).
+ *
+ * Re-review 3 couches (HIGH AC10) : cette fonction ne prend plus la valeur réelle en paramètre du
+ * tout (elle prenait auparavant `string $currentValue`, dont elle prouvait par test ne jamais la
+ * réinjecter — mais un test d'ABSENCE de fuite reste contournable par une forme syntaxique non
+ * anticipée). Recevoir directement un `bool $isConfigured` rend la fuite structurellement
+ * IMPOSSIBLE plutôt que seulement testée absente : cette fonction ne PEUT PAS imprimer une valeur
+ * qu'elle n'a jamais reçue. `doli2shopRenderCredentialFieldsBlock()` ci-dessous est l'unique
+ * appelant, et lui seul calcule ce booléen via `doli2shopCredentialIsConfigured()`.
+ *
+ * Motif d'exposition refermé par cette fonction (cf. constat de la story) : les 2 modes de
+ * `admin/setup.php` (OAuth connecté et manuel) affichaient chacun la valeur réelle — le premier en
+ * `<input type="hidden">` (tout aussi exposé côté HTML source qu'un champ visible), le second en
+ * `value="..."` visible. Les 2 branches appellent désormais cette même fonction.
+ *
+ * Re-review (LOW) : `$rowClass` restaure l'alternance pair/impair (ou `oddeven`) du rendu
+ * d'origine, que l'appelant choisit selon le contexte (mode manuel : pair/impair alternés comme
+ * avant ; mode OAuth connecté : `oddeven`, comme le reste de cette branche).
+ *
+ * @param  object $langs       Objet Translate ($langs->trans())
+ * @param  string $fieldName   Nom du champ HTML (attribut `name`)
+ * @param  bool   $isConfigured Statut déjà calculé par l'appelant (jamais la valeur elle-même)
+ * @param  string $labelKey    Clé de traduction du libellé de la ligne
+ * @param  string $helpKey     Clé de traduction de l'aide (tooltip du champ)
+ * @param  string $rowClass    Classe CSS de la ligne (`pair`/`impair`/`oddeven`)
+ * @return string HTML de la ligne `<tr>` complète (2 colonnes : libellé, statut + champ + aide)
+ * @since  2.6.0
+ */
+function doli2shopRenderCredentialFieldRow($langs, string $fieldName, bool $isConfigured, string $labelKey, string $helpKey, string $rowClass = 'oddeven'): string
+{
+    $statusBadge = $isConfigured
+        ? '<span class="badge badge-status4">' . $langs->trans('Configured') . '</span>'
+        : '<span class="badge badge-status8">' . $langs->trans('NotConfigured') . '</span>';
+
+    $html = '<tr class="' . dol_escape_htmltag($rowClass) . '">';
+    $html .= '<td class="titlefieldcreate">' . $langs->trans($labelKey) . '</td>';
+    $html .= '<td>';
+    $html .= $statusBadge . '<br>';
+    $html .= '<input type="text" name="' . dol_escape_htmltag($fieldName) . '" value="" size="40" autocomplete="off" placeholder="' . dol_escape_htmltag($langs->trans('LeaveEmptyToKeep')) . '">';
+    $html .= ' <span class="help-icon" title="' . dol_escape_htmltag($langs->trans($helpKey)) . '">?</span>';
+    $html .= '</td>';
+    $html .= '</tr>';
+
+    return $html;
+}
+
+/**
+ * Rend les 3 lignes credential Shopify (`doli2shopSetupCredentialFieldDefinitions()`), en lisant
+ * le statut de chaque constante Dolibarr via `doli2shopCredentialIsConfigured()` — jamais sa
+ * valeur réelle. Utilisée par les 2 branches (OAuth connecté / manuel) de `admin/setup.php`
+ * (Task 1).
+ *
+ * Re-review (LOW) : `$rowClasses` permet à l'appelant de restaurer l'alternance pair/impair
+ * exacte du rendu d'origine (3 classes, une par champ, dans l'ordre de
+ * `doli2shopSetupCredentialFieldDefinitions()` ; `oddeven` par défaut si omis ou incomplet).
+ *
+ * Re-review (LOW) : `$secondaryStoreViewingDefaultCredentials`, quand `true`, ajoute sous le bloc
+ * une ligne d'information (5 langues, clé `CredentialsBelongToDefaultStore`) rappelant que ces 3
+ * credentials sont GLOBAUX — donc ceux de la boutique PAR DÉFAUT — même quand l'onglet est
+ * consulté depuis le contexte d'une boutique secondaire (qui n'a et n'affiche jamais ses propres
+ * credentials, cf. garde-fou `admin/setup.php` ~:1137-1149).
+ *
+ * @param  object   $langs                                  Objet Translate ($langs->trans())
+ * @param  string[] $rowClasses                              Classes CSS des 3 lignes, dans l'ordre
+ * @param  bool     $secondaryStoreViewingDefaultCredentials Ajoute la mention « boutique par défaut »
+ * @return string HTML concaténé des 3 lignes `<tr>` (+ mention éventuelle)
+ * @since  2.6.0
+ */
+function doli2shopRenderCredentialFieldsBlock($langs, array $rowClasses = array(), bool $secondaryStoreViewingDefaultCredentials = false): string
+{
+    $html = '';
+    $i = 0;
+    foreach (doli2shopSetupCredentialFieldDefinitions() as $fieldName => $def) {
+        $rowClass = isset($rowClasses[$i]) ? (string) $rowClasses[$i] : 'oddeven';
+        $html .= doli2shopRenderCredentialFieldRow(
+            $langs,
+            $fieldName,
+            doli2shopCredentialIsConfigured($def['const']),
+            $def['label'],
+            $def['help'],
+            $rowClass
+        );
+        $i++;
+    }
+
+    if ($secondaryStoreViewingDefaultCredentials) {
+        $html .= '<tr class="oddeven">';
+        $html .= '<td colspan="2" class="opacitymedium" style="font-style: italic;">';
+        $html .= dol_escape_htmltag($langs->trans('CredentialsBelongToDefaultStore'));
+        $html .= '</td>';
+        $html .= '</tr>';
+    }
+
+    return $html;
 }

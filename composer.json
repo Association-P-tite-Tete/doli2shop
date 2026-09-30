@@ -40,6 +40,7 @@
         "test:integration": "phpunit --testdox --testsuite 'Integration Tests'",
         "test:functional": "phpunit --testdox --testsuite 'Functional Tests'",
         "test:db-migrations": "phpunit --testdox --group db-migrations",
+        "test:migration-custom-prefix": "DOLI2SHOP_TEST_DB_PREFIX=d2stest_ phpunit --testdox --group migration-custom-prefix",
         "phpcs": "phpcs --standard=PSR12 --extensions=php class/",
         "phpstan": "phpstan analyse class/",
         "check-sql": "grep -r --include=\"*.php\" \"\\$sql.*\\$_\" --color class/ || echo \"No direct SQL injections found\"",

@@ -12,7 +12,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.org>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.1.6
  * @link        https://doli2shop.ptitetete.org
  */
@@ -52,11 +52,10 @@ $langs->loadLangs(array("admin", "doli2shop@doli2shop"));
 // CONFIGURATION
 // ===========================================
 
-// Secret HMAC legacy (modèle historique à secret partagé). PLUS de valeur par défaut
-// prévisible (HIGH review 34.6) : la vérification legacy n'est possible que si la constante
-// est explicitement définie. Ce chemin n'est emprunté que si le proxy n'émet PAS de
-// signature asymétrique (proxy non migré) ; sinon vérification asymétrique exclusive.
-$oauth_proxy_secret = getDolGlobalString('DOLI2SHOP_OAUTH_PROXY_SECRET', '');
+// Story 34-6b (cutover) — le repli HMAC legacy et sa constante DOLI2SHOP_OAUTH_PROXY_SECRET
+// sont RETIRÉS : la vérification est désormais EXCLUSIVEMENT asymétrique, fail-closed, sans
+// AUCUNE branche alternative (AC2/AC6). Voir doli2shopVerifyOAuthBaseSignature()/
+// doli2shopVerifyOAuthExtendedSignature() (lib/doli2shop.lib.php).
 
 // URL de l'endpoint clé publique du proxy (Story 34.6 — vérification asymétrique)
 $oauth_pubkey_url = 'https://doli2shop.ptitetete.org/oauth/pubkey.php';
@@ -160,135 +159,157 @@ if (!empty($error)) {
     doli2shopOauthErrorRedirect('credentials');
 }
 
-// Get credentials from proxy
-$shop = GETPOST('shop', 'alphanohtml');
-$access_token = GETPOST('access_token', 'alphanohtml');
-$scope = GETPOST('scope', 'alphanohtml');
-$api_key = GETPOST('api_key', 'alphanohtml');
-$api_secret = GETPOST('api_secret', 'alphanohtml');
-$signature = GETPOST('signature', 'alphanohtml');
-$signature_asym = GETPOST('signature_asym', 'alphanohtml'); // hex RSA (Story 34.6)
-$key_id = GETPOST('key_id', 'alphanohtml');
-$timestamp = GETPOST('timestamp', 'int');
+// ===========================================
+// Story 61-3 — Pickup token (AC5) : détection EN TÊTE de traitement, avant toute lecture des
+// credentials. Si présent, les credentials sont récupérées par un appel serveur-à-serveur vers
+// le proxy (jamais lues depuis la query string) ; sinon, chemin historique STRICTEMENT
+// inchangé (AC4/invariant n°1 — tout le parc installé à ce jour n'annonce pas encore
+// oauth_pickup_v1 et continue de recevoir les credentials dans l'URL comme avant).
+// ===========================================
+$pickup_token = GETPOST('pickup_token', 'alphanohtml');
 
-// Story 51-1 — Jetons expirables : présents UNIQUEMENT si Shopify a basculé ce marchand
-// en régime expirable (expiring=1 côté proxy). Absents = comportement rétrocompatible (AC5).
-$expires_in = GETPOST('expires_in', 'int');
-$refresh_token = GETPOST('refresh_token', 'alphanohtml');
-$signature_ext = GETPOST('signature_ext', 'alphanohtml');
-$signature_asym_ext = GETPOST('signature_asym_ext', 'alphanohtml');
+if (!empty($pickup_token)) {
+    dol_include_once('/core/lib/geturl.lib.php');
 
-// Validate required parameters (au moins une signature requise)
-if (empty($shop) || empty($access_token) || (empty($signature) && empty($signature_asym))) {
+    // Host codé en dur, JAMAIS dérivé d'une entrée utilisateur (Dev Notes) — sinon on
+    // réintroduit une SSRF/open-redirect sur cet appel serveur-à-serveur lui-même.
+    $pickup_url = 'https://doli2shop.ptitetete.org/oauth/pickup.php';
+
+    // ssl_verifypeer explicite à 1 (Dev Notes) : ne PAS laisser getURLContent() retomber sur sa
+    // valeur par défaut, qui désactive la vérification TLS hors production (même classe de
+    // défaut que le finding MEDIUM comparable de l'audit sur shopifyapi.class.php:2866 — hors
+    // périmètre de cette story, mais à ne pas reproduire ici).
+    $pickup_result = getURLContent($pickup_url, 'POST', array('pickup_token' => $pickup_token), 1, array(), array('https'), 0, 1);
+
+    if (!is_array($pickup_result) || (int) ($pickup_result['http_code'] ?? 0) !== 200 || empty($pickup_result['content'])) {
+        dol_syslog("Doli2Shop OAuth: échec rédemption pickup_token (http=" . ($pickup_result['http_code'] ?? 'n/a') . ")", LOG_ERR);
+        setEventMessages($langs->trans("OAuthPickupTokenExpired"), null, 'errors');
+        doli2shopOauthErrorRedirect('credentials');
+    }
+
+    $pickup_payload = json_decode($pickup_result['content'], true);
+    if (!is_array($pickup_payload) || empty($pickup_payload['shop']) || empty($pickup_payload['access_token'])) {
+        dol_syslog("Doli2Shop OAuth: réponse pickup.php invalide ou incomplète", LOG_ERR);
+        setEventMessages($langs->trans("OAuthPickupTokenExpired"), null, 'errors');
+        doli2shopOauthErrorRedirect('credentials');
+    }
+
+    // Peupler les MÊMES variables locales que le chemin historique ci-dessous : le reste du
+    // fichier (vérification de signature, résolution boutique, upsert StoreService...) n'est
+    // PAS dupliqué et continue de les lire sans savoir d'où elles viennent (AC5).
+    $shop               = (string) ($pickup_payload['shop'] ?? '');
+    $access_token       = (string) ($pickup_payload['access_token'] ?? '');
+    $scope              = (string) ($pickup_payload['scope'] ?? '');
+    $api_key            = (string) ($pickup_payload['api_key'] ?? '');
+    $api_secret         = (string) ($pickup_payload['api_secret'] ?? '');
+    $signature_asym     = (string) ($pickup_payload['signature_asym'] ?? ''); // hex RSA (Story 34.6)
+    $key_id             = (string) ($pickup_payload['key_id'] ?? '');
+    $timestamp          = (int) ($pickup_payload['timestamp'] ?? 0);
+    // Story 51-1 — Jetons expirables : présents UNIQUEMENT si Shopify a basculé ce marchand
+    // en régime expirable (expiring=1 côté proxy). Absents = comportement rétrocompatible (AC5).
+    $expires_in         = (int) ($pickup_payload['expires_in'] ?? 0);
+    $refresh_token      = (string) ($pickup_payload['refresh_token'] ?? '');
+    // Story 34-6b (cutover) — signature/signature_ext (HMAC legacy) retirés : seule
+    // l'asymétrique (signature_asym/signature_asym_ext) authentifie ce retour (AC2/AC3).
+    $signature_asym_ext = (string) ($pickup_payload['signature_asym_ext'] ?? '');
+} else {
+    // Chemin historique — STRICTEMENT inchangé (AC4) : credentials lues depuis la query string
+    // de la redirection, comme avant cette story.
+    $shop = GETPOST('shop', 'alphanohtml');
+    $access_token = GETPOST('access_token', 'alphanohtml');
+    $scope = GETPOST('scope', 'alphanohtml');
+    $api_key = GETPOST('api_key', 'alphanohtml');
+    $api_secret = GETPOST('api_secret', 'alphanohtml');
+    $signature_asym = GETPOST('signature_asym', 'alphanohtml'); // hex RSA (Story 34.6)
+    $key_id = GETPOST('key_id', 'alphanohtml');
+    $timestamp = GETPOST('timestamp', 'int');
+
+    // Story 51-1 — Jetons expirables : présents UNIQUEMENT si Shopify a basculé ce marchand
+    // en régime expirable (expiring=1 côté proxy). Absents = comportement rétrocompatible (AC5).
+    $expires_in = GETPOST('expires_in', 'int');
+    $refresh_token = GETPOST('refresh_token', 'alphanohtml');
+    // Story 34-6b (cutover) — signature/signature_ext (HMAC legacy) retirés : seule
+    // l'asymétrique (signature_asym/signature_asym_ext) authentifie ce retour (AC2/AC3).
+    $signature_asym_ext = GETPOST('signature_asym_ext', 'alphanohtml');
+}
+
+// Validate required parameters — Story 34-6b (AC2) : signature_asym devient OBLIGATOIRE, plus
+// aucun repli sur `signature` (HMAC legacy, retiré).
+if (empty($shop) || empty($access_token) || empty($signature_asym)) {
     dol_syslog("Doli2Shop OAuth: Missing required parameters", LOG_ERR);
     setEventMessages($langs->trans("OAuthMissingParameters"), null, 'errors');
     doli2shopOauthErrorRedirect('credentials');
 }
 
-// Verify signature
-$data_to_verify = $shop . '|' . $access_token . '|' . $scope;
+// ===========================================
+// Story 34-6b (cutover) — Vérification du canal de BASE, EXCLUSIVEMENT asymétrique
+// ===========================================
+// Le repli HMAC legacy (`signature`/DOLI2SHOP_OAUTH_PROXY_SECRET) est RETIRÉ : plus aucune
+// branche alternative. Tout échec (signature absente, OpenSSL absent, clé publique injoignable,
+// hex invalide, openssl_verify() != 1) = REJET, jamais de downgrade. La décision elle-même est
+// une fonction PURE (doli2shopVerifyOAuthBaseSignature(), lib/doli2shop.lib.php) : ce fichier ne
+// fait que résoudre la clé publique (réseau/cache) et traduire le motif en message/log.
+$oauthBasePublicKey = doli2shopFetchOAuthPublicKey($key_id, $oauth_pubkey_url, $db, $conf);
+$oauthBaseVerification = doli2shopVerifyOAuthBaseSignature(
+    $shop,
+    $access_token,
+    $scope,
+    $signature_asym,
+    $oauthBasePublicKey,
+    function_exists('openssl_verify')
+);
 
-// Story 34.6 — Stratégie de vérification :
-// - Si le retour porte une signature ASYMÉTRIQUE (`signature_asym`), le proxy est migré :
-//   on vérifie EXCLUSIVEMENT en asymétrique, FAIL-CLOSED. Tout échec (OpenSSL absent, clé
-//   publique injoignable, hex invalide, openssl_verify != 1) = REJET. AUCUNE retombée sur
-//   le HMAC legacy → impossible de downgrader en omettant/cassant l'asymétrique (HIGH review).
-// - Sinon (pas de `signature_asym` = proxy non migré) : HMAC legacy, et UNIQUEMENT si la
-//   constante DOLI2SHOP_OAUTH_PROXY_SECRET est explicitement définie (plus de défaut prévisible).
-if (!empty($signature_asym)) {
-    if (!function_exists('openssl_verify')) {
-        dol_syslog("Doli2Shop OAuth: signature asymétrique présente mais OpenSSL absent — rejet", LOG_ERR);
-        setEventMessages($langs->trans("OAuthInvalidSignature"), null, 'errors');
-        doli2shopOauthErrorRedirect('signature');
-    }
-    $publicPem = doli2shopFetchOAuthPublicKey($key_id, $oauth_pubkey_url, $db, $conf);
-    if ($publicPem === null) {
-        // Clé publique indisponible : REJET (pas de downgrade legacy). Réessayer la connexion.
+if (!$oauthBaseVerification['valid']) {
+    if ($oauthBaseVerification['reason'] === 'public_key_unreachable') {
+        // Décision 1 (story 34-6b) : message DISTINCT et actionnable — ce n'est PAS une
+        // signature invalide, c'est le proxy/réseau qui est injoignable ; l'admin doit
+        // réessayer, pas "mettre à jour le module".
         dol_syslog("Doli2Shop OAuth: clé publique indisponible (key_id=$key_id) — rejet sans downgrade", LOG_ERR);
+        setEventMessages($langs->trans("OAuthPublicKeyUnreachable"), null, 'errors');
+    } else {
+        dol_syslog("Doli2Shop OAuth: signature asymétrique invalide ou non vérifiable (motif=" . $oauthBaseVerification['reason'] . ") — rejet", LOG_ERR);
         setEventMessages($langs->trans("OAuthInvalidSignature"), null, 'errors');
-        doli2shopOauthErrorRedirect('signature');
     }
-    $rawSig = @hex2bin($signature_asym);
-    $verify = ($rawSig !== false)
-        ? openssl_verify($data_to_verify, $rawSig, $publicPem, OPENSSL_ALGO_SHA256)
-        : -1;
-    if ($verify !== 1) { // 1 = OK ; 0 = invalide ; -1 = erreur
-        dol_syslog("Doli2Shop OAuth: signature asymétrique invalide (verify=$verify)", LOG_ERR);
-        setEventMessages($langs->trans("OAuthInvalidSignature"), null, 'errors');
-        doli2shopOauthErrorRedirect('signature');
-    }
-} else {
-    // Proxy non migré → HMAC legacy, sans défaut prévisible
-    if ($oauth_proxy_secret === '' || empty($signature)) {
-        dol_syslog("Doli2Shop OAuth: aucune signature vérifiable (asym absente, legacy non configuré)", LOG_ERR);
-        setEventMessages($langs->trans("OAuthInvalidSignature"), null, 'errors');
-        doli2shopOauthErrorRedirect('signature');
-    }
-    $expected_signature = hash_hmac('sha256', $data_to_verify, $oauth_proxy_secret);
-    if (!hash_equals($expected_signature, $signature)) {
-        dol_syslog("Doli2Shop OAuth: Invalid signature", LOG_ERR);
-        setEventMessages($langs->trans("OAuthInvalidSignature"), null, 'errors');
-        doli2shopOauthErrorRedirect('signature');
-    }
+    doli2shopOauthErrorRedirect('signature');
 }
 
 // ===========================================
 // Story 51-1 — Vérification de la signature ÉTENDUE (jetons expirables)
+// Story 34-6b (cutover) — plus aucun repli HMAC (`signature_ext`) : seule `signature_asym_ext`
+// authentifie ces deux champs.
 // ===========================================
-// Stratégie de rétrocompatibilité DOUBLE ASYMÉTRIE (module/proxy déployés séparément) :
-// - La signature de BASE ci-dessus (shop|access_token|scope) N'A PAS changé et reste
-//   OBLIGATOIRE — c'est elle qui protège shop/access_token/scope, comme avant cette story.
-// - expires_in/refresh_token sont authentifiés par une signature SÉPARÉE et INDÉPENDANTE
-//   (`signature_ext`/`signature_asym_ext`), couvrant shop|access_token|scope|expires_in|
-//   refresh_token. Un échec de vérification sur CETTE signature additionnelle ne fait PAS
-//   échouer tout le callback OAuth (le shop/access_token/scope restent authentifiés par la
-//   signature de base) : on se contente d'ignorer expires_in/refresh_token (comme si Shopify
-//   ne les avait pas renvoyés — AC5), et de logger un WARNING.
-//   - proxy à jour + module PAS à jour : le module ignore silencieusement expires_in/
-//     refresh_token/signature_ext (pas de GETPOST dessus) → aucune régression.
-//   - proxy PAS à jour + module à jour : ces champs sont absents → bloc ci-dessous no-op,
-//     token_expires_at/refresh_token restent NULL (comportement historique, AC5).
+// Un échec de vérification sur cette signature additionnelle ne fait PAS échouer tout le
+// callback OAuth (shop/access_token/scope restent authentifiés par la signature de base
+// ci-dessus) : on se contente d'ignorer expires_in/refresh_token (comme si Shopify ne les avait
+// pas renvoyés — AC3/AC5), et de logger un WARNING.
+// - proxy à jour + module PAS à jour : le module ignore silencieusement expires_in/refresh_token/
+//   signature_asym_ext (pas de GETPOST dessus) → aucune régression.
+// - proxy PAS à jour + module à jour : ces champs sont absents → bloc ci-dessous no-op,
+//   token_expires_at/refresh_token restent NULL (comportement historique, AC5).
 $tokenExpiresAt = null;
 if ($expires_in > 0 && $refresh_token !== '') {
-    // FIX HIGH (review 51-1) — anti-replay : timestamp inclus dans la chaîne signée ÉTENDUE
-    // (miroir exact de shopify_return.php). La signature de BASE (data_to_verify plus haut,
-    // shop|access_token|scope) N'INCLUT PAS le timestamp et reste STRICTEMENT inchangée — des
-    // modules déployés avant cette story la vérifient déjà telle quelle (dette tracée :
-    // le canal de base reste rejouable comme avant la story, à durcir au retrait du HMAC legacy).
-    $data_to_verify_ext = $shop . '|' . $access_token . '|' . $scope . '|' . $expires_in . '|' . $refresh_token . '|' . $timestamp;
-    $extSignatureValid = false;
-    $extHasSignature = (!empty($signature_asym_ext) || !empty($signature_ext));
+    $oauthExtPublicKey = !empty($signature_asym_ext)
+        ? doli2shopFetchOAuthPublicKey($key_id, $oauth_pubkey_url, $db, $conf)
+        : null;
+    $oauthExtVerification = doli2shopVerifyOAuthExtendedSignature(
+        $shop,
+        $access_token,
+        $scope,
+        $expires_in,
+        $refresh_token,
+        $timestamp,
+        $signature_asym_ext,
+        $oauthExtPublicKey,
+        function_exists('openssl_verify'),
+        time()
+    );
 
-    // Fail-closed sur le canal ÉTENDU uniquement : timestamp OBLIGATOIRE dès qu'une signature
-    // étendue est fournie, et fraîcheur stricte (>300s = rejet). Un échec ici n'invalide QUE
-    // expires_in/refresh_token (branche else ci-dessous) — le reste du callback (shop/
-    // access_token/scope, déjà authentifié par la signature de base) n'est jamais impacté.
-    if ($extHasSignature && empty($timestamp)) {
-        dol_syslog("Doli2Shop OAuth: signature étendue (51-1) présente mais timestamp absent — expires_in/refresh_token ignorés (anti-replay)", LOG_WARNING);
-    } elseif ($extHasSignature && (time() - (int) $timestamp) > 300) {
-        dol_syslog("Doli2Shop OAuth: signature étendue (51-1) trop ancienne (anti-replay, >300s) — expires_in/refresh_token ignorés", LOG_WARNING);
-    } elseif (!empty($signature_asym_ext)) {
-        if (function_exists('openssl_verify')) {
-            $publicPemExt = doli2shopFetchOAuthPublicKey($key_id, $oauth_pubkey_url, $db, $conf);
-            if ($publicPemExt !== null) {
-                $rawSigExt = @hex2bin($signature_asym_ext);
-                $verifyExt = ($rawSigExt !== false)
-                    ? openssl_verify($data_to_verify_ext, $rawSigExt, $publicPemExt, OPENSSL_ALGO_SHA256)
-                    : -1;
-                $extSignatureValid = ($verifyExt === 1);
-            }
-        }
-    } elseif (!empty($signature_ext) && $oauth_proxy_secret !== '') {
-        $expectedSignatureExt = hash_hmac('sha256', $data_to_verify_ext, $oauth_proxy_secret);
-        $extSignatureValid = hash_equals($expectedSignatureExt, $signature_ext);
-    }
-
-    if ($extSignatureValid) {
+    if ($oauthExtVerification['valid']) {
         // Marge de sécurité (latence réseau entre réception et 1er usage) — évite un 401
         // immédiat sur un token "juste" expiré.
         $tokenExpiresAt = date('Y-m-d H:i:s', time() + $expires_in - DOLI2SHOP_TOKEN_EXPIRY_MARGIN_SECONDS);
     } else {
-        dol_syslog("Doli2Shop OAuth: signature étendue (51-1) absente/invalide — expires_in/refresh_token ignorés (fallback rétrocompatible)", LOG_WARNING);
+        dol_syslog("Doli2Shop OAuth: signature étendue (51-1/34-6b) absente/invalide (motif=" . $oauthExtVerification['reason'] . ") — expires_in/refresh_token ignorés (fallback rétrocompatible)", LOG_WARNING);
         $refresh_token = ''; // ne jamais persister un refresh_token non authentifié
     }
 }
@@ -555,13 +576,85 @@ if ($errors === 0) {
     } else {
         $storeData['label']      = $shop;
         $storeData['is_default'] = $createAsDefault ? 1 : 0;
-        if ($storeService->create($storeData) <= 0) {
+        // Review 3 couches 2026-09-23 (HIGH, finding 1b) : rowid capturé pour pouvoir résoudre
+        // l'objet boutique fraîchement créé plus bas (post-commit) — sans cette capture,
+        // $targetStore restait null après une création et les appels Shopify post-connexion
+        // (getLocations/getShopInfo/syncWebhooks) retombaient sur le chemin legacy fkStore=0.
+        $createdStoreId = $storeService->create($storeData);
+        if ($createdStoreId <= 0) {
             $errors++;
             $storeFailureDetail = $db->lasterror();
             dol_syslog("Doli2Shop OAuth: échec création boutique $shop (is_default=" . $storeData['is_default'] . "): " . $storeFailureDetail, LOG_ERR);
+        } elseif ($createAsDefault) {
+            // Finding 1 (review 3 couches 2026-09-26) : StoreService::create() expose désormais
+            // DIRECTEMENT si une race TOCTOU a eu lieu (lastCreateWasDemotedByDefaultKeyRace()).
+            // Si create() a réussi du PREMIER coup en is_default=1 (aucun retry secondaire), la
+            // cible EST par défaut avec certitude — AUCUNE relecture n'est nécessaire ni utile.
+            // Sinon, relecture pour trancher l'état réellement écrit par le retry — avec UNE
+            // tentative supplémentaire si elle échoue elle-même (incident transitoire, distinct de
+            // la race déjà tranchée par create() : jamais réinterprété silencieusement comme une
+            // confirmation de démotion, l'ancien bug). La DÉCISION (quel outcome, quel message) est
+            // déléguée à une fonction PURE testable — ce script top-level (header()/exit) ne l'est
+            // pas (même motif que les fonctions voisines de ce fichier).
+            $wasDemotedByRace = $storeService->lastCreateWasDemotedByDefaultKeyRace();
+            $firstReread  = null;
+            $secondReread = null;
+            if ($wasDemotedByRace) {
+                $firstReread = $storeService->fetch((int) $createdStoreId);
+                if ($firstReread === null) {
+                    $secondReread = $storeService->fetch((int) $createdStoreId);
+                }
+            }
+
+            $defaultStoreOutcome = doli2shopResolveDefaultStoreOutcomeAfterCreate($wasDemotedByRace, $firstReread, $secondReread);
+            $targetsDefaultStore = $defaultStoreOutcome['targetsDefaultStore'];
+
+            if ($defaultStoreOutcome['outcome'] === 'unconfirmed') {
+                // Relecture impossible malgré la nouvelle tentative : traité en SECONDAIRE par
+                // prudence (create() a de toute façon écrit is_default=0 pour cette ligne dans son
+                // propre retry — sûr), mais avec un message admin EXPLICITE plutôt qu'une bascule
+                // silencieuse (finding 1).
+                dol_syslog(
+                    "Doli2Shop OAuth: relecture post-création impossible après race TOCTOU sur"
+                    . " is_default (rowid=$createdStoreId, entity=" . (int) $conf->entity . ","
+                    . " 2 tentatives) — état non confirmé, boutique traitée en SECONDAIRE (sûr"
+                    . " par construction du retry de create())",
+                    LOG_ERR
+                );
+                setEventMessages(
+                    doli2shopBuildOAuthDefaultStoreRaceUnconfirmedMessage($langs, (int) $createdStoreId),
+                    null,
+                    'warnings'
+                );
+            } elseif ($defaultStoreOutcome['outcome'] === 'demoted') {
+                dol_syslog(
+                    "Doli2Shop OAuth: race TOCTOU détectée sur is_default lors de la création de $shop"
+                    . " — une autre boutique est devenue défaut entre-temps, celle-ci reste SECONDAIRE"
+                    . " (rowid=$createdStoreId)",
+                    LOG_WARNING
+                );
+                // Finding 5 (review 3 couches 2026-09-26) : visible à l'écran, pas seulement dans
+                // dolibarr.log — sinon l'admin croit avoir connecté SA boutique par défaut alors
+                // qu'une autre boutique concurrente l'est devenue entre-temps.
+                setEventMessages(
+                    doli2shopBuildOAuthDefaultStoreDemotedMessage($langs, $shop, (int) $createdStoreId),
+                    null,
+                    'warnings'
+                );
+            }
         }
     }
 }
+
+// Finding 6 (review 3 couches 2026-09-26) : rowid RÉELLEMENT créé/reconnecté par CETTE requête.
+// $targetStore reste `null` pour toute boutique nouvellement CRÉÉE (secondaire dès le départ, OU
+// démotée en secondaire par la race TOCTOU ci-dessus) — seul $createdStoreId la porte dans ce cas.
+// Calculé UNE SEULE FOIS ici et réutilisé plus bas (constante DOLI2SHOP_OAUTH_CONNECTED_AT_<rowid>
+// ET résolution de $reconnectedStoreId), pour ne pas dupliquer cette même logique deux fois dans
+// ce fichier (cf. mémoire projet « corriger la classe pas l'endroit »).
+$effectiveStoreId = ($targetStore !== null)
+    ? (int) $targetStore->rowid
+    : ((isset($createdStoreId) && $createdStoreId > 0) ? (int) $createdStoreId : 0);
 
 // Constantes DOLI2SHOP_* : UNIQUEMENT pour la boutique par défaut (une boutique secondaire
 // ne doit jamais écraser la config globale historique).
@@ -628,8 +721,12 @@ if ($targetsDefaultStore && $errors === 0) {
 
 // Story 49-5 : pour les boutiques SECONDAIRES, écrire DOLI2SHOP_OAUTH_CONNECTED_AT_<rowid>
 // La boutique par défaut a déjà DOLI2SHOP_OAUTH_CONNECTED_AT (bloc ci-dessus).
-if (!$targetsDefaultStore && $errors === 0 && $targetStore !== null && (int) $targetStore->rowid > 0) {
-    dolibarr_set_const($db, 'DOLI2SHOP_OAUTH_CONNECTED_AT_'.(int) $targetStore->rowid, date('Y-m-d H:i:s'), 'chaine', 0, '', $conf->entity);
+// Finding 6 (review 3 couches 2026-09-26) : $effectiveStoreId (ci-dessus), pas $targetStore->rowid
+// — sinon cette constante n'était JAMAIS écrite pour une boutique nouvellement CRÉÉE (secondaire
+// dès le départ, ou démotée en secondaire par la race TOCTOU), $targetStore restant `null` pour
+// elles.
+if (!$targetsDefaultStore && $errors === 0 && $effectiveStoreId > 0) {
+    dolibarr_set_const($db, 'DOLI2SHOP_OAUTH_CONNECTED_AT_'.$effectiveStoreId, date('Y-m-d H:i:s'), 'chaine', 0, '', $conf->entity);
 }
 
 // Contexte consommé
@@ -661,6 +758,42 @@ if ($errors > 0) {
 
 $db->commit();
 
+// Review 3 couches 2026-09-23 (HIGH, finding 1) : résoudre l'objet boutique RÉELLEMENT
+// reconnectée par CETTE requête — rechargée depuis la ligne `stores` déjà commitée ci-dessus
+// (jamais l'objet $targetStore pré-update, qui porte encore les ANCIENS credentials avant cette
+// reconnexion), ou la ligne tout juste créée via $createdStoreId. Sert à cibler correctement les
+// appels Shopify post-connexion plus bas (getLocations/getShopInfo/syncWebhooks) : avant ce
+// correctif, ils instanciaient toujours `new ShopifyApi($db)`/`new ShopifyWebhooks($db)` SANS
+// boutique (chemin legacy fkStore=0) — sur un 401 transitoire, ShopifyApi::markReconnectRequired()
+// reposait alors le flag sur la constante globale ET la boutique PAR DÉFAUT, y compris lors de la
+// reconnexion d'une boutique SECONDAIRE (violation de l'isolation Epic 47).
+// Finding 6 (review 3 couches 2026-09-26) : réutilise $effectiveStoreId (calculé plus haut, avant
+// le commit) — même règle de résolution, une seule fois écrite dans ce fichier.
+$reconnectedStoreId = ($effectiveStoreId > 0) ? $effectiveStoreId : null;
+$reconnectedStore = ($reconnectedStoreId !== null) ? $storeService->fetch($reconnectedStoreId) : null;
+
+// Re-review 2026-09-23 (MEDIUM, finding 3) : si ce refetch échoue (transitoire) et que la cible
+// n'est PAS la boutique par défaut, ne PAS laisser les appels Shopify post-connexion retomber sur
+// le chemin legacy (il viserait alors la boutique PAR DÉFAUT au lieu de la boutique secondaire/
+// nouvelle réellement reconnectée — violation Epic 47). Cf. doli2shopShouldRunPostConnectionShopifyCalls().
+$shouldRunPostConnectionShopifyCalls = doli2shopShouldRunPostConnectionShopifyCalls($reconnectedStore, $targetsDefaultStore);
+
+if (!$shouldRunPostConnectionShopifyCalls) {
+    $skippedStoreLabel = ($targetStore !== null) ? doli2shopStoreDisplayLabel($targetStore) : ('#' . (int) $reconnectedStoreId);
+    $skippedStoreRowid = ($targetStore !== null) ? (int) $targetStore->rowid : (int) $reconnectedStoreId;
+    dol_syslog(
+        'Doli2Shop OAuth: post-connection Shopify calls SKIPPED for non-default store #'
+        . $skippedStoreRowid . ' (' . $skippedStoreLabel . ') — refetch after commit failed;'
+        . ' legacy fallback would have targeted the DEFAULT store instead (Epic 47 isolation).',
+        LOG_ERR
+    );
+    setEventMessages(
+        doli2shopBuildOAuthPostConnectionSkippedMessage($langs, $skippedStoreLabel, $skippedStoreRowid),
+        null,
+        'warnings'
+    );
+}
+
 if ($purgedShopChange) {
     setEventMessages($langs->trans("OAuthShopChangedPurged", $previous_shop, $shop), null, 'warnings');
 }
@@ -677,125 +810,157 @@ dol_syslog("Doli2Shop OAuth: Credentials stored successfully for $shop", LOG_INF
 // FETCH ADDITIONAL INFO (Location ID, etc.)
 // ===========================================
 
-try {
-    // Reload conf to get new values
-    $conf->global->DOLI2SHOP_STORE_HOSTNAME = $shop;
-    $conf->global->DOLI2SHOP_ACCESS_TOKEN = $access_token;
-    if (!empty($api_key)) {
-        $conf->global->DOLI2SHOP_API_KEY = $api_key;
-    }
-    if (!empty($api_secret)) {
-        $conf->global->DOLI2SHOP_API_SECRET_KEY = $api_secret;
-    }
+if ($shouldRunPostConnectionShopifyCalls) {
+    try {
+        // Reload conf to get new values
+        $conf->global->DOLI2SHOP_STORE_HOSTNAME = $shop;
+        $conf->global->DOLI2SHOP_ACCESS_TOKEN = $access_token;
+        if (!empty($api_key)) {
+            $conf->global->DOLI2SHOP_API_KEY = $api_key;
+        }
+        if (!empty($api_secret)) {
+            $conf->global->DOLI2SHOP_API_SECRET_KEY = $api_secret;
+        }
 
-    // Try to fetch shop info and location
-    $shopifyApi = new ShopifyApi($db);
+        // Try to fetch shop info and location
+        // Review 3 couches 2026-09-23 (HIGH, finding 1b) : forStore() sur la boutique RÉELLEMENT
+        // reconnectée (credentials frais, cf. résolution $reconnectedStore plus haut) — jamais le
+        // chemin legacy fkStore=0 pour une reconnexion de boutique SECONDAIRE, sinon un 401 ici
+        // marquerait à tort ShopifyApi::markReconnectRequired() sur la constante globale et la
+        // boutique par défaut. Repli sur new ShopifyApi($db) uniquement si $reconnectedStore n'a pas
+        // pu être rechargée — désormais possible seulement quand $targetsDefaultStore est vrai
+        // (finding 3, gate $shouldRunPostConnectionShopifyCalls ci-dessus).
+        $shopifyApi = ($reconnectedStore !== null)
+            ? ShopifyApi::forStore($db, $reconnectedStore, (int) $conf->entity)
+            : new ShopifyApi($db);
 
-    // Get locations (check if method exists first)
-    if (method_exists($shopifyApi, 'getLocations')) {
-        $locations = $shopifyApi->getLocations();
-        if (!empty($locations) && is_array($locations)) {
-            // Use first location as default
-            $first_location = reset($locations);
-            if (!empty($first_location['id'])) {
-                $location_id = $first_location['id'];
-                // Extract numeric ID if it's a GID
-                if (strpos($location_id, 'gid://') !== false) {
-                    $location_id = preg_replace('/.*\//', '', $location_id);
+        // Get locations (check if method exists first)
+        if (method_exists($shopifyApi, 'getLocations')) {
+            $locations = $shopifyApi->getLocations();
+            if (!empty($locations) && is_array($locations)) {
+                // Use first location as default
+                $first_location = reset($locations);
+                if (!empty($first_location['id'])) {
+                    $location_id = $first_location['id'];
+                    // Extract numeric ID if it's a GID
+                    if (strpos($location_id, 'gid://') !== false) {
+                        $location_id = preg_replace('/.*\//', '', $location_id);
+                    }
+                    dolibarr_set_const($db, 'DOLI2SHOP_LOCATION_ID', $location_id, 'chaine', 0, '', $conf->entity);
+                    dol_syslog("Doli2Shop OAuth: Auto-configured location ID: $location_id", LOG_INFO);
                 }
-                dolibarr_set_const($db, 'DOLI2SHOP_LOCATION_ID', $location_id, 'chaine', 0, '', $conf->entity);
-                dol_syslog("Doli2Shop OAuth: Auto-configured location ID: $location_id", LOG_INFO);
             }
+        } else {
+            dol_syslog("Doli2Shop OAuth: getLocations method not available, skipping auto-configuration", LOG_INFO);
         }
-    } else {
-        dol_syslog("Doli2Shop OAuth: getLocations method not available, skipping auto-configuration", LOG_INFO);
-    }
 
-    // Get shop info (check if method exists first)
-    if (method_exists($shopifyApi, 'getShopInfo')) {
-        $shop_info = $shopifyApi->getShopInfo();
-        if (!empty($shop_info)) {
-            // Store shop name as vendor if not set
-            if (empty(getDolGlobalString('DOLI2SHOP_VENDOR')) && !empty($shop_info['name'])) {
-                dolibarr_set_const($db, 'DOLI2SHOP_VENDOR', $shop_info['name'], 'chaine', 0, '', $conf->entity);
+        // Get shop info (check if method exists first)
+        if (method_exists($shopifyApi, 'getShopInfo')) {
+            $shop_info = $shopifyApi->getShopInfo();
+            if (!empty($shop_info)) {
+                // Store shop name as vendor if not set
+                if (empty(getDolGlobalString('DOLI2SHOP_VENDOR')) && !empty($shop_info['name'])) {
+                    dolibarr_set_const($db, 'DOLI2SHOP_VENDOR', $shop_info['name'], 'chaine', 0, '', $conf->entity);
+                }
             }
         }
+    } catch (Exception $e) {
+        // Non-critical, just log
+        dol_syslog("Doli2Shop OAuth: Failed to fetch additional info: " . $e->getMessage(), LOG_WARNING);
+    } catch (Error $e) {
+        // Catch PHP errors too (like undefined methods)
+        dol_syslog("Doli2Shop OAuth: Error fetching additional info: " . $e->getMessage(), LOG_WARNING);
     }
-} catch (Exception $e) {
-    // Non-critical, just log
-    dol_syslog("Doli2Shop OAuth: Failed to fetch additional info: " . $e->getMessage(), LOG_WARNING);
-} catch (Error $e) {
-    // Catch PHP errors too (like undefined methods)
-    dol_syslog("Doli2Shop OAuth: Error fetching additional info: " . $e->getMessage(), LOG_WARNING);
 }
 
 // ===========================================
 // AUTO-REGISTER WEBHOOKS (v2.1.8)
 // ===========================================
 
-try {
-    require_once dirname(__FILE__) . '/../class/shopifywebhooks.class.php';
+if ($shouldRunPostConnectionShopifyCalls) {
+    try {
+        require_once dirname(__FILE__) . '/../class/shopifywebhooks.class.php';
 
-    $shopifyWebhooksAuto = new ShopifyWebhooks($db);
+        // Review 3 couches 2026-09-23 (HIGH, finding 1b) : même raison que ci-dessus — cible la
+        // boutique réellement reconnectée (ShopifyWebhooks::__construct($db, $store) construit alors
+        // en interne un ShopifyApi::forStore(), jamais le chemin legacy fkStore=0). Ce bloc entier
+        // ne s'exécute désormais que si $shouldRunPostConnectionShopifyCalls est vrai (finding 3) :
+        // $reconnectedStore n'est donc jamais null ici sans que $targetsDefaultStore le soit aussi.
+        $shopifyWebhooksAuto = new ShopifyWebhooks($db, $reconnectedStore);
 
-    // Topics par défaut à enregistrer automatiquement
-    $defaultTopics = array(
-        'products/create',
-        'products/update',
-        'products/delete',
-        'orders/create',
-        'orders/updated',
-        'orders/cancelled',
-        'orders/fulfilled',
-        'orders/paid',
-        'inventory_levels/update',
-        'app/uninstalled'
-    );
+        // Topics par défaut à enregistrer automatiquement
+        $defaultTopics = array(
+            'products/create',
+            'products/update',
+            'products/delete',
+            'orders/create',
+            'orders/updated',
+            'orders/cancelled',
+            'orders/fulfilled',
+            'orders/paid',
+            'inventory_levels/update',
+            'app/uninstalled'
+        );
 
-    // Vérifier si c'est une reconnexion (shop déjà connu)
-    $existingWebhooksCount = 0;
-    $sqlCount = "SELECT COUNT(*) as nb FROM " . MAIN_DB_PREFIX . "doli2shop_webhooks WHERE status = 1 AND entity = " . ((int) $conf->entity);
-    $resqlCount = $db->query($sqlCount);
-    if ($resqlCount) {
-        $objCount = $db->fetch_object($resqlCount);
-        $existingWebhooksCount = (int) $objCount->nb;
-        $db->free($resqlCount);
-    }
-
-    if ($existingWebhooksCount > 0) {
-        // Reconnexion : synchroniser pour vérifier/recréer les webhooks manquants
-        dol_syslog("Doli2Shop OAuth: Reconnection detected, syncing webhooks (" . $existingWebhooksCount . " existing)", LOG_INFO);
-        // Story 59-9 (correctif review) : reconnexion OAuth = action humaine explicite (l'utilisateur
-        // vient de réautoriser l'app, potentiellement pour corriger la cause d'un refus durable) —
-        // `true` garantit que le disjoncteur d'échecs consécutifs ne l'ignore jamais, contrairement
-        // au CRON périodique (cronCheckWebhookHealth() passe false).
-        $shopifyWebhooksAuto->syncWebhooks($defaultTopics, true);
-    } else {
-        // Nouvelle installation : créer tous les webhooks
-        dol_syslog("Doli2Shop OAuth: New installation, auto-registering webhooks", LOG_INFO);
-        $webhookSuccessCount = 0;
-        $webhookFailCount = 0;
-
-        foreach ($defaultTopics as $webhookTopic) {
-            $webhookResult = $shopifyWebhooksAuto->createWebhookWithDatabase($webhookTopic);
-            if ($webhookResult > 0) {
-                $webhookSuccessCount++;
-                dol_syslog("Doli2Shop OAuth: Webhook registered: " . $webhookTopic, LOG_INFO);
-            } else {
-                $webhookFailCount++;
-                dol_syslog("Doli2Shop OAuth: Failed to register webhook: " . $webhookTopic . " - " . implode(', ', $shopifyWebhooksAuto->errors), LOG_WARNING);
-                $shopifyWebhooksAuto->errors = array(); // Reset pour le prochain topic
-            }
+        // Vérifier si c'est une reconnexion (shop déjà connu)
+        $existingWebhooksCount = 0;
+        $sqlCount = "SELECT COUNT(*) as nb FROM " . MAIN_DB_PREFIX . "doli2shop_webhooks WHERE status = 1 AND entity = " . ((int) $conf->entity);
+        $resqlCount = $db->query($sqlCount);
+        if ($resqlCount) {
+            $objCount = $db->fetch_object($resqlCount);
+            $existingWebhooksCount = (int) $objCount->nb;
+            $db->free($resqlCount);
         }
 
-        dol_syslog("Doli2Shop OAuth: Auto-registered webhooks: " . $webhookSuccessCount . " success, " . $webhookFailCount . " failed", LOG_INFO);
+        if ($existingWebhooksCount > 0) {
+            // Reconnexion : synchroniser pour vérifier/recréer les webhooks manquants
+            dol_syslog("Doli2Shop OAuth: Reconnection detected, syncing webhooks (" . $existingWebhooksCount . " existing)", LOG_INFO);
+            // Story 59-9 (correctif review) : reconnexion OAuth = action humaine explicite (l'utilisateur
+            // vient de réautoriser l'app, potentiellement pour corriger la cause d'un refus durable) —
+            // `true` garantit que le disjoncteur d'échecs consécutifs ne l'ignore jamais, contrairement
+            // au CRON périodique (cronCheckWebhookHealth() passe false).
+            $shopifyWebhooksAuto->syncWebhooks($defaultTopics, true);
+        } else {
+            // Nouvelle installation : créer tous les webhooks
+            dol_syslog("Doli2Shop OAuth: New installation, auto-registering webhooks", LOG_INFO);
+            $webhookSuccessCount = 0;
+            $webhookFailCount = 0;
+
+            foreach ($defaultTopics as $webhookTopic) {
+                $webhookResult = $shopifyWebhooksAuto->createWebhookWithDatabase($webhookTopic);
+                if ($webhookResult > 0) {
+                    $webhookSuccessCount++;
+                    dol_syslog("Doli2Shop OAuth: Webhook registered: " . $webhookTopic, LOG_INFO);
+                } else {
+                    $webhookFailCount++;
+                    dol_syslog("Doli2Shop OAuth: Failed to register webhook: " . $webhookTopic . " - " . implode(', ', $shopifyWebhooksAuto->errors), LOG_WARNING);
+                    $shopifyWebhooksAuto->errors = array(); // Reset pour le prochain topic
+                }
+            }
+
+            dol_syslog("Doli2Shop OAuth: Auto-registered webhooks: " . $webhookSuccessCount . " success, " . $webhookFailCount . " failed", LOG_INFO);
+        }
+    } catch (Exception $e) {
+        // Non-bloquant : l'utilisateur pourra les configurer manuellement dans admin/webhooks.php
+        dol_syslog("Doli2Shop OAuth: Failed to auto-register webhooks: " . $e->getMessage(), LOG_WARNING);
+    } catch (Error $e) {
+        dol_syslog("Doli2Shop OAuth: Error auto-registering webhooks: " . $e->getMessage(), LOG_WARNING);
     }
-} catch (Exception $e) {
-    // Non-bloquant : l'utilisateur pourra les configurer manuellement dans admin/webhooks.php
-    dol_syslog("Doli2Shop OAuth: Failed to auto-register webhooks: " . $e->getMessage(), LOG_WARNING);
-} catch (Error $e) {
-    dol_syslog("Doli2Shop OAuth: Error auto-registering webhooks: " . $e->getMessage(), LOG_WARNING);
 }
+
+// Story reconnect-flag-jamais-remis-a-zero (AC1/AC5) + Review 3 couches 2026-09-23 (HIGH,
+// finding 1a) : remise à zéro best-effort journalisée du flag "reconnexion requise" — appelée EN
+// DERNIER, après TOUS les appels Shopify post-connexion ci-dessus (getLocations/getShopInfo/
+// syncWebhooks/createWebhookWithDatabase), jamais juste après $db->commit(). Ces appels peuvent,
+// sur un 401 transitoire (ex. jeton fraîchement retourné mais déjà invalidé côté Shopify),
+// déclencher ShopifyApi::markReconnectRequired() et REPOSER le flag pour la boutique qu'ils
+// ciblent — désormais toujours la boutique réellement reconnectée (finding 1b ci-dessus). Cette
+// remise à zéro doit donc avoir le DERNIER MOT sur une reconnexion par ailleurs réussie : jamais
+// dans le $errors/rollback qui gouverne les écritures strictes plus haut (STORE_HOSTNAME/
+// ACCESS_TOKEN/API_KEY/API_SECRET_KEY/OAUTH_SCOPES). Un échec isolé ici ne doit jamais remettre en
+// cause une reconnexion OAuth par ailleurs déjà commitée avec succès — voir
+// doli2shopResetReconnectRequiredAfterOAuth().
+doli2shopResetReconnectRequiredAfterOAuth($db, $storeService, $targetStore, $targetsDefaultStore, (int) $conf->entity);
 
 // ===========================================
 // REDIRECT TO SUCCESS PAGE

@@ -8,7 +8,7 @@
  * @package ShopifyIntegration
  * @subpackage Class
  * @category class
- * @version     2.5.7
+ * @version     2.6.0
  * @since 2.0.0
  * @author      P'tite Tête <doli2shop@ptitetete.com>
  * @copyright   2022-2025 Robert Steinbacher<robert .steinbacher@xivtech.de>

@@ -12,7 +12,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       1.0.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -36,6 +36,7 @@ require_once dirname(__FILE__) . '/dolibarrdirectfileresolver.class.php';
 require_once dirname(__FILE__) . '/productscopehelper.class.php';
 require_once dirname(__FILE__) . '/skuvariantmatcher.class.php';
 require_once dirname(__FILE__) . '/LoggerTrait.php';
+require_once dirname(__FILE__) . '/CronHelperTrait.php';
 
 // Include compatibility functions for older Dolibarr versions
 require_once dirname(__FILE__) . '/../lib/compatibility.lib.php';
@@ -47,6 +48,7 @@ require_once dirname(__FILE__) . '/../lib/compatibility.lib.php';
 class ImportProducts extends CommonObject
 {
     use LoggerTrait;
+    use CronHelperTrait;
 
     /** @var string Module name */
     public $element = 'importproducts';
@@ -181,6 +183,136 @@ class ImportProducts extends CommonObject
      * @since 2.5.5
      */
     public $imagesNoSourceFoundRefs = [];
+
+    /**
+     * Story apparier-les-images-une-a-une-au-lieu-de-tout-detruire (AC1) : compteur des échecs
+     * de CRÉATION de médias Shopify sur le cycle en cours — staged upload en échec total,
+     * mutation `productCreateMedia` sans média créé ou avec `mediaUserErrors`, ou média créé
+     * avec un statut `FAILED`. Dans TOUS ces cas, l'ordre désormais respecté
+     * (créer+vérifier PUIS supprimer) fait qu'AUCUNE suppression des anciens médias Shopify n'a
+     * lieu : ils restent en place, et l'empreinte composite n'est PAS mise à jour, pour qu'une
+     * nouvelle tentative ait lieu au cycle suivant. Même convention que $imagesNoSourceFoundCount
+     * ci-dessus.
+     *
+     * @var int
+     * @since 2.6.0
+     */
+    public $imagesCreationFailedCount = 0;
+
+    /**
+     * Références des produits comptés par $imagesCreationFailedCount, pour le rapport (même
+     * convention que $imagesNoSourceFoundRefs — bornée à 20 entrées).
+     *
+     * @var string[]
+     * @since 2.6.0
+     */
+    public $imagesCreationFailedRefs = [];
+
+    /**
+     * @var int MEDIUM (review 3 couches 27/09/2026) : compteur des échecs de SUPPRESSION des
+     * anciens médias survenus APRÈS une création intégralement réussie ($creationFullySuccessful
+     * === true) — distinct de $imagesCreationFailedCount (qui compte les échecs de CRÉATION).
+     * Dans ce cas, le produit se retrouve temporairement avec un doublon (ancien + nouveau média)
+     * plutôt qu'un remplacement propre — jamais sans photo, mais à surveiller : un échec de
+     * suppression répété peut indiquer un problème d'API/permissions. Même convention que
+     * $imagesCreationFailedCount (remise à zéro par cycle, résumé LOG_ERR, CRON).
+     * @since 2.6.0
+     */
+    public $imagesDeleteFailedCount = 0;
+
+    /**
+     * Références des produits comptés par $imagesDeleteFailedCount (même convention que
+     * $imagesCreationFailedRefs — bornée à 20 entrées).
+     *
+     * @var string[]
+     * @since 2.6.0
+     */
+    public $imagesDeleteFailedRefs = [];
+
+    /**
+     * @var int HIGH (re-review 27/09/2026, point 1) : compteur des produits DIFFÉRÉS sur ce
+     * cycle — soit parce que le budget de polling du cycle était DÉJÀ épuisé avant même
+     * d'attaquer les images de ce produit (point 1a, aucun appel de création n'a eu lieu), soit
+     * parce qu'un lot de médias créé lors d'un cycle précédent est encore en cours de traitement
+     * chez Shopify (point 1c, ni READY ni FAILED). Dans les deux cas : AUCUNE suppression, AUCUNE
+     * création, empreinte non touchée, nouvelle tentative au cycle suivant — ce n'est PAS un échec
+     * ($imagesCreationFailedCount reste réservé aux échecs réels), simplement une décharge de
+     * charge, d'où un niveau LOG_INFO et un compteur séparé.
+     * @since 2.6.0
+     */
+    public $imagesDeferredForBudgetCount = 0;
+
+    /**
+     * Références des produits comptés par $imagesDeferredForBudgetCount (même convention que
+     * $imagesCreationFailedRefs — bornée à 20 entrées).
+     *
+     * @var string[]
+     * @since 2.6.0
+     */
+    public $imagesDeferredForBudgetRefs = [];
+
+    /**
+     * Nombre maximal de tentatives de polling du statut FINAL des médias créés
+     * (waitForMediaToBeReady()) — extrait en propriété (au lieu d'un argument par défaut figé)
+     * uniquement pour permettre à un test unitaire de réduire le temps d'attente réel d'un
+     * scénario de TIMEOUT, sans changer le comportement de production (valeur inchangée : 10).
+     *
+     * @var int
+     * @since 2.6.0
+     */
+    private $mediaReadyMaxAttempts = 10;
+
+    /**
+     * Secondes de pause entre deux tentatives de polling — même raison que
+     * $mediaReadyMaxAttempts ci-dessus (valeur de production inchangée : 2).
+     *
+     * @var int
+     * @since 2.6.0
+     */
+    private $mediaReadySleepSeconds = 2;
+
+    /**
+     * Budget de temps CUMULÉ (toutes synchronisations d'images confondues sur CE cycle) alloué au
+     * polling du statut final des médias (waitForMediaToBeReady()) — re-review 3 couches
+     * 27/09/2026 (point 3). Le cycle CRON lui-même est borné par `set_time_limit(300)`
+     * (`ImportProductsCron::runSyncForStore()`, ~:196) : sans ce budget, chaque produit dont le
+     * polling atteint le timeout (jusqu'à `mediaReadyMaxAttempts * mediaReadySleepSeconds` ≈ 20s)
+     * consomme jusqu'à 20s à lui seul, et un lot de plusieurs produits « à problème » dans le même
+     * cycle pourrait épuiser à lui seul tout le temps du script, faisant échouer le reste du cycle
+     * (stock, autres produits) sans lien apparent avec les images.
+     *
+     * @var float Secondes, valeur de production par défaut : 120.
+     * @since 2.6.0
+     */
+    private $pollingBudgetSeconds = 120.0;
+
+    /**
+     * Temps de polling déjà consommé sur CE cycle (secondes réelles, `microtime(true)`) — remis à
+     * zéro par importProducts() comme les autres compteurs de cycle. Une fois
+     * $pollingBudgetUsedSeconds >= $pollingBudgetSeconds, tout produit suivant est traité comme
+     * NON PRÊT SANS interroger Shopify (aucune suppression, empreinte non écrite, nouvelle
+     * tentative au cycle suivant, compté via $imagesCreationFailedCount — compteur existant).
+     *
+     * @var float
+     * @since 2.6.0
+     */
+    private $pollingBudgetUsedSeconds = 0.0;
+
+    /**
+     * @var int Story stock-article-non-active-emplacement-reselection-perpetuelle (AC3) :
+     * compteur d'articles ACTUELLEMENT en situation « référence de stock non résolue depuis
+     * DOLI2SHOP_LOCATION_UNRESOLVED_STREAK_CAP cycles consécutifs, plafond atteint » sur le
+     * cycle en cours — distinct de $stockSyncFailedCount (qui compte n'importe quel échec, y
+     * compris transitoire) et de $stockSyncLocationErrorCount (erreurs GraphQL GLOBALES
+     * d'emplacement, pas ce cas — un article simplement jamais activé à l'emplacement ne
+     * déclenche AUCUNE erreur GraphQL, juste une absence de niveau de stock, cf.
+     * ShopifyApi::getInventoryQuantitiesAtLocation()). Incrémenté par
+     * updateLocationUnresolvedStreak(), lu par le CRON (ImportProductsCron) et exposé dans la
+     * réponse JSON d'ajax/sync_products_batch.php (champ `stockLocationCapped`), même
+     * convention que les compteurs voisins.
+     * @since 2.6.0
+     */
+    public $stockLocationCappedCount = 0;
 
     /**
      * Constructor
@@ -346,6 +478,18 @@ class ImportProducts extends CommonObject
         $this->imagesResyncForcedCount = 0;
         $this->imagesNoSourceFoundCount = 0;
         $this->imagesNoSourceFoundRefs = [];
+        $this->imagesCreationFailedCount = 0;
+        $this->imagesCreationFailedRefs = [];
+        $this->imagesDeleteFailedCount = 0;
+        $this->imagesDeleteFailedRefs = [];
+        $this->imagesDeferredForBudgetCount = 0;
+        $this->imagesDeferredForBudgetRefs = [];
+        // Re-review 3 couches 27/09/2026 (point 3) : budget de polling remis à zéro par CYCLE.
+        $this->pollingBudgetUsedSeconds = 0.0;
+        // Story stock-article-non-active-emplacement-reselection-perpetuelle : même raison,
+        // compteur d'articles ACTUELLEMENT plafonnés (persistance au-delà de N cycles) sur CE
+        // cycle.
+        $this->stockLocationCappedCount = 0;
 
         $this->db->begin();
 
@@ -407,15 +551,26 @@ class ImportProducts extends CommonObject
                 )
                 -- v2.3.0: Double cycle — contenu (24h) et stock (15min) indépendants
                 -- Remplace le hack v2.2.2 fenêtre 1h : sélectionne si contenu à re-sync (tms > 24h)
-                -- OU si stock à rattraper (last_stock_sync NULL ou > 15min)
+                -- OU si stock à rattraper (last_stock_sync NULL ou > 15min, ou intervalle élargi
+                -- une fois le plafond de persistance atteint — cf. buildStockCatchupEligibilityClause())
+                -- Re-review 27/09/2026 (CRITICAL) : `last_sync_status != 'success'` n'est PLUS une
+                -- branche indépendante ici — un lot ENTIÈREMENT écarté (produit simple, ou aucune
+                -- déclinaison résolue) écrit 'skipped' à CHAQUE cycle, ce qui resélectionnait le
+                -- produit indéfiniment sans aucun égard pour le plafond. Cette condition est
+                -- désormais gatée par le plafond DANS buildStockCatchupEligibilityClause().
+                -- HIGH (re-review 27/09/2026, point 1b) : OU si les images ont été DIFFÉRÉES
+                -- (budget de polling épuisé, ou lot précédent encore en cours) — sans cette
+                -- clause, un produit dont le contenu ET le stock sont déjà à jour ne serait
+                -- JAMAIS re-sélectionné par ce cycle, même prioritaire, avant l'échéance normale
+                -- de 24h/15min.
                 AND (sync.last_sync_status IS NULL
-                    OR sync.last_sync_status != 'success'
                     OR sync.tms < DATE_SUB(NOW(), INTERVAL 24 HOUR)
-                    OR sync.last_stock_sync IS NULL
-                    OR sync.last_stock_sync < DATE_SUB(NOW(), INTERVAL 15 MINUTE))
+                    OR " . $this->buildStockCatchupEligibilityClause() . "
+                    OR sync.images_priority_requeue = 1)
                 GROUP BY p.rowid
                 ORDER BY
                     CASE
+                        WHEN MAX(sync.images_priority_requeue) = 1 THEN 0
                         WHEN MAX(sync.last_sync_status) IS NULL THEN 1
                         WHEN MAX(sync.last_sync_status) = 'failed' THEN 2
                         ELSE 3
@@ -496,15 +651,23 @@ class ImportProducts extends CommonObject
                 )
                 -- v2.3.0: Double cycle — contenu (24h) et stock (15min) indépendants
                 -- Remplace le hack v2.2.2 fenêtre 1h : sélectionne si contenu à re-sync (tms > 24h)
-                -- OU si stock à rattraper (last_stock_sync NULL ou > 15min)
+                -- OU si stock à rattraper (last_stock_sync NULL ou > 15min, ou intervalle élargi
+                -- une fois le plafond de persistance atteint — cf. buildStockCatchupEligibilityClause())
+                -- Re-review 27/09/2026 (CRITICAL) : `last_sync_status != 'success'` n'est PLUS une
+                -- branche indépendante ici — un lot ENTIÈREMENT écarté (produit simple, ou aucune
+                -- déclinaison résolue) écrit 'skipped' à CHAQUE cycle, ce qui resélectionnait le
+                -- produit indéfiniment sans aucun égard pour le plafond. Cette condition est
+                -- désormais gatée par le plafond DANS buildStockCatchupEligibilityClause().
+                -- HIGH (re-review 27/09/2026, point 1b) : même clause qu'au-dessus (produits
+                -- simples) — voir son commentaire pour la justification.
                 AND (sync.last_sync_status IS NULL
-                    OR sync.last_sync_status != 'success'
                     OR sync.tms < DATE_SUB(NOW(), INTERVAL 24 HOUR)
-                    OR sync.last_stock_sync IS NULL
-                    OR sync.last_stock_sync < DATE_SUB(NOW(), INTERVAL 15 MINUTE))
+                    OR " . $this->buildStockCatchupEligibilityClause() . "
+                    OR sync.images_priority_requeue = 1)
                 GROUP BY p.rowid
                 ORDER BY
                     CASE
+                        WHEN MAX(sync.images_priority_requeue) = 1 THEN 0
                         WHEN MAX(sync.last_sync_status) IS NULL THEN 1
                         WHEN MAX(sync.last_sync_status) = 'failed' THEN 2
                         ELSE 3
@@ -612,6 +775,17 @@ class ImportProducts extends CommonObject
                     . " dans la configuration de la boutique — voir logs LOG_ERR ci-dessus)", LOG_ERR);
             }
 
+            // Story stock-article-non-active-emplacement-reselection-perpetuelle (AC3) : résumé
+            // visible des articles ACTUELLEMENT plafonnés (référence de stock non résolue depuis
+            // N cycles consécutifs) — distinct du compteur ci-dessus (une erreur GraphQL GLOBALE
+            // d'emplacement), ce cas ne produit AUCUNE erreur GraphQL, juste une absence de
+            // niveau de stock pour l'article. Lu également par ImportProductsCron::runSyncForStore().
+            if ($this->stockLocationCappedCount > 0) {
+                $this->log("RÉSUMÉ CYCLE EMPLACEMENT PLAFONNÉ: " . $this->stockLocationCappedCount
+                    . " article(s) jamais active(s) a l'emplacement Shopify configure, plafond de cycles"
+                    . " consecutifs atteint - action manuelle requise cote Shopify (voir logs LOG_WARNING ci-dessus)", LOG_WARNING);
+            }
+
             // Story variante-sans-correspondance-sku-ignoree-en-silence (AC1/AC2/AC3) : résumé
             // visible des variantes/déclinaisons non appariées par SKU du cycle (au lieu de rester
             // invisible dans un diagnostic à "0 erreur") — lu également par
@@ -650,6 +824,49 @@ class ImportProducts extends CommonObject
                     . " produit(s) dont l'envoi d'images a été abandonné faute d'image trouvée côté Dolibarr"
                     . " (ni index llx_ecm_files, ni disque) — ces produits restent SANS PHOTO côté Shopify."
                     . " Produits concernés : " . $refsList, LOG_WARNING);
+            }
+
+            // Story apparier-les-images-une-a-une-au-lieu-de-tout-detruire (AC1) : résumé visible
+            // des échecs de CRÉATION de médias du cycle — le produit garde ses anciennes photos
+            // (rien n'a été supprimé), mais la resynchronisation doit être réessayée au prochain
+            // cycle. Même convention que les compteurs d'images ci-dessus.
+            if ($this->imagesCreationFailedCount > 0) {
+                $refsList = implode(', ', $this->imagesCreationFailedRefs);
+                if ($this->imagesCreationFailedCount > count($this->imagesCreationFailedRefs)) {
+                    $refsList .= ' (+' . ($this->imagesCreationFailedCount - count($this->imagesCreationFailedRefs)) . ' autre(s))';
+                }
+                $this->log("RÉSUMÉ CYCLE IMAGES EN ÉCHEC DE CRÉATION: " . $this->imagesCreationFailedCount
+                    . " produit(s) dont la création de médias Shopify a échoué (totalement ou partiellement)"
+                    . " — anciennes photos PRÉSERVÉES (aucune suppression), nouvelle tentative au prochain cycle."
+                    . " Produits concernés : " . $refsList, LOG_ERR);
+            }
+
+            // MEDIUM (review 3 couches 27/09/2026) : résumé visible des échecs de SUPPRESSION
+            // survenus APRÈS une création réussie — le produit se retrouve avec un doublon
+            // (ancien + nouveau média), jamais sans photo, mais mérite d'être surveillé.
+            if ($this->imagesDeleteFailedCount > 0) {
+                $refsList = implode(', ', $this->imagesDeleteFailedRefs);
+                if ($this->imagesDeleteFailedCount > count($this->imagesDeleteFailedRefs)) {
+                    $refsList .= ' (+' . ($this->imagesDeleteFailedCount - count($this->imagesDeleteFailedRefs)) . ' autre(s))';
+                }
+                $this->log("RÉSUMÉ CYCLE IMAGES EN ÉCHEC DE SUPPRESSION: " . $this->imagesDeleteFailedCount
+                    . " produit(s) où la suppression des anciens médias a échoué après une création réussie"
+                    . " (doublon possible : ancien média non retiré + nouveau média créé)."
+                    . " Produits concernés : " . $refsList, LOG_ERR);
+            }
+
+            // HIGH (re-review 27/09/2026, point 1) : résumé visible des produits DIFFÉRÉS —
+            // budget de polling du cycle déjà épuisé, ou lot d'un cycle précédent encore en
+            // cours de traitement chez Shopify. Ni un échec ni une réussite : une décharge de
+            // charge, nouvelle tentative garantie EN PRIORITÉ au cycle suivant.
+            if ($this->imagesDeferredForBudgetCount > 0) {
+                $refsList = implode(', ', $this->imagesDeferredForBudgetRefs);
+                if ($this->imagesDeferredForBudgetCount > count($this->imagesDeferredForBudgetRefs)) {
+                    $refsList .= ' (+' . ($this->imagesDeferredForBudgetCount - count($this->imagesDeferredForBudgetRefs)) . ' autre(s))';
+                }
+                $this->log("RÉSUMÉ CYCLE IMAGES DIFFÉRÉES: " . $this->imagesDeferredForBudgetCount
+                    . " produit(s) reportés (budget de polling du cycle épuisé, ou lot précédent encore en cours) —"
+                    . " traités en PRIORITÉ au prochain cycle. Produits concernés : " . $refsList, LOG_INFO);
             }
 
             $this->db->commit();
@@ -873,6 +1090,207 @@ class ImportProducts extends CommonObject
         return '';
     }
 
+    /**
+     * Story stock-article-non-active-emplacement-reselection-perpetuelle (AC1) : plafond de
+     * cycles CONSÉCUTIFS où un article peut rester non résolu (référence de stock illisible à
+     * l'emplacement configuré) avant que le produit ne soit considéré comme "plafonné" (retenté
+     * à intervalle élargi, plus à chaque cycle). Configurable, défaut raisonnable de l'ordre de
+     * quelques cycles (proposition story : 4 à 6, soit ~1h à 1h30 à 15 minutes/cycle).
+     *
+     * @return int
+     * @since 2.6.0
+     */
+    private function getLocationUnresolvedStreakCap()
+    {
+        return max(1, (int) getDolGlobalInt('DOLI2SHOP_LOCATION_UNRESOLVED_STREAK_CAP', 5));
+    }
+
+    /**
+     * Story stock-article-non-active-emplacement-reselection-perpetuelle (AC2) : intervalle
+     * élargi (en heures) auquel un produit "plafonné" reste malgré tout retenté — jamais une
+     * suppression silencieuse de la synchronisation, juste beaucoup moins souvent tant qu'aucune
+     * action manuelle n'a été faite côté Shopify.
+     *
+     * @return int
+     * @since 2.6.0
+     */
+    private function getLocationUnresolvedRetryHours()
+    {
+        return max(1, (int) getDolGlobalInt('DOLI2SHOP_LOCATION_UNRESOLVED_RETRY_HOURS', 6));
+    }
+
+    /**
+     * Story stock-article-non-active-emplacement-reselection-perpetuelle (AC2) : fragment SQL
+     * d'éligibilité "stock à rattraper", utilisé PAR LES DEUX requêtes de sélection candidates de
+     * importProducts() (produits simples ET produits parents — même fragment, jamais dupliqué à
+     * la main, pour ne jamais risquer de diverger entre les deux).
+     *
+     * Sous le plafond (`location_unresolved_streak < cap`) : comportement STRICTEMENT INCHANGÉ,
+     * fenêtre de 15 minutes comme avant cette story (non-régression du cas transitoire, AC4).
+     * Au-delà du plafond : fenêtre élargie (`getLocationUnresolvedRetryHours()`) — le produit
+     * reste sélectionnable (jamais une suppression silencieuse de la synchronisation) mais
+     * beaucoup moins souvent, le temps qu'une action manuelle soit faite côté Shopify.
+     *
+     * Re-review 27/09/2026 (CRITICAL) : quand TOUT le lot d'un produit est écarté (aucune
+     * variante résolue à l'emplacement — le cas même de cette story pour un produit SIMPLE, ou un
+     * produit parent dont AUCUNE déclinaison ne matche), `syncProduct()` écrit
+     * `last_sync_status = 'skipped'` sur la ligne parent à CHAQUE cycle
+     * (importproducts.class.php ~1450). Les deux requêtes de sélection portaient jusqu'ici une
+     * branche INDÉPENDANTE `OR sync.last_sync_status != 'success'`, qui resélectionnait ce produit
+     * à chaque cycle SANS AUCUN égard pour `location_unresolved_streak` : le plafond n'avait alors
+     * strictement aucun effet sur le cas qui motive cette story. Ce fragment intègre désormais
+     * cette condition, mais UNIQUEMENT gatée par le plafond (`COALESCE(..., 0) < cap`) : tant que
+     * le produit n'est PAS plafonné, un statut différent de 'success' (erreur réseau, produit
+     * jamais synchronisé avec succès, etc.) continue de déclencher une resélection IMMÉDIATE,
+     * exactement comme avant cette story — seul le cas "plafonné" est ralenti. `COALESCE` protège
+     * une ligne sans compteur persisté (NULL par LEFT JOIN) — cas déjà couvert par ailleurs par
+     * `sync.last_sync_status IS NULL` (branche indépendante, hors de ce fragment), mais gardé ici
+     * par défense en profondeur : "NULL < cap" vaudrait NULL (donc faux) sans ce COALESCE.
+     *
+     * @return string Fragment SQL déjà entre parenthèses, à combiner par OR avec les autres
+     *                conditions de re-sync (statut IS NULL, contenu 24h).
+     * @since 2.6.0
+     */
+    private function buildStockCatchupEligibilityClause()
+    {
+        $cap = $this->getLocationUnresolvedStreakCap();
+        $retryHours = $this->getLocationUnresolvedRetryHours();
+
+        return "("
+            . "(sync.last_sync_status != 'success' AND COALESCE(sync.location_unresolved_streak, 0) < " . (int) $cap . ")"
+            . " OR (COALESCE(sync.location_unresolved_streak, 0) < " . (int) $cap
+            . " AND (sync.last_stock_sync IS NULL OR sync.last_stock_sync < DATE_SUB(NOW(), INTERVAL 15 MINUTE)))"
+            . " OR (COALESCE(sync.location_unresolved_streak, 0) >= " . (int) $cap
+            . " AND sync.last_stock_sync < DATE_SUB(NOW(), INTERVAL " . (int) $retryHours . " HOUR))"
+            . ")";
+    }
+
+    /**
+     * Story stock-article-non-active-emplacement-reselection-perpetuelle : persiste ou
+     * réinitialise le compteur de cycles CONSÉCUTIFS où au moins un article de ce produit a été
+     * écarté pour référence de stock non résolue (`dropUnresolvedInventoryReferences()`).
+     *
+     * ⚠️ Porté EXCLUSIVEMENT par la ligne du produit PARENT/SIMPLE (`fk_product = $parentProductId`,
+     * TOUJOURS `$dolProduct->id`, jamais l'id d'une déclinaison individuellement écartée) — c'est
+     * cette ligne, et uniquement elle, qui gouverne `sync.last_stock_sync` dans la clause de
+     * sélection SQL du cron (cf. buildStockCatchupEligibilityClause(), Validate 27/09/2026,
+     * réserve #1). Poser ce compteur sur la ligne d'une déclinaison ne changerait rien à la
+     * re-sélection perpétuelle du produit entier.
+     *
+     * Invariant multi-boutiques (CLAUDE.dolibarr.md §14, même motif que clearOffsaleActionStatus()
+     * et les stamps last_stock_sync voisins de syncVariantStocksOnly()) : filtre `fk_store`
+     * conditionnel — appliqué seulement si la boutique courante en a un (`> 0`), aucun filtre en
+     * mono-boutique/chemin historique (`fk_store == 0`), et jamais d'écrasement d'un `fk_store > 0`
+     * par 0.
+     *
+     * Résolution (Validate 27/09/2026, réserve #3) : dès que ce lot n'a PLUS d'article écarté
+     * (incident transitoire réglé, ou activation Shopify faite entre-temps), le compteur est remis
+     * à 0 et le produit retrouve la cadence normale — le plafond ne doit JAMAIS devenir un blocage
+     * permanent.
+     *
+     * Re-review 27/09/2026 (LOW) : lecture-modification-écriture (SELECT puis UPDATE), PAS une
+     * écriture atomique (`SET location_unresolved_streak = LEAST(location_unresolved_streak + 1,
+     * cap)`) — choix délibéré, pas un oubli. Une écriture purement atomique perdrait la valeur
+     * `$currentStreak` AVANT incrément, nécessaire pour détecter le franchissement EXACT du
+     * plafond (`$currentStreak < $cap` ligne plus bas) qui déclenche l'alerte one-shot : la
+     * récupérer nécessiterait soit une variable de session MySQL dans l'UPDATE (fragile, ordre
+     * d'évaluation non garanti selon la version du moteur), soit un `SELECT ... FOR UPDATE`
+     * verrouillant. Cette lecture-modification-écriture reste SÛRE sans verrou explicite parce que
+     * `syncProduct()` (l'appelant, en amont de `syncVariantStocksOnly()`) acquiert déjà un verrou
+     * PAR PRODUIT via la colonne `sync_lock` de cette même table AVANT tout appel à cette méthode
+     * (`isSyncLocked()` ~ligne 2040, posé par `manageProductMapping(..., 'pending', ...)` juste
+     * après, cf. ~ligne 1368-1380) : un second process qui tenterait de synchroniser CE MÊME
+     * produit pendant que ce SELECT/UPDATE est en cours serait rejeté par ce verrou AVANT même
+     * d'atteindre `syncVariantStocksOnly()`. Aucune autre méthode n'écrit
+     * `location_unresolved_streak` (grep vérifié) : pas de concurrence possible sur la même ligne.
+     *
+     * @param  int  $parentProductId ID Dolibarr du produit PARENT ou SIMPLE (jamais une déclinaison)
+     * @param  bool $anyItemDropped  true si au moins un article du lot a été écarté ce cycle
+     * @param  int  $fkStore         ShopifyApi::getStoreId() courant (0 = chemin historique mono-boutique)
+     * @return void
+     * @since  2.6.0
+     */
+    private function updateLocationUnresolvedStreak($parentProductId, $anyItemDropped, $fkStore)
+    {
+        $parentProductId = (int) $parentProductId;
+        $fkStore = (int) $fkStore;
+
+        $sqlSelect = "SELECT location_unresolved_streak FROM " . MAIN_DB_PREFIX . $this->table_element
+            . " WHERE fk_product = ? AND entity = ?";
+        $paramsSelect = [$parentProductId, (int) $this->entity];
+        if ($fkStore > 0) {
+            $sqlSelect .= " AND fk_store = ?";
+            $paramsSelect[] = $fkStore;
+        }
+
+        $currentStreak = 0;
+        $result = SqlUtils::executeQuery($this->db, $sqlSelect, "reading location_unresolved_streak for product " . $parentProductId, false, $paramsSelect);
+        if ($result) {
+            $obj = $this->db->fetch_object($result);
+            if ($obj !== null && isset($obj->location_unresolved_streak)) {
+                $currentStreak = (int) $obj->location_unresolved_streak;
+            }
+            $this->db->free($result);
+        }
+
+        if (!$anyItemDropped) {
+            // Résolution : retour à la cadence normale, jamais un blocage permanent (réserve #3).
+            if ($currentStreak !== 0) {
+                $sqlReset = "UPDATE " . MAIN_DB_PREFIX . $this->table_element
+                    . " SET location_unresolved_streak = 0 WHERE fk_product = ? AND entity = ?";
+                $paramsReset = [$parentProductId, (int) $this->entity];
+                if ($fkStore > 0) {
+                    $sqlReset .= " AND fk_store = ?";
+                    $paramsReset[] = $fkStore;
+                }
+                $resetResult = SqlUtils::executeQuery($this->db, $sqlReset, "resetting location_unresolved_streak for product " . $parentProductId, false, $paramsReset);
+                // Re-review 27/09/2026 (LOW) : la ligne parent peut ne plus exister pour CE
+                // fk_store (produit supprimé entre-temps, ou fk_store désaligné) — ce n'est jamais
+                // bloquant (comportement inchangé), mais ça restait jusqu'ici totalement
+                // silencieux. LOG_DEBUG uniquement : ni WARNING (pas une anomalie en soi), ni
+                // bruit en production (niveau DEBUG seulement).
+                if ($resetResult && (int) $this->db->affected_rows($resetResult) === 0) {
+                    $this->log("updateLocationUnresolvedStreak - reset : 0 ligne affectee pour le produit "
+                        . $parentProductId . " (fk_store=" . $fkStore . ") - ligne parent absente pour ce fk_store ?", LOG_DEBUG);
+                }
+            }
+            return;
+        }
+
+        $cap = $this->getLocationUnresolvedStreakCap();
+        // Fige la valeur affichée au plafond une fois atteint (pas de croissance indéfinie).
+        $newStreak = min($currentStreak + 1, $cap);
+
+        $sqlUpdate = "UPDATE " . MAIN_DB_PREFIX . $this->table_element
+            . " SET location_unresolved_streak = ? WHERE fk_product = ? AND entity = ?";
+        $paramsUpdate = [$newStreak, $parentProductId, (int) $this->entity];
+        if ($fkStore > 0) {
+            $sqlUpdate .= " AND fk_store = ?";
+            $paramsUpdate[] = $fkStore;
+        }
+        $updateResult = SqlUtils::executeQuery($this->db, $sqlUpdate, "updating location_unresolved_streak for product " . $parentProductId, false, $paramsUpdate);
+        // Re-review 27/09/2026 (LOW) : même raison que pour le reset ci-dessus — 0 ligne affectée
+        // (ligne parent absente pour ce fk_store) ne doit jamais rester totalement silencieux.
+        if ($updateResult && (int) $this->db->affected_rows($updateResult) === 0) {
+            $this->log("updateLocationUnresolvedStreak - increment : 0 ligne affectee pour le produit "
+                . $parentProductId . " (fk_store=" . $fkStore . ") - ligne parent absente pour ce fk_store ?", LOG_DEBUG);
+        }
+
+        if ($newStreak >= $cap) {
+            $this->stockLocationCappedCount++;
+            if ($currentStreak < $cap) {
+                // Franchissement du plafond CE cycle : alerte one-shot, jamais répétée les
+                // cycles suivants (story : "LOG_WARNING actionnable une seule fois au passage du
+                // plafond, pas à chaque cycle").
+                $this->log("Produit ID " . $parentProductId . " : plafond de " . $cap
+                    . " cycle(s) consecutif(s) atteint pour une reference de stock non resolue "
+                    . "(article probablement jamais active a l'emplacement Shopify configure pour "
+                    . "cette boutique) - action manuelle requise cote Shopify (Locations de la fiche "
+                    . "produit) ; ce produit ne sera plus retente qu'a intervalle elargi ("
+                    . $this->getLocationUnresolvedRetryHours() . "h) jusqu'a resolution.", LOG_WARNING);
+            }
+        }
+    }
 
     /**
      * FIX v2.2.0: Synchronise UNIQUEMENT les stocks des variantes quand le produit est skippé
@@ -981,7 +1399,9 @@ class ImportProducts extends CommonObject
             // repousserait le réexamen du produit ENTIER de 15 minutes, alors que l'article écarté
             // doit être retenté dès le cycle suivant.
             $anyItemDropped = false;
+            $locationStreakTrackingApplicable = false;
             if (!empty($inventoryQuantities)) {
+                $locationStreakTrackingApplicable = true;
                 $countBeforeDrop = count($inventoryQuantities);
 
                 // Hotfix 2.5.7 : résout current_shopify_quantity (available) et
@@ -996,6 +1416,18 @@ class ImportProducts extends CommonObject
                 $inventoryQuantities = $this->dropUnresolvedInventoryReferences($inventoryQuantities, 'syncVariantStocksOnly');
 
                 $anyItemDropped = (count($inventoryQuantities) < $countBeforeDrop);
+            }
+
+            // Story stock-article-non-active-emplacement-reselection-perpetuelle : persiste ou
+            // réinitialise le compteur de persistance sur la ligne PARENT/SIMPLE, AVANT de savoir
+            // si ce lot a pu être envoyé (couvre aussi bien le cas "mixte" ci-dessous que le cas
+            // "tout écarté", qui retourne plus bas SANS jamais entrer dans le bloc d'envoi).
+            // `$locationStreakTrackingApplicable` exclut le cas "aucune correspondance SKU du
+            // tout" (matchCount == 0 plus bas) — une classe de défaut différente (déjà couverte
+            // par $unmatchedVariantsCount), pas une référence de stock non résolue.
+            if ($locationStreakTrackingApplicable) {
+                $fkStoreForStreak = (int) $this->shopifyApi->getStoreId();
+                $this->updateLocationUnresolvedStreak((int) $dolProduct->id, $anyItemDropped, $fkStoreForStreak);
             }
 
             if (!empty($inventoryQuantities)) {
@@ -1965,63 +2397,125 @@ class ImportProducts extends CommonObject
 
             // If no rows affected and we have Shopify IDs, create new record
             if ($affectedRows == 0 && $shopifyId !== null) {
-                // CRITICAL: Check if a record already exists for this product to prevent duplicates
-                // Story 47-3 : filtre sur fk_store (isoler les mappings par boutique) — conditionné
-                // à fkStore>0 (fkStore=0 = legacy/fallback → pas de filtre, comportement pré-47-3)
-                $checkSql = "SELECT COUNT(*) as count FROM " . MAIN_DB_PREFIX . $this->table_element .
-                           " WHERE fk_product = ? AND entity = ?";
-                $checkParams = [(int)$dolibarrId, (int)$this->entity];
-                if ($fkStore > 0) {
-                    $checkSql .= " AND fk_store = ?";
-                    $checkParams[] = $fkStore;
+                // Verrou advisory MySQL (Story cle-unique-doli2shop-products-null-fk-product-parent,
+                // AC1) : la course porte sur l'ABSENCE de ligne (check-then-act UPDATE -> SELECT
+                // COUNT -> INSERT ci-dessous, sans transaction ni SELECT ... FOR UPDATE) — même
+                // mécanisme et même motivation que
+                // ShopifyWebhooks::createWebhookWithDatabase() (class/shopifywebhooks.class.php:1550) :
+                // rien à verrouiller par lock de ligne (gap locks InnoDB, subtils, source de
+                // deadlocks). Nom scopé par produit ET boutique — jamais un verrou global qui
+                // sérialiserait tous les produits entre eux ; l'entité est ajoutée automatiquement
+                // par CronHelperTrait::buildCronLockName().
+                $lockName = 'product_map_' . (int)$dolibarrId . '_' . $fkStore;
+                // Timeout 3s : ni bloquant indéfiniment (timeout=0, défaut de la méthode, ferait
+                // échouer la quasi-totalité des courses réelles — elles se jouent en quelques
+                // dizaines de ms), ni instantané. Suffisant pour laisser le gagnant de la course
+                // terminer son propre INSERT (opération unique, rapide) sans bloquer un
+                // webhook/CRON au-delà d'un délai perceptible ; cohérent avec le précédent
+                // ShopifyWebhooks (borné à 5s max selon le budget restant).
+                $lockTimeout = 3;
+
+                if (!$this->acquireCronLock($lockName, $lockTimeout)) {
+                    // AC1 : JAMAIS de skip silencieux — un verrou non obtenu doit remonter comme un
+                    // échec explicite, sinon un mapping produit ne serait jamais créé, sans aucune
+                    // trace (plus grave que le doublon d'origine que ce correctif ferme).
+                    $this->log("manageProductMapping - Verrou non acquis pour fk_product=" . $dolibarrId
+                        . " fk_store=" . $fkStore . " (entity=" . $this->entity . ") : abandon"
+                        . " (course avec un autre appelant, verrou déjà détenu au-delà du timeout de "
+                        . $lockTimeout . "s)", LOG_ERR);
+                    return false;
                 }
 
-                // For variants, also check parent ID to allow multiple variants of same parent
-                if ($dolibarrParentId !== null) {
-                    $checkSql .= " AND fk_product_parent = ?";
-                    $checkParams[] = (int)$dolibarrParentId;
-                } else {
-                    // For simple products, ensure no record exists regardless of parent status
-                    $checkSql .= " AND (fk_product_parent IS NULL OR fk_product_parent = 0)";
-                }
-
-                $checkResult = SqlUtils::executeQuery($this->db, $checkSql, "checking product mapping existence", false, $checkParams);
-                if ($checkResult) {
-                    $row = $this->db->fetch_object($checkResult);
-                    if ($row && $row->count > 0) {
-                        $this->log("Product mapping already exists for Dolibarr ID " . $dolibarrId . " (fk_store=" . $fkStore . ") - skipping INSERT to prevent duplicate", LOG_WARNING);
-                        return true; // Don't fail, just skip the duplicate creation
+                try {
+                    // Re-vérification SOUS verrou (le perdant de la course n'est pas un échec) :
+                    // CRITICAL: Check if a record already exists for this product to prevent duplicates
+                    // Story 47-3 : filtre sur fk_store (isoler les mappings par boutique) — conditionné
+                    // à fkStore>0 (fkStore=0 = legacy/fallback → pas de filtre, comportement pré-47-3)
+                    $checkSql = "SELECT COUNT(*) as count FROM " . MAIN_DB_PREFIX . $this->table_element .
+                               " WHERE fk_product = ? AND entity = ?";
+                    $checkParams = [(int)$dolibarrId, (int)$this->entity];
+                    if ($fkStore > 0) {
+                        $checkSql .= " AND fk_store = ?";
+                        $checkParams[] = $fkStore;
                     }
+
+                    // For variants, also check parent ID to allow multiple variants of same parent
+                    if ($dolibarrParentId !== null) {
+                        $checkSql .= " AND fk_product_parent = ?";
+                        $checkParams[] = (int)$dolibarrParentId;
+                    } else {
+                        // For simple products, ensure no record exists regardless of parent status
+                        $checkSql .= " AND (fk_product_parent IS NULL OR fk_product_parent = 0)";
+                    }
+
+                    $checkResult = SqlUtils::executeQuery($this->db, $checkSql, "checking product mapping existence", false, $checkParams);
+                    if ($checkResult) {
+                        $row = $this->db->fetch_object($checkResult);
+                        if ($row && $row->count > 0) {
+                            $this->log("Product mapping already exists for Dolibarr ID " . $dolibarrId . " (fk_store=" . $fkStore . ") - skipping INSERT to prevent duplicate", LOG_WARNING);
+                            return true; // Don't fail, just skip the duplicate creation
+                        }
+                    }
+
+                    // For INSERT, always use default tms (CURRENT_TIMESTAMP) unless status is 'success'
+                    // Story 47-3 : inclure fk_store dans l'INSERT
+                    // FIX v2.4.1 : idem UPDATE, tms=NOW() explicite réservé au succès de contenu
+                    if ($status === 'success' && $contentSynced) {
+                        $insertSql = "INSERT INTO " . MAIN_DB_PREFIX . $this->table_element .
+                                   " (fk_product, entity, fk_store, shopifyProductId, shopifyVariantId, fk_product_parent, last_sync_status, tms) " .
+                                   "VALUES (?, ?, ?, ?, ?, ?, ?, NOW())";
+                    } else {
+                        // Let tms use the default CURRENT_TIMESTAMP from table definition
+                        $insertSql = "INSERT INTO " . MAIN_DB_PREFIX . $this->table_element .
+                                   " (fk_product, entity, fk_store, shopifyProductId, shopifyVariantId, fk_product_parent, last_sync_status) " .
+                                   "VALUES (?, ?, ?, ?, ?, ?, ?)";
+                    }
+
+                    $insertParams = [
+                        (int)$dolibarrId,
+                        (int)$this->entity,
+                        $fkStore,
+                        $cleanShopifyId,
+                        $cleanVariantId ?? '',
+                        $dolibarrParentId ? (int)$dolibarrParentId : null,
+                        $status ?? 'pending'
+                    ];
+
+                    $this->log("Executing INSERT: " . $insertSql . " with params: " . json_encode($insertParams), LOG_DEBUG);
+
+                    try {
+                        $result = SqlUtils::executeQuery($this->db, $insertSql, "inserting product mapping", true, $insertParams, 5);
+                        $affectedRows = 1; // INSERT success
+                    } catch (Exception $insertException) {
+                        // AC3 : lire lasterrno() IMMÉDIATEMENT dans le catch — rien d'autre n'a
+                        // requêté $this->db entre l'échec et ici (SqlUtils::executeQuery lève dès que
+                        // $db->query() échoue, sans requête intermédiaire). DoliDB normalise l'errno
+                        // MySQL/MariaDB 1062 en la chaîne 'DB_ERROR_RECORD_ALREADY_EXISTS'
+                        // (core/db/mysqli.class.php, vérifié sur Dolibarr 18/23/24) — jamais l'entier
+                        // 1062 brut, que DoliDB ne renvoie jamais.
+                        if ($this->db->lasterrno() === 'DB_ERROR_RECORD_ALREADY_EXISTS') {
+                            // Absorption : un appelant concurrent a gagné la course entre notre
+                            // re-vérification et notre INSERT (fenêtre résiduelle, ex. un tiers non
+                            // couvert par ce verrou). Traiter comme "déjà existant" : appliquer nos
+                            // propres données sur la ligne survivante plutôt que perdre l'écriture.
+                            // LOG_DEBUG seulement : une fois ce correctif en place, ce n'est plus une
+                            // anomalie mais la confirmation que le filet de secours a joué.
+                            $this->log("manageProductMapping - Collision absorbée (DB_ERROR_RECORD_ALREADY_EXISTS)"
+                                . " pour fk_product=" . $dolibarrId . " fk_store=" . $fkStore
+                                . " : mapping déjà créé par un appel concurrent, mise à jour de la ligne existante", LOG_DEBUG);
+
+                            $retryResult = SqlUtils::executeQuery($this->db, $sql, "updating product mapping after absorbed duplicate", false, $allParams, 1);
+                            $result = true;
+                            $affectedRows = $retryResult ? $this->db->affected_rows($retryResult) : 0;
+                        } else {
+                            // Toute autre erreur remonte comme avant (pas de masquage).
+                            throw $insertException;
+                        }
+                    }
+                } finally {
+                    // Libération garantie sur TOUS les chemins de sortie (succès, skip, exception).
+                    $this->releaseCronLock($lockName);
                 }
-
-                // For INSERT, always use default tms (CURRENT_TIMESTAMP) unless status is 'success'
-                // Story 47-3 : inclure fk_store dans l'INSERT
-                // FIX v2.4.1 : idem UPDATE, tms=NOW() explicite réservé au succès de contenu
-                if ($status === 'success' && $contentSynced) {
-                    $insertSql = "INSERT INTO " . MAIN_DB_PREFIX . $this->table_element .
-                               " (fk_product, entity, fk_store, shopifyProductId, shopifyVariantId, fk_product_parent, last_sync_status, tms) " .
-                               "VALUES (?, ?, ?, ?, ?, ?, ?, NOW())";
-                } else {
-                    // Let tms use the default CURRENT_TIMESTAMP from table definition
-                    $insertSql = "INSERT INTO " . MAIN_DB_PREFIX . $this->table_element .
-                               " (fk_product, entity, fk_store, shopifyProductId, shopifyVariantId, fk_product_parent, last_sync_status) " .
-                               "VALUES (?, ?, ?, ?, ?, ?, ?)";
-                }
-
-                $insertParams = [
-                    (int)$dolibarrId,
-                    (int)$this->entity,
-                    $fkStore,
-                    $cleanShopifyId,
-                    $cleanVariantId ?? '',
-                    $dolibarrParentId ? (int)$dolibarrParentId : null,
-                    $status ?? 'pending'
-                ];
-
-                $this->log("Executing INSERT: " . $insertSql . " with params: " . json_encode($insertParams), LOG_DEBUG);
-
-                $result = SqlUtils::executeQuery($this->db, $insertSql, "inserting product mapping", true, $insertParams, 5);
-                $affectedRows = 1; // INSERT success
             }
 
             if ($result) {
@@ -4752,7 +5246,7 @@ class ImportProducts extends CommonObject
      *                                   (Story 57-7) — conservé pour rétro-compatibilité de signature
      * @param object|null $product Dolibarr product — requis pour la branche 'product' (Story 57-2)
      * @return array|null Image data with content, mime_type, size, filename
-     * @version     2.5.7
+     * @version     2.6.0
      * @since 2.0.33
      */
     protected function getImageContent($image, $modulepart = 'product', $originalFile = null, $product = null)
@@ -5101,7 +5595,7 @@ class ImportProducts extends CommonObject
      *                                  fournit l'entité à utiliser pour résoudre
      *                                  `multidir_output`, à la place de l'entité contextuelle
      * @return array|null Image data with content, mime_type, size, filename or null on failure
-     * @version     2.5.7
+     * @version     2.6.0
      * @since 2.1.6
      */
     private function getImageContentFromDisk($image, $modulepart = 'product', $originalFile = null, $product = null)
@@ -5508,6 +6002,280 @@ class ImportProducts extends CommonObject
     }
 
     /**
+     * Décode la provenance des médias Shopify connus comme CRÉÉS PAR LE MODULE pour un produit
+     * (colonne `shopify_media_ids`, JSON — migration 2.6.0d_2.6.0e). Les identifiants servent de
+     * preuve de provenance (a) à isExistingMediaCreatedByModule() — HIGH, review 3 couches
+     * 27/09/2026 : ne jamais supprimer un média que le module n'a pas lui-même posé.
+     *
+     * ⚠️ Forme `{"hash": string|null, "ids": string[]}` (re-review 28/09/2026, point 1c) — PAS un
+     * simple tableau plat. Le hash composite associé est INDISPENSABLE pour décider si ce lot de
+     * médias peut être RÉUTILISÉ sans recréation (syncProductAllImages()) : un lot dont le compte
+     * d'identifiants coïncide par hasard avec le nombre d'images Dolibarr courant, mais qui a été
+     * créé pour un état ANTÉRIEUR et différent des images (contenu changé, même total), serait
+     * servi à tort comme "à jour" sans ce hash pour trancher — la réutilisation n'est tentée QUE si
+     * ce hash correspond EXACTEMENT au hash composite courant.
+     *
+     * @param string|null $rawJson Valeur brute de la colonne (NULL/vide sur une ligne pas encore
+     *                             alimentée par cette story, ou avant la migration)
+     * @return array{hash: ?string, ids: string[]}
+     */
+    private function decodeKnownModuleMediaIds($rawJson)
+    {
+        $empty = ['hash' => null, 'ids' => []];
+        if (empty($rawJson)) {
+            return $empty;
+        }
+        $decoded = json_decode($rawJson, true);
+        if (!is_array($decoded) || !isset($decoded['ids']) || !is_array($decoded['ids'])) {
+            return $empty;
+        }
+        $ids = array_values(array_filter($decoded['ids'], function ($v) {
+            return is_string($v) && $v !== '';
+        }));
+        $hash = (isset($decoded['hash']) && is_string($decoded['hash']) && $decoded['hash'] !== '') ? $decoded['hash'] : null;
+        return ['hash' => $hash, 'ids' => $ids];
+    }
+
+    /**
+     * Persiste la liste des médias Shopify reconnus comme créés par le module pour ce produit,
+     * ainsi que le hash composite (état des images Dolibarr) auquel ce lot correspond.
+     *
+     * ⚠️ Le hash est ESSENTIEL (re-review 28/09/2026, point 1c) : c'est lui qui permet à un cycle
+     * ultérieur de décider si ce lot peut être RÉUTILISÉ tel quel (hash identique au hash composite
+     * courant -> même état d'images Dolibarr) ou doit être traité comme potentiellement PÉRIMÉ
+     * (hash différent -> les images ont changé depuis, ne jamais servir ce lot comme "à jour" même
+     * si son compte d'identifiants coïncide par hasard avec le nouveau compte d'images).
+     *
+     * ⚠️ Même limite préexistante que la requête de lecture du mapping (SELECT ci-dessus dans
+     * syncProductAllImages()) : le WHERE ne filtre pas sur fk_store — motif documenté comme dette
+     * séparée (story fk-store-absent-du-mapping-produit-shopify-images), pas introduit ici.
+     *
+     * @param int         $dolibarrProductId
+     * @param int         $entity
+     * @param string[]    $mediaIds
+     * @param string|null $compositeHash Hash composite courant (état des images Dolibarr)
+     * @return void
+     */
+    private function saveKnownModuleMediaIds($dolibarrProductId, $entity, array $mediaIds, $compositeHash)
+    {
+        $mediaIds = array_values(array_unique($mediaIds));
+        sort($mediaIds);
+        $json = json_encode(['hash' => $compositeHash, 'ids' => $mediaIds]);
+        $sql = "UPDATE " . MAIN_DB_PREFIX . $this->table_element . "
+                SET shopify_media_ids = ?
+                WHERE fk_product = ? AND entity = ?";
+        SqlUtils::executeQuery($this->db, $sql, "updating known module media ids", false, [
+            $json,
+            (int) $dolibarrProductId,
+            (int) $entity
+        ]);
+    }
+
+    /**
+     * Marque (ou démarque) un produit comme prioritaire pour le PROCHAIN cycle de synchronisation
+     * de contenu/stock (`importProducts()`, requêtes SQL de sélection ~488-521 et ~582-610) — HIGH
+     * (re-review 27/09/2026, point 1b). Posée à `true` quand la synchronisation d'images de ce
+     * produit vient d'être DIFFÉRÉE (budget de polling du cycle épuisé, ou lot précédent encore en
+     * cours de traitement) : sans cette priorité, un produit chroniquement en fin de file (ordre
+     * déterministe) ne serait JAMAIS rattrapé, et recréerait un lot complet à chaque cycle sans
+     * jamais rien supprimer (accumulation illimitée de doublons).
+     *
+     * ⚠️ Colonne `images_priority_requeue` (migration 2.6.0e_2.6.0f) — délibérément DISTINCTE de
+     * `last_sync_status`/`last_sync_error` : ces deux colonnes portent le statut/l'erreur du
+     * contenu produit dans son ensemble (lues par admin/diagnostic.php et d'autres consommateurs
+     * existants) ; les réutiliser pour un signal spécifique aux images aurait soit écrasé une
+     * vraie erreur de synchronisation de contenu, soit inversement caché ce signal derrière une
+     * information sans rapport. Une colonne dédiée coûte une migration triviale et garde les deux
+     * préoccupations séparées.
+     *
+     * @param int  $dolibarrProductId
+     * @param int  $entity
+     * @param bool $flag
+     * @return void
+     */
+    private function setImagePriorityRequeue($dolibarrProductId, $entity, bool $flag)
+    {
+        // Re-review 28/09/2026 (Round 5) : filtre fk_store CONDITIONNEL (invariant §14
+        // CLAUDE.dolibarr.md, même idiome que clearOffsaleActionStatus() ci-dessus) — jamais de
+        // filtre en mono-boutique (getStoreId() == 0, chemin historique), pour ne pas rendre ce
+        // garde-fou anti-famine muet sur les installations qui n'ont pas encore de fk_store
+        // renseigné.
+        //
+        // Re-review 28/09/2026 (Round 6, HIGH) : le prédicat `fk_store = ?` STRICT ratait la ligne
+        // pas encore backfillée (fk_store = 0) quand la boutique courante en a un — la remise à 0
+        // touchait alors 0 ligne et le flag restait à 1 pour toujours sur cette ligne. Assoupli en
+        // `(fk_store = ? OR fk_store = 0)`, EXACTEMENT le même prédicat que la lecture
+        // (getImagePriorityRequeueFlag() ci-dessous) : lecture et écriture doivent voir la MÊME
+        // ligne, sans quoi l'une peut lire un flag que l'autre ne parvient jamais à démarquer.
+        $fkStore = (int) $this->shopifyApi->getStoreId();
+
+        $sql = "UPDATE " . MAIN_DB_PREFIX . $this->table_element . "
+                SET images_priority_requeue = ?
+                WHERE fk_product = ? AND entity = ?";
+        $params = [
+            $flag ? 1 : 0,
+            (int) $dolibarrProductId,
+            (int) $entity
+        ];
+        if ($fkStore > 0) {
+            $sql .= " AND (fk_store = ? OR fk_store = 0)";
+            $params[] = $fkStore;
+        }
+
+        $result = SqlUtils::executeQuery($this->db, $sql, "updating image priority requeue flag", false, $params);
+        // Re-review 28/09/2026 (Round 6, HIGH) : même discipline que updateLocationUnresolvedStreak()
+        // / clearOffsaleActionStatus() — 0 ligne affectée (ligne absente pour ce fk_product/entity/
+        // fk_store) ne doit jamais rester totalement silencieux, sans pour autant être bloquant.
+        if ($result && (int) $this->db->affected_rows($result) === 0) {
+            $this->log("setImagePriorityRequeue - 0 ligne affectee pour le produit " . $dolibarrProductId
+                . " (fk_store=" . $fkStore . ", flag=" . ($flag ? 1 : 0) . ") - ligne absente pour ce fk_store ?", LOG_DEBUG);
+        }
+    }
+
+    /**
+     * Lit la valeur COURANTE de `images_priority_requeue` pour un produit (PARENT/SIMPLE — jamais
+     * une déclinaison, cf. l'appelant `syncProductAllImages()`), sur EXACTEMENT le même prédicat
+     * `fk_store` que `setImagePriorityRequeue()` ci-dessus — condition nécessaire (Round 6, HIGH)
+     * pour que la remise à 0 par l'appelant sache si une écriture est réellement nécessaire, sans
+     * jamais lire une ligne que l'écriture ne pourrait pas atteindre ensuite.
+     *
+     * En présence de DEUX lignes pour ce fk_product/entity (l'une pas encore backfillée à
+     * fk_store = 0, l'autre déjà backfillée pour la boutique courante) — fenêtre de migration
+     * transitoire, jamais l'état stable — préfère la ligne DÉJÀ backfillée (`ORDER BY fk_store
+     * DESC LIMIT 1`), cohérent avec l'invariant §14 CLAUDE.dolibarr.md : ne jamais laisser un
+     * fk_store > 0 se faire éclipser par une ligne fk_store = 0 obsolète.
+     *
+     * @param int $productId ID Dolibarr du produit PARENT ou SIMPLE
+     * @param int $entity
+     * @return int 0 ou 1 (0 si aucune ligne trouvée)
+     */
+    private function getImagePriorityRequeueFlag($productId, $entity): int
+    {
+        $fkStore = (int) $this->shopifyApi->getStoreId();
+
+        $sql = "SELECT images_priority_requeue FROM " . MAIN_DB_PREFIX . $this->table_element . "
+                WHERE fk_product = ? AND entity = ?";
+        $params = [(int) $productId, (int) $entity];
+        if ($fkStore > 0) {
+            $sql .= " AND (fk_store = ? OR fk_store = 0) ORDER BY fk_store DESC LIMIT 1";
+            $params[] = $fkStore;
+        }
+
+        $result = SqlUtils::executeQuery($this->db, $sql, "reading image priority requeue flag for product " . $productId, false, $params);
+        if ($result) {
+            $obj = $this->db->fetch_object($result);
+            $this->db->free($result);
+            if ($obj !== null && isset($obj->images_priority_requeue)) {
+                return (int) $obj->images_priority_requeue;
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Indexe par identifiant la réponse de `ShopifyApi::getMediaStatusByIds()` (`nodes(ids:)`) —
+     * factorisé entre `waitForMediaToBeReady()` et la vérification des médias en attente d'un
+     * cycle précédent (point 1c, re-review 27/09/2026) : un identifiant demandé mais ABSENT de la
+     * réponse (page tronquée, suppression concurrente...) est simplement absent de ce tableau,
+     * jamais présent avec un statut inventé.
+     *
+     * @param object $response Réponse brute de getMediaStatusByIds()
+     * @return array<string,string> id (gid complet) => statut
+     */
+    private function indexMediaStatusResponseById($response): array
+    {
+        $byId = [];
+        if (empty($response) || empty($response->data) || !isset($response->data->nodes) || !is_array($response->data->nodes)) {
+            return $byId;
+        }
+        foreach ($response->data->nodes as $node) {
+            if ($node !== null && isset($node->id) && isset($node->status)) {
+                $byId[$node->id] = $node->status;
+            }
+        }
+        return $byId;
+    }
+
+    /**
+     * Détermine si un média Shopify EXISTANT (snapshot pris AVANT le cycle en cours) a été posé
+     * par le module, et est donc un candidat légitime à la suppression lors d'un remplacement.
+     *
+     * HIGH (review 3 couches 27/09/2026) : la sélection ne doit JAMAIS reposer sur la POSITION —
+     * un array_slice sur l'ordre de POSITION pouvait supprimer une photo ajoutée à la main et
+     * promue en tête par le client. Trois preuves de PROVENANCE, dans l'ordre :
+     *
+     *  (a) l'identifiant du média est enregistré comme créé par le module (colonne
+     *      `shopify_media_ids`, alimentée UNIQUEMENT par les créations réelles du module — voir
+     *      syncProductAllImages(), jamais par (b)/(c) ci-dessous) ;
+     *  (b) le texte alternatif est EXACTEMENT égal à l'une des chaînes que buildImageAltText()
+     *      construirait pour le libellé COURANT du produit et le nombre d'images COURANT (N et M
+     *      cohérents — re-review 27/09/2026 : ancien critère bien trop large, un simple suffixe
+     *      « - photo N sur M » matchait n'importe quel libellé, y compris celui d'un AUTRE
+     *      produit) ;
+     *  (c) comportement PRÉ-2.5.5 : le texte alternatif est ÉGAL (pas seulement contenu) au nom de
+     *      fichier d'une image Dolibarr COURANTE du produit.
+     *
+     * Un média à alt VIDE, ou qui ne correspond à AUCUNE de ces preuves, est CONSERVÉ — même s'il
+     * en reste plus que d'images Dolibarr après un cycle. Mieux vaut un doublon visible qu'une
+     * photo client effacée par erreur (AC5).
+     *
+     * ⚠️ (b)/(c) ne sont JAMAIS promus en provenance explicite (a) — voir syncProductAllImages(),
+     * suppression de l'auto-guérison (re-review 27/09/2026, HIGH) : un média reconnu SEULEMENT par
+     * heuristique reste reconnu par heuristique à chaque cycle, il n'est jamais écrit dans
+     * `shopify_media_ids`. Seuls les identifiants que le module vient RÉELLEMENT de créer y sont
+     * écrits.
+     *
+     * Limites résiduelles assumées, DANS LES DEUX SENS :
+     *  - faux négatif (sûr) : un média (a)/(b)/(c) renommé manuellement par le client avec un alt
+     *    ne correspondant plus à aucun motif échappe à la détection et reste conservé comme un
+     *    surplus — aucune perte, juste un doublon ;
+     *  - faux positif (risque nommé, jugé acceptable) : un client qui écrirait à la main,
+     *    EXACTEMENT, l'alt que le module aurait posé (même libellé, même « photo N sur M ») ferait
+     *    reconnaître son média comme provenant du module. La reproduction EXACTE d'un texte généré
+     *    est jugée improbable en pratique, et le premier passage sans provenance explicite (a)
+     *    conserve désormais TOUT média non reconnu — ce faux positif ne peut donc se produire que
+     *    sur un média déjà reconnu par (b)/(c) lors d'un cycle où la création réussit, jamais sur
+     *    un média totalement inconnu.
+     *
+     * @param object   $media                    Média Shopify (id, alt, ...) du snapshot AVANT le cycle
+     * @param string[] $knownModuleMediaIds      Provenance explicite (a)
+     * @param object   $dolParentProduct         Produit parent Dolibarr (pour le libellé courant)
+     * @param string[] $currentDolibarrFilenames Noms de fichiers des images Dolibarr actuelles du produit (c)
+     * @param int      $currentImageCount        Nombre d'images Dolibarr uniques COURANT (M, pour (b))
+     * @return bool
+     */
+    private function isExistingMediaCreatedByModule($media, array $knownModuleMediaIds, $dolParentProduct, array $currentDolibarrFilenames, int $currentImageCount)
+    {
+        if (isset($media->id) && in_array($media->id, $knownModuleMediaIds, true)) {
+            return true;
+        }
+
+        $alt = isset($media->alt) ? trim((string) $media->alt) : '';
+        if ($alt === '') {
+            return false;
+        }
+
+        // (b) égalité EXACTE avec la forme construite par buildImageAltText() pour le libellé
+        // COURANT et CHAQUE position possible 1..M du compte d'images COURANT M — jamais un
+        // simple test de suffixe. Réutilise buildImageAltText() elle-même (au lieu de
+        // recalculer la résolution de libellé/troncature) pour garantir une comparaison
+        // BYTE POUR BYTE avec ce que le module aurait réellement posé.
+        $positionsToCheck = max(1, $currentImageCount);
+        for ($n = 0; $n < $positionsToCheck; $n++) {
+            if ($alt === $this->buildImageAltText($dolParentProduct, $n, $currentImageCount)) {
+                return true;
+            }
+        }
+
+        // (c) comportement PRÉ-2.5.5 : alt == nom de fichier d'une image Dolibarr courante.
+        if (in_array($alt, $currentDolibarrFilenames, true)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
     * Sync all images for a product with proper ordering
     *
     * @param object $dolParentProduct Dolibarr parent product
@@ -5527,6 +6295,17 @@ class ImportProducts extends CommonObject
 
         $this->db->begin();
 
+        // Story apparier-les-images-une-a-une-au-lieu-de-tout-detruire (AC1) : déclaré AVANT le
+        // try pour rester visible du catch — permet de compter une Exception survenant APRÈS le
+        // snapshot (ex. staged uploads en échec total) comme un échec de création d'images,
+        // jamais une Exception plus précoce (mapping absent, pré-check images, dédoublonnage).
+        $reachedImageUploadPhase = false;
+        // LOW (review 3 couches 27/09/2026) : évite un double comptage d'imagesCreationFailedCount
+        // si $this->db->commit() (ou toute instruction après l'incrémentation dans le bloc
+        // "if (!$creationFullySuccessful)") lève une Exception — auquel cas le catch ci-dessous
+        // recompterait le MÊME échec pour le MÊME produit sur le MÊME cycle.
+        $creationFailureAlreadyCounted = false;
+
         try {
             $this->log("🖼️ Starting sync all images for parent product: " . $dolParentProduct->ref, LOG_INFO);
 
@@ -5539,12 +6318,30 @@ class ImportProducts extends CommonObject
             $shopifyProductId = null;
             $dolibarrProductId = $isSimpleProduct ? (int)$dolParentProduct->id : (int)$dolVariants[0]->id;
 
+            // Re-review 28/09/2026 (Round 6, CRITICAL) : images_priority_requeue est LU et ÉCRIT
+            // par les requêtes SQL de sélection du cron (importProducts(), ~566-578 et ~663-675)
+            // via `sync.fk_product = p.rowid` — la ligne du PRODUIT PARENT, jamais celle d'une
+            // déclinaison. $dolibarrProductId ci-dessus vaut pourtant l'ID de la PREMIÈRE
+            // déclinaison pour un produit à variantes (nécessaire pour lire shopifyProductId/
+            // shopify_media_ids, qui restent inchangés). Sans cette distinction, la priorité
+            // était lue/écrite sur la ligne d'une déclinaison que la sélection du cron ne lit
+            // JAMAIS : le mécanisme de rattrapage restait inopérant pour tout produit à
+            // variantes — soit l'inverse de la majorité d'un catalogue. Même ID PARENT que celui
+            // déjà utilisé pour location_unresolved_streak (updateLocationUnresolvedStreak(),
+            // appelé avec (int) $dolProduct->id, le produit PARENT/SIMPLE — jamais une
+            // déclinaison).
+            $priorityRequeueProductId = $isSimpleProduct ? $dolibarrProductId : (int) $dolParentProduct->id;
+
             $this->log("🔑 Dolibarr Product ID used for mapping: " . $dolibarrProductId .
                       " (from " . ($isSimpleProduct ? "parent product" : "first variant") . ")", LOG_INFO);
 
             // FIX #139 v2.1.1: Vérification mapping AVANT toute opération destructive
             // Get Shopify data from the mapping table
-            $sql = "SELECT shopifyProductId FROM " . MAIN_DB_PREFIX . $this->table_element . "
+            // HIGH (review 3 couches 27/09/2026) : shopify_media_ids (colonne migration
+            // 2.6.0d_2.6.0e) lue ici — provenance EXPLICITE des médias créés par le module,
+            // condition (a) de isExistingMediaCreatedByModule(). Peut être NULL sur une ligne
+            // pas encore alimentée par cette story ; decodeKnownModuleMediaIds() gère ce cas.
+            $sql = "SELECT shopifyProductId, shopify_media_ids FROM " . MAIN_DB_PREFIX . $this->table_element . "
                     WHERE fk_product = ? AND entity = " . (int)$this->entity;
 
             $result = SqlUtils::executeQuery($this->db, $sql, "fetching product mapping for images", true, [$dolibarrProductId]);
@@ -5559,7 +6356,37 @@ class ImportProducts extends CommonObject
             }
 
             $shopifyProductId = $parentMapping->shopifyProductId;
+            $knownModuleMediaProvenance = $this->decodeKnownModuleMediaIds(isset($parentMapping->shopify_media_ids) ? $parentMapping->shopify_media_ids : null);
+            $knownModuleMediaIds = $knownModuleMediaProvenance['ids'];
+            $knownModuleMediaHash = $knownModuleMediaProvenance['hash'];
             $this->log("[OK] Shopify product ID found: " . $shopifyProductId, LOG_INFO);
+
+            // Re-review 28/09/2026 (Round 5, HIGH) : la priorité est levée dès l'ENTRÉE de la
+            // fonction, AVANT tout retour anticipé (pré-check images absentes, échec de
+            // dédoublonnage, skip-if-unchanged) — plus seulement après le snapshot des médias
+            // (ancien point d'appel, atteint APRÈS ces trois retours). Sans ce déplacement, un
+            // produit DIFFÉRÉ un cycle (point 1a, budget épuisé) puis rattrapé au cycle suivant
+            // par un chemin de retour anticipé (ex. skip-if-unchanged, hash inchangé) restait
+            // prioritaire À CHAQUE cycle, indéfiniment : aucun des quatre retours anticipés
+            // (mapping absent, pré-check images, dédoublonnage, skip-if-unchanged) ne repassait
+            // par l'ancien appel de remise à 0, situé plus bas dans le flux.
+            //
+            // Re-review 28/09/2026 (Round 6, CRITICAL + HIGH) : lu désormais sur
+            // $priorityRequeueProductId (ligne PARENT pour un produit à variantes, cf. plus haut)
+            // via getImagePriorityRequeueFlag() — plus depuis $parentMapping (qui reste keyé sur
+            // la première déclinaison, jamais la bonne ligne pour ce flag). Ce garde-fou aligne
+            // AUSSI le prédicat fk_store de cette lecture sur celui de l'écriture
+            // (setImagePriorityRequeue()) : sans cet alignement, une ligne pas encore backfillée
+            // (fk_store = 0) alors que la boutique courante en a un pouvait faire lire un flag à
+            // 1 que l'écriture, filtrée strictement sur fk_store = ?, ne parvenait jamais à
+            // remettre à 0 (0 ligne affectée, flag bloqué à 1 indéfiniment).
+            //
+            // N'écrit en base QUE si le flag valait 1 : la très large majorité des produits n'ont
+            // jamais été différés, un UPDATE inconditionnel à CHAQUE produit de CHAQUE cycle
+            // serait un coût sans aucune valeur.
+            if ($this->getImagePriorityRequeueFlag($priorityRequeueProductId, (int) $this->entity) === 1) {
+                $this->setImagePriorityRequeue($priorityRequeueProductId, (int) $this->entity, false);
+            }
 
             // FIX #139 v2.1.1: Vérifier qu'il y aura des images à uploader AVANT de supprimer
             // Cela évite de supprimer des images si le processus échoue ensuite
@@ -5656,6 +6483,16 @@ class ImportProducts extends CommonObject
 
             $this->log("ImportProducts::syncProductAllImages - Total images collected: " . count($allImages), LOG_INFO);
 
+            // HIGH (review 3 couches 27/09/2026) : noms de fichiers Dolibarr COURANTS — condition
+            // (c) de isExistingMediaCreatedByModule() (comportement pré-2.5.5 : alt == nom de
+            // fichier). Calculé sur $allImages (parent + variantes), avant dédoublonnage.
+            $currentDolibarrFilenames = [];
+            foreach ($allImages as $imageEntry) {
+                if (!empty($imageEntry['image']['name'])) {
+                    $currentDolibarrFilenames[] = basename((string) $imageEntry['image']['name']);
+                }
+            }
+
             // 2.3 Story 8.2: Download all image contents and deduplicate by SHA256 hash
             $dedup = $this->deduplicateImages($allImages);
             if ($dedup === null) {
@@ -5741,12 +6578,179 @@ class ImportProducts extends CommonObject
 
             $this->log("ImportProducts::syncProductAllImages - Total unique images to upload: " . count($uniqueImages), LOG_INFO);
 
-            // 2. Delete existing images AFTER skip-if-unchanged check (Story 8.2: prevents data loss)
-            // FIX #139: Maintenant sûr de supprimer car mapping vérifié ET images disponibles
-            $this->log("🗑️ Deleting existing images from Shopify product " . $shopifyProductId, LOG_DEBUG);
-            $deletionSuccess = $this->deleteExistingProductImages($shopifyProductId);
-            if (!$deletionSuccess) {
-                $this->log("[WARNING] Warning: Failed to delete existing images for product: " . $shopifyProductId . " . Continuing with image upload .", LOG_WARNING);
+            // HIGH (re-review 27/09/2026, point 1a) : si le budget de polling du CYCLE est DÉJÀ
+            // épuisé AVANT même d'attaquer les images de CE produit, ne rien créer — ni staged
+            // upload, ni createProductMedia. Sans ce garde-fou, le budget ne protégeait QUE
+            // l'attente (waitForMediaToBeReady()), pas la création elle-même : un produit
+            // chroniquement en fin de file (ordre déterministe de la sélection SQL de
+            // importProducts()) recréait un lot complet à CHAQUE cycle, sans jamais rien
+            // supprimer (creationFullySuccessful restait toujours false faute de confirmation) —
+            // accumulation illimitée de médias en double.
+            if ($this->pollingBudgetUsedSeconds >= $this->pollingBudgetSeconds) {
+                $this->imagesDeferredForBudgetCount++;
+                if (count($this->imagesDeferredForBudgetRefs) < 20) {
+                    $this->imagesDeferredForBudgetRefs[] = (string) $dolParentProduct->ref;
+                }
+                // Point 1b : priorité au cycle suivant, pour ne jamais affamer ce produit.
+                // Round 6 (CRITICAL) : $priorityRequeueProductId (ligne PARENT), jamais
+                // $dolibarrProductId (première déclinaison pour un produit à variantes).
+                $this->setImagePriorityRequeue($priorityRequeueProductId, (int) $this->entity, true);
+                $this->log("ImportProducts::syncProductAllImages - Budget de polling du cycle déjà épuisé ("
+                    . round($this->pollingBudgetUsedSeconds, 1) . "s/" . $this->pollingBudgetSeconds
+                    . "s) : produit " . $dolParentProduct->ref . " REPORTÉ sans aucun appel de création"
+                    . " (ni staged upload, ni createProductMedia), priorité au prochain cycle.", LOG_INFO);
+                $this->db->commit();
+                return true;
+            }
+
+            // 2. Story apparier-les-images-une-a-une-au-lieu-de-tout-detruire (AC1) : la
+            // suppression n'a plus le droit d'intervenir ICI. On se contente de PHOTOGRAPHIER
+            // l'état Shopify actuel — cette liste sert plus bas à ne supprimer QUE ce que la
+            // création aura effectivement remplacé, jamais avant, jamais plus. Snapshot pris
+            // AVANT tout envoi : après création, getProductImages() renverrait aussi les
+            // nouveaux médias et rendrait la distinction impossible.
+            $this->log("📸 Snapshot des médias existants avant envoi (produit " . $shopifyProductId . ")", LOG_DEBUG);
+            $existingMediaBeforeSync = $this->shopifyApi->getProductImages($shopifyProductId);
+            $existingMediaBeforeIds = array_map(function ($m) {
+                return $m->id;
+            }, $existingMediaBeforeSync);
+            // Marque le point à partir duquel une Exception (ex. createStagedUploads() en échec
+            // total ci-dessous) doit être comptée comme un échec de création — jamais avant
+            // (les abandons précoces, ex. mapping/pré-check absents, sont déjà gérés par leurs
+            // propres `return false` et ne passent jamais par le catch englobant).
+            $reachedImageUploadPhase = true;
+
+            // Re-review 28/09/2026 (Round 5) : l'ancienne remise à 0 vivait ICI — trop tard,
+            // après les retours anticipés de pré-check/dédoublonnage/skip-if-unchanged. Déplacée
+            // à l'entrée de la fonction (juste après confirmation du mapping, voir plus haut).
+            // Ré-posée à true plus bas si ce cycle DIFFÈRE quand même (point 1c, lot précédent
+            // encore en cours).
+
+            // HIGH (re-review 27/09/2026, point 1c ; re-review 28/09/2026 : garde-fou par hash) :
+            // des médias CRÉÉS PAR LE MODULE lors d'un cycle précédent, mais jamais confirmés
+            // (cycle interrompu par le budget), restent dans $knownModuleMediaIds sans qu'on
+            // sache s'ils sont utilisables. AVANT d'en recréer un nouveau lot, on vérifie leur
+            // statut RÉEL — jamais une seconde création sur un lot déjà en vol.
+            //
+            // ⚠️ Le hash composite ($knownModuleMediaHash === $compositeHash) est la condition
+            // DÉTERMINANTE, pas un simple bonus : sans elle, un lot ANCIEN mais déjà pleinement
+            // CONFIRMÉ (persisté après un cycle réussi, donc légitimement recensé comme
+            // provenance (a)) serait à tort traité comme "en attente de confirmation" dès que son
+            // compte d'identifiants coïncide avec le nombre d'images Dolibarr courant — y compris
+            // quand les images ont changé depuis (contenu différent, même total). Le hash composite
+            // ne peut être identique que si RIEN n'a changé côté Dolibarr depuis que ce lot précis
+            // a été créé : c'est la seule preuve fiable qu'il s'agit bien du MÊME cycle interrompu,
+            // pas d'un lot antérieur et désormais périmé.
+            $pendingKnownMediaIds = array_values(array_intersect($knownModuleMediaIds, $existingMediaBeforeIds));
+            if (
+                $knownModuleMediaHash !== null
+                && $knownModuleMediaHash === $compositeHash
+                && !empty($pendingKnownMediaIds)
+                && count($pendingKnownMediaIds) === count($uniqueImages)
+            ) {
+                $pendingStatusResponse = $this->shopifyApi->getMediaStatusByIds($pendingKnownMediaIds);
+                $pendingStatusesById = $this->indexMediaStatusResponseById($pendingStatusResponse);
+
+                $allPendingReady = true;
+                $anyPendingFailed = false;
+                $failedPendingIds = [];
+                foreach ($pendingKnownMediaIds as $pendingId) {
+                    $pendingStatus = isset($pendingStatusesById[$pendingId]) ? $pendingStatusesById[$pendingId] : null;
+                    if ($pendingStatus === 'FAILED') {
+                        $anyPendingFailed = true;
+                        $failedPendingIds[] = $pendingId;
+                        $allPendingReady = false;
+                    } elseif ($pendingStatus !== 'READY') {
+                        $allPendingReady = false;
+                    }
+                }
+
+                if ($allPendingReady) {
+                    // Convergence : le lot d'un cycle précédent est maintenant CONFIRMÉ READY —
+                    // réutilisé tel quel, AUCUNE recréation. L'association parent/variantes a
+                    // déjà eu lieu lors du cycle de création initial (elle ne dépend pas de la
+                    // confirmation du statut) ; il ne reste qu'à nettoyer les anciens médias
+                    // effectivement remplacés et à figer l'empreinte.
+                    $this->log("ImportProducts::syncProductAllImages - " . count($pendingKnownMediaIds)
+                        . " média(s) créé(s) lors d'un cycle précédent sont maintenant CONFIRMÉS READY pour le produit "
+                        . $dolParentProduct->ref . " : réutilisés comme lot courant, aucune recréation.", LOG_INFO);
+
+                    $mediaIdsToDeleteNow = [];
+                    $keptMediaIdsNow = [];
+                    foreach ($existingMediaBeforeSync as $existingMedia) {
+                        if (in_array($existingMedia->id, $pendingKnownMediaIds, true)) {
+                            continue; // fait partie du lot réutilisé — jamais candidat à la suppression
+                        }
+                        if ($this->isExistingMediaCreatedByModule($existingMedia, $knownModuleMediaIds, $dolParentProduct, $currentDolibarrFilenames, count($uniqueImages))) {
+                            $mediaIdsToDeleteNow[] = $existingMedia->id;
+                        } else {
+                            $keptMediaIdsNow[] = $existingMedia->id;
+                        }
+                    }
+
+                    $deletedNowIds = [];
+                    if (!empty($mediaIdsToDeleteNow)) {
+                        $deletionResultNow = $this->deleteSpecificProductMedia($mediaIdsToDeleteNow, $shopifyProductId);
+                        $deletedNowIds = $deletionResultNow['deletedIds'];
+                        if (!$deletionResultNow['success']) {
+                            $this->imagesDeleteFailedCount++;
+                            if (count($this->imagesDeleteFailedRefs) < 20) {
+                                $this->imagesDeleteFailedRefs[] = (string) $dolParentProduct->ref;
+                            }
+                            $this->log("[WARNING] Failed to delete some replaced media for product: " . $shopifyProductId
+                                . ". Old media may remain alongside the reused batch — no data was lost.", LOG_WARNING);
+                        }
+                        if (!empty($keptMediaIdsNow)) {
+                            $this->log("ImportProducts::syncProductAllImages - " . count($keptMediaIdsNow)
+                                . " média(s) Shopify surplus préservé(s) (non appariés, jamais supprimés par défaut) pour le produit "
+                                . $dolParentProduct->ref, LOG_INFO);
+                        }
+                    }
+
+                    $finalKnownIds = array_values(array_diff(array_unique($pendingKnownMediaIds), $deletedNowIds));
+                    $this->saveKnownModuleMediaIds($dolibarrProductId, (int) $this->entity, $finalKnownIds, $compositeHash);
+
+                    $hashImageCount = count($allImages) - $dedupFailedCount;
+                    $this->updateStoredCompositeHash((int) $dolParentProduct->id, (int) $this->entity, $compositeHash, $hashImageCount);
+
+                    $this->db->commit();
+                    $this->log("ImportProducts::syncProductAllImages - Image synchronization completed (lot réutilisé) for product: " . $dolParentProduct->ref, LOG_INFO);
+                    return true;
+                }
+
+                if ($anyPendingFailed) {
+                    // "S'ils sont FAILED, supprime-les (ils sont bien au module) et recrée" :
+                    // nettoyage puis poursuite normale du flux (staged upload/création fraîche
+                    // ci-dessous), comme si ce lot n'avait jamais existé.
+                    $this->log("ImportProducts::syncProductAllImages - " . count($failedPendingIds)
+                        . " média(s) d'un cycle précédent ont échoué (FAILED) pour le produit "
+                        . $dolParentProduct->ref . " : suppression puis recréation.", LOG_WARNING);
+                    $failedDeletionResult = $this->deleteSpecificProductMedia($failedPendingIds, $shopifyProductId);
+                    $knownModuleMediaIds = array_values(array_diff($knownModuleMediaIds, $failedDeletionResult['deletedIds']));
+                    // Le snapshot pré-cycle contenait ces médias FAILED : les retirer aussi de
+                    // $existingMediaBeforeSync/$existingMediaBeforeIds pour que la sélection de
+                    // suppression provenance-based, plus bas, ne tente pas de les supprimer une
+                    // seconde fois.
+                    $existingMediaBeforeSync = array_values(array_filter($existingMediaBeforeSync, function ($m) use ($failedPendingIds) {
+                        return !in_array($m->id, $failedPendingIds, true);
+                    }));
+                    $existingMediaBeforeIds = array_values(array_diff($existingMediaBeforeIds, $failedPendingIds));
+                    // Poursuite du flux normal (staged upload + création fraîche) ci-dessous.
+                } else {
+                    // Ni READY ni FAILED : encore en cours de traitement chez Shopify. Ne PAS
+                    // créer un second lot par-dessus — différer proprement, comme le budget.
+                    $this->imagesDeferredForBudgetCount++;
+                    if (count($this->imagesDeferredForBudgetRefs) < 20) {
+                        $this->imagesDeferredForBudgetRefs[] = (string) $dolParentProduct->ref;
+                    }
+                    // Round 6 (CRITICAL) : ligne PARENT, même raison que le point 1a ci-dessus.
+                    $this->setImagePriorityRequeue($priorityRequeueProductId, (int) $this->entity, true);
+                    $this->log("ImportProducts::syncProductAllImages - Le lot de médias d'un cycle précédent pour le produit "
+                        . $dolParentProduct->ref . " est encore en cours de traitement chez Shopify (ni READY ni FAILED) :"
+                        . " REPORTÉ sans créer de second lot, priorité au prochain cycle.", LOG_INFO);
+                    $this->db->commit();
+                    return true;
+                }
             }
 
             // 3. Prepare staged uploads for unique images only (Story 8.2: deduplicated)
@@ -5841,6 +6845,14 @@ class ImportProducts extends CommonObject
             $this->log("ImportProducts::syncProductAllImages - Successfully uploaded " . count($uploadedImages) . " of " . count($uniqueImages) . " unique images (from " . count($allImages) . " total)", LOG_INFO);
 
             // 6. Create media in Shopify
+            //
+            // Story apparier-les-images-une-a-une-au-lieu-de-tout-detruire (AC1) : $creationFullySuccessful
+            // devient la SEULE porte pour deux décisions — mettre à jour l'empreinte composite (comme
+            // avant, Story 8.2) ET, désormais, supprimer les anciens médias. Tant qu'elle n'est pas
+            // levée à true, AUCUNE suppression n'a lieu et les anciens médias restent en place.
+            $creationFullySuccessful = false;
+            $mediaIdsToDelete = [];
+            $keptMediaIds = $existingMediaBeforeIds; // par défaut : rien supprimé, tout conservé
             if (!empty($uploadedImages)) {
                 $mediaInputs = [];
 
@@ -5856,9 +6868,24 @@ class ImportProducts extends CommonObject
                 $this->log("Creating " . count($mediaInputs) . " media in Shopify", LOG_INFO);
                 $response = $this->shopifyApi->createProductMedia($shopifyProductId, $mediaInputs);
 
+                $mediaUserErrors = (!empty($response->data->productCreateMedia->mediaUserErrors))
+                    ? $response->data->productCreateMedia->mediaUserErrors
+                    : [];
+
                 if (!empty($response->data->productCreateMedia->media)) {
                     $createdMedia = $response->data->productCreateMedia->media;
                     $this->log("Successfully created " . count($createdMedia) . " media", LOG_INFO);
+
+                    // Signal IMMÉDIAT (réponse de création) — utilisé seulement comme filtre
+                    // précoce. Il ne suffit PAS à prouver le succès : voir le statut FINAL
+                    // (polling) ci-dessous, seul habilité à faire foi (CRITICAL, review 3 couches
+                    // 27/09/2026).
+                    $immediateFailedStatusCount = 0;
+                    foreach ($createdMedia as $media) {
+                        if (isset($media->status) && $media->status === 'FAILED') {
+                            $immediateFailedStatusCount++;
+                        }
+                    }
 
                     // Track media IDs for parent images (to maintain order) and variants (for associations)
                     $parentMediaIds = [];
@@ -5870,12 +6897,49 @@ class ImportProducts extends CommonObject
                         $allMediaIds[] = $media->id;
                     }
 
-                    $this->log("Waiting for " . count($allMediaIds) . " media to be ready...", LOG_INFO);
-                    $readySuccess = $this->waitForMediaToBeReady($shopifyProductId, $allMediaIds);
-
-                    if (!$readySuccess) {
-                        $this->log("Not all media became ready, but continuing with available media", LOG_WARNING);
+                    // Re-review 3 couches 27/09/2026 (point 3) : budget de polling CUMULÉ sur le
+                    // cycle. Épuisé -> ce produit est traité comme NON PRÊT SANS interroger
+                    // Shopify (aucune suppression, empreinte non écrite, nouvelle tentative au
+                    // cycle suivant) — jamais de suppression par défaut de vérification.
+                    if ($this->pollingBudgetUsedSeconds >= $this->pollingBudgetSeconds) {
+                        $this->log("ImportProducts::syncProductAllImages - Budget de polling du cycle épuisé ("
+                            . round($this->pollingBudgetUsedSeconds, 1) . "s/" . $this->pollingBudgetSeconds
+                            . "s) : produit " . $dolParentProduct->ref . " traité comme NON PRÊT sans interroger Shopify,"
+                            . " aucune suppression, nouvelle tentative au prochain cycle.", LOG_WARNING);
+                        $readyResult = array('allReady' => false, 'anyFailed' => false, 'timedOut' => true, 'statuses' => array());
+                        // LOW (re-review 28/09/2026, Round 6, point 3) : un lot vient d'être CRÉÉ
+                        // mais jamais interrogé (budget épuisé PENDANT le polling, pas seulement
+                        // avant — cf. point 1a ci-dessus) — ce produit doit être repris en
+                        // PRIORITÉ au prochain cycle pour confirmer ce lot en attente (point 1c),
+                        // exactement comme les deux autres chemins de report.
+                        $this->setImagePriorityRequeue($priorityRequeueProductId, (int) $this->entity, true);
+                    } else {
+                        $this->log("Waiting for " . count($allMediaIds) . " media to be ready...", LOG_INFO);
+                        $pollingStartedAt = microtime(true);
+                        $readyResult = $this->waitForMediaToBeReady($shopifyProductId, $allMediaIds, $this->mediaReadyMaxAttempts, $this->mediaReadySleepSeconds);
+                        $this->pollingBudgetUsedSeconds += (microtime(true) - $pollingStartedAt);
                     }
+
+                    if (!$readyResult['allReady']) {
+                        if ($readyResult['anyFailed']) {
+                            $this->log("ImportProducts::syncProductAllImages - Au moins un média a basculé FAILED de façon asynchrone après création (statut final, pas immédiat) pour le produit " . $dolParentProduct->ref, LOG_ERR);
+                        } else {
+                            $this->log("Not all media became ready (timeout), but continuing with available media", LOG_WARNING);
+                        }
+                    }
+
+                    // CRITICAL (review 3 couches 27/09/2026) : la décision de suppression ET
+                    // l'écriture de l'empreinte composite ne peuvent PLUS se fier au statut
+                    // IMMÉDIAT de la réponse productCreateMedia (souvent PROCESSING/UPLOADED,
+                    // jamais garanti). Seul le statut FINAL observé par waitForMediaToBeReady()
+                    // (polling) fait foi : $readyResult['allReady'] exige que TOUS les médias
+                    // créés aient atteint READY — un FAILED asynchrone ou un timeout bloquent
+                    // désormais la suppression exactement comme un échec immédiat.
+                    $creationFullySuccessful = empty($mediaUserErrors)
+                        && $immediateFailedStatusCount === 0
+                        && count($createdMedia) === count($uploadedImages)
+                        && count($uploadedImages) === count($uniqueImages)
+                        && $readyResult['allReady'];
 
                     // Story 8.2: Process created media and map to ALL original entries via hash-based deduplication
                     // Each unique image upload maps to one or more original entries sharing the same hash
@@ -5972,13 +7036,46 @@ class ImportProducts extends CommonObject
                         }
                     }
 
-                    // Create full media order: parent images first, then variant images
+                    // AC1 (item 2 du périmètre tranché) : les anciens médias ne sont supprimés QUE
+                    // si la création a intégralement réussi.
+                    //
+                    // HIGH (review 3 couches 27/09/2026) : la sélection ne repose PLUS sur la
+                    // POSITION/le COMPTE (un array_slice sur l'ordre de POSITION pouvait supprimer
+                    // une photo ajoutée à la main et promue en tête) mais sur la PROVENANCE — voir
+                    // isExistingMediaCreatedByModule(). Un média Shopify non reconnu comme posé par
+                    // le module est un SURPLUS : il n'est JAMAIS supprimé par défaut ici (AC5),
+                    // quel qu'en soit le nombre. Seule l'action explicite « forcer le renvoi
+                    // complet » (2.5.5) invalide le hash et redéclenche ce même chemin.
+                    if ($creationFullySuccessful) {
+                        $mediaIdsToDelete = [];
+                        $keptMediaIds = [];
+                        foreach ($existingMediaBeforeSync as $existingMedia) {
+                            if ($this->isExistingMediaCreatedByModule($existingMedia, $knownModuleMediaIds, $dolParentProduct, $currentDolibarrFilenames, count($uniqueImages))) {
+                                $mediaIdsToDelete[] = $existingMedia->id;
+                            } else {
+                                $keptMediaIds[] = $existingMedia->id;
+                            }
+                        }
+                    } else {
+                        $mediaIdsToDelete = [];
+                        $keptMediaIds = $existingMediaBeforeIds;
+                    }
+
+                    // Create full media order: parent images first, then variant images, puis les
+                    // médias CONSERVÉS (surplus non supprimé, ou totalité des anciens médias si la
+                    // création n'a pas intégralement réussi) — réserve 3 du Validate : le
+                    // réordonnancement doit porter sur l'ensemble conservés + nouveaux.
                     $orderedMediaIds = $parentMediaIds;
                     foreach ($variantMediaMap as $shopifyVariantId =>  $mediaIds) {
                         foreach ($mediaIds as $mediaId) {
                             if (!in_array($mediaId, $orderedMediaIds)) {
                                 $orderedMediaIds[] = $mediaId;
                             }
+                        }
+                    }
+                    foreach ($keptMediaIds as $keptMediaId) {
+                        if (!in_array($keptMediaId, $orderedMediaIds)) {
+                            $orderedMediaIds[] = $keptMediaId;
                         }
                     }
 
@@ -6001,22 +7098,93 @@ class ImportProducts extends CommonObject
                             $this->log("Linked media " . $mediaId . " to variant " . $shopifyVariantId, LOG_DEBUG);
                         }
                     }
+
+                    // 9. Story apparier-les-images-une-a-une-au-lieu-de-tout-detruire (AC1) :
+                    // suppression des anciens médias — MAINTENANT SEULEMENT, après vérification
+                    // complète de la création. AUCUNE suppression sur échec (géré par le bloc
+                    // $creationFullySuccessful === false ci-dessous, après la sortie de ce bloc).
+                    //
+                    // HIGH (re-review 27/09/2026) : $newKnownModuleMediaIds ne contient QUE ce que
+                    // le module vient RÉELLEMENT de créer ce cycle ($allMediaIds, même en succès
+                    // partiel) plus ce qui était déjà connu explicitement — JAMAIS un média reconnu
+                    // seulement par heuristique (b)/(c). L'auto-guérison de la première version de
+                    // ce correctif est SUPPRIMÉE : elle promouvait en provenance explicite tout
+                    // média reconnu par heuristique et survivant à un échec partiel de suppression,
+                    // ce qui aurait fini par figer un faux positif d'alt en vérité définitive.
+                    $newKnownModuleMediaIds = array_merge($knownModuleMediaIds, $allMediaIds);
+
+                    if ($creationFullySuccessful && !empty($mediaIdsToDelete)) {
+                        $this->log("🗑️ Deleting " . count($mediaIdsToDelete) . " module-owned media (of "
+                            . count($existingMediaBeforeIds) . " existing before sync, provenance-based selection) for product " . $shopifyProductId, LOG_DEBUG);
+                        $deletionResult = $this->deleteSpecificProductMedia($mediaIdsToDelete, $shopifyProductId);
+                        if (!$deletionResult['success']) {
+                            // MEDIUM (review 3 couches 27/09/2026) : un échec de suppression APRÈS
+                            // création réussie n'est plus seulement un WARNING silencieux — il est
+                            // compté pour le résumé de cycle. Jamais de perte de photo dans ce cas
+                            // (le remplaçant existe déjà), au pire un doublon temporaire.
+                            $this->imagesDeleteFailedCount++;
+                            if (count($this->imagesDeleteFailedRefs) < 20) {
+                                $this->imagesDeleteFailedRefs[] = (string) $dolParentProduct->ref;
+                            }
+                            $this->log("[WARNING] Failed to delete some replaced media for product: " . $shopifyProductId
+                                . ". Old media may remain alongside the new ones — no data was lost.", LOG_WARNING);
+                        }
+
+                        // HIGH (re-review 27/09/2026) : retire des identifiants connus tout ce qui
+                        // a été EFFECTIVEMENT supprimé — hygiène simple, PAS une promotion. Les
+                        // médias reconnus par (b)/(c) qui survivent (échec partiel de suppression)
+                        // NE SONT PLUS ajoutés à $newKnownModuleMediaIds : ils resteront reconnus
+                        // par heuristique au prochain cycle, jamais par provenance explicite.
+                        $newKnownModuleMediaIds = array_diff($newKnownModuleMediaIds, $deletionResult['deletedIds']);
+
+                        if (!empty($keptMediaIds)) {
+                            $this->log("ImportProducts::syncProductAllImages - " . count($keptMediaIds)
+                                . " média(s) Shopify surplus préservé(s) (non appariés, jamais supprimés par défaut) pour le produit "
+                                . $dolParentProduct->ref, LOG_INFO);
+                        }
+                    }
+
+                    // HIGH : persistance INCONDITIONNELLE (succès complet, partiel, ou échec de
+                    // création) — tout média que le module vient de créer doit être reconnu comme
+                    // « à nous » dès ce cycle, y compris quand la création n'est que partielle.
+                    $this->saveKnownModuleMediaIds($dolibarrProductId, (int) $this->entity, $newKnownModuleMediaIds, $compositeHash);
                 } else {
                     $this->log("No media created in Shopify response", LOG_WARNING);
-                    if (isset($response->data->productCreateMedia->mediaUserErrors)) {
-                        $this->log("Media creation errors: " . json_encode($response->data->productCreateMedia->mediaUserErrors), LOG_ERR);
+                    if (!empty($mediaUserErrors)) {
+                        $this->log("Media creation errors: " . json_encode($mediaUserErrors), LOG_ERR);
                     }
                 }
             }
 
+            if (!$creationFullySuccessful) {
+                // AC1 : échec partiel ou total de la création — AUCUNE suppression (déjà garanti
+                // ci-dessus, les anciens médias n'ont jamais été touchés), échec journalisé de
+                // façon ACTIONNABLE et compté pour le résumé de cycle, empreinte NON mise à jour
+                // (bloc ci-dessous) pour permettre une nouvelle tentative au cycle suivant.
+                $this->imagesCreationFailedCount++;
+                $creationFailureAlreadyCounted = true;
+                if (count($this->imagesCreationFailedRefs) < 20) {
+                    $this->imagesCreationFailedRefs[] = (string) $dolParentProduct->ref;
+                }
+                $this->log("ImportProducts::syncProductAllImages - ÉCHEC de création des médias pour le produit "
+                    . $dolParentProduct->ref . " (" . count($uploadedImages) . "/" . count($uniqueImages)
+                    . " téléversées) : anciens médias Shopify PRÉSERVÉS (aucune suppression), nouvelle tentative"
+                    . " au prochain cycle. Voir logs ci-dessus pour le détail (userErrors/statut FAILED/échec de téléversement).", LOG_ERR);
+            }
+
             // Story 8.2: Update composite hash only if ALL unique images were successfully uploaded
             // This ensures partial failures trigger a full re-sync on next run
-            if (count($uploadedImages) === count($uniqueImages)) {
+            // Story apparier-les-images-une-a-une-au-lieu-de-tout-detruire (AC1) : la condition
+            // se réduit désormais à $creationFullySuccessful, qui couvre STRICTEMENT le même cas
+            // (count($uploadedImages) === count($uniqueImages)) ET, en plus, l'absence de
+            // userErrors/statut FAILED sur les médias créés — condition plus stricte, jamais plus
+            // permissive.
+            if ($creationFullySuccessful) {
                 $hashImageCount = count($allImages) - $dedupFailedCount;
                 $this->updateStoredCompositeHash((int)$dolParentProduct->id, (int)$this->entity, $compositeHash, $hashImageCount);
-            } else {
-                $this->log("ImportProducts::syncProductAllImages - Story 8.2: Not storing composite hash - partial upload: " . count($uploadedImages) . "/" . count($uniqueImages) . " images", LOG_WARNING);
             }
+            // else : empreinte volontairement NON mise à jour — voir le LOG_ERR actionnable et
+            // l'incrémentation de $imagesCreationFailedCount ci-dessus (échec de création).
 
             $this->db->commit();
             $this->log("ImportProducts::syncProductAllImages - Image synchronization completed for product: " . $dolParentProduct->ref, LOG_INFO);
@@ -6024,46 +7192,99 @@ class ImportProducts extends CommonObject
         } catch (Exception $e) {
             $this->db->rollback();
             $this->log("ImportProducts::syncProductAllImages - Error syncing product images: " . $e->getMessage(), LOG_ERR);
+            if ($reachedImageUploadPhase) {
+                $this->log("ImportProducts::syncProductAllImages - ÉCHEC de création des médias pour le produit "
+                    . $dolParentProduct->ref . " (Exception après le snapshot) : anciens médias Shopify PRÉSERVÉS"
+                    . " (aucune suppression n'a pu avoir lieu), nouvelle tentative au prochain cycle.", LOG_ERR);
+            }
+            // Story apparier-les-images-une-a-une-au-lieu-de-tout-detruire (AC1) : une Exception
+            // survenue APRÈS le snapshot (ex. createStagedUploads() en échec total, throw ligne
+            // plus haut) est un échec de création comme un autre — aucune suppression n'a pu
+            // avoir lieu (le snapshot ne fait que lire), les anciens médias restent intacts, et
+            // ce cycle doit être compté/retenté comme les échecs partiels ci-dessus. Les
+            // abandons PRÉCOCES (mapping absent, pré-check images) ont leurs propres `return
+            // false` avant que $reachedImageUploadPhase ne passe à true et ne sont jamais comptés
+            // ici, pour ne pas les confondre avec un vrai échec de création.
+            if ($reachedImageUploadPhase && !$creationFailureAlreadyCounted) {
+                $this->imagesCreationFailedCount++;
+                if (count($this->imagesCreationFailedRefs) < 20) {
+                    $this->imagesCreationFailedRefs[] = (string) $dolParentProduct->ref;
+                }
+            }
             return false;
         }
     }
 
     /**
-     * Delete existing images of a Shopify product
+     * Delete ALL existing images of a Shopify product.
+     *
+     * ⚠️ CONSERVÉE pour compatibilité mais N'EST PLUS APPELÉE par syncProductAllImages() depuis
+     * la Story apparier-les-images-une-a-une-au-lieu-de-tout-detruire (AC1) : elle listait ET
+     * supprimait la TOTALITÉ des médias, y compris un surplus non apparié (ajout manuel, vidéo),
+     * et le faisait AVANT toute création de remplaçant — exactement la fenêtre destructive visée
+     * par cette story. syncProductAllImages() calcule désormais lui-même la liste EXACTE à
+     * supprimer (les anciens médias effectivement remplacés, jamais plus) via
+     * deleteSpecificProductMedia() ci-dessous, uniquement APRÈS vérification de la création.
      *
      * @param string $shopifyProductId Shopify product ID
      * @return bool Success status
      */
     private function deleteExistingProductImages($shopifyProductId)
     {
+        $this->log("Starting deletion of existing images for product: " . $shopifyProductId, LOG_DEBUG);
+
+        // 1. Retrieve all existing images (with pagination)
+        $shopifyImages = $this->shopifyApi->getProductImages($shopifyProductId);
+
+        if (empty($shopifyImages)) {
+            $this->log("No existing images found for product: " . $shopifyProductId, LOG_INFO);
+            return true;
+        }
+
+        $this->log("Found " . count($shopifyImages) . " existing images for product: " . $shopifyProductId, LOG_INFO);
+
+        $imagesIds = [];
+        foreach ($shopifyImages as $image) {
+            $imagesIds[] = $image->id;
+        }
+
+        return $this->deleteSpecificProductMedia($imagesIds, $shopifyProductId)['success'];
+    }
+
+    /**
+     * Delete an EXPLICIT, pre-computed set of media IDs for a Shopify product, in batches.
+     *
+     * Story apparier-les-images-une-a-une-au-lieu-de-tout-detruire (AC1) : extrait de l'ancien
+     * deleteExistingProductImages() qui listait ET supprimait TOUT à chaque appel. Cette méthode
+     * ne prend plus AUCUNE décision — l'appelant (syncProductAllImages()) a déjà déterminé quels
+     * médias ont été effectivement remplacés et lesquels doivent rester (surplus non apparié,
+     * échec de création). Elle se contente d'exécuter la suppression, par lots de 50, avec le
+     * même relevé successCount/errorCount que l'implémentation d'origine.
+     *
+     * @param array  $mediaIds         IDs Shopify (gid://shopify/MediaImage/...) à supprimer
+     * @param string $shopifyProductId Shopify product ID
+     * @return array{success: bool, deletedIds: string[], errorCount: int} `success` : true si
+     *         aucun lot n'a échoué (ou si $mediaIds était vide). `deletedIds` : les IDs
+     *         EFFECTIVEMENT confirmés supprimés par Shopify (peut être un sous-ensemble de
+     *         $mediaIds en cas d'échec partiel) — utilisé par l'appelant pour mettre à jour la
+     *         provenance persistée (HIGH, review 3 couches 27/09/2026).
+     */
+    private function deleteSpecificProductMedia(array $mediaIds, $shopifyProductId)
+    {
+        if (empty($mediaIds)) {
+            return array('success' => true, 'deletedIds' => [], 'errorCount' => 0);
+        }
+
         $this->db->begin();
 
         try {
-            $this->log("Starting deletion of existing images for product: " . $shopifyProductId, LOG_DEBUG);
-
-            // 1. Retrieve all existing images (with pagination)
-            $shopifyImages = $this->shopifyApi->getProductImages($shopifyProductId);
-
-            if (empty($shopifyImages)) {
-                $this->log("No existing images found for product: " . $shopifyProductId, LOG_INFO);
-                $this->db->commit();
-                return true;
-            }
-
-            $this->log("Found " . count($shopifyImages) . " existing images for product: " . $shopifyProductId, LOG_INFO);
-
-            // 2. Retrieve image IDs for deletion
-            $imagesIds = [];
-            foreach ($shopifyImages as $image) {
-                $imagesIds[] = $image->id;
-            }
-
-            // 3. Delete images in batches to avoid API limitations
+            // Delete images in batches to avoid API limitations
             $batchSize = 50; // Reasonable batch size
-            $batches = array_chunk($imagesIds, $batchSize);
+            $batches = array_chunk($mediaIds, $batchSize);
 
             $successCount = 0;
             $errorCount = 0;
+            $deletedIds = [];
 
             foreach ($batches as $index => $batch) {
                 $this->log("Processing batch " . ($index + 1) . "/" . count($batches) .
@@ -6079,7 +7300,9 @@ class ImportProducts extends CommonObject
                         !empty($deleteResponse->data->productDeleteMedia->deletedMediaIds)
                     ) {
 
-                        $deletedCount = count($deleteResponse->data->productDeleteMedia->deletedMediaIds);
+                        $batchDeletedIds = $deleteResponse->data->productDeleteMedia->deletedMediaIds;
+                        $deletedIds = array_merge($deletedIds, $batchDeletedIds);
+                        $deletedCount = count($batchDeletedIds);
                         $successCount += $deletedCount;
                         $this->log("Successfully deleted " . $deletedCount . " images in batch " .
                             ($index + 1), LOG_INFO);
@@ -6118,69 +7341,117 @@ class ImportProducts extends CommonObject
 
             $this->db->commit();
             // If all deletions succeeded or no images were found
-            return ($errorCount == 0);
+            return array('success' => ($errorCount == 0), 'deletedIds' => $deletedIds, 'errorCount' => $errorCount);
         } catch (Exception $e) {
             $this->db->rollback();
             $this->log("Exception during deletion of images: " . $e->getMessage(), LOG_ERR);
-            return false;
+            return array('success' => false, 'deletedIds' => [], 'errorCount' => count($mediaIds));
         }
     }
 
     /**
-     * Wait for media to be ready
+     * Wait for media to be ready — attend le statut FINAL (asynchrone) des médias créés.
+     *
+     * ⚠️ CRITICAL (review 3 couches 27/09/2026, story
+     * apparier-les-images-une-a-une-au-lieu-de-tout-detruire) : le statut IMMÉDIAT renvoyé par
+     * `productCreateMedia` (souvent `PROCESSING`/`UPLOADED`) ne prouve RIEN sur l'issue réelle du
+     * traitement Shopify. Un média peut basculer `FAILED` de façon purement asynchrone, APRÈS la
+     * réponse de création — c'est CE polling, et lui seul, qui observe le statut qui fait foi.
+     * L'appelant (`syncProductAllImages()`) DOIT désormais conditionner la suppression des
+     * anciens médias ET l'écriture de l'empreinte composite sur `allReady === true` ici, jamais
+     * sur le statut immédiat de la réponse de création.
      *
      * @param string $shopifyProductId Shopify product ID
-     * @param array $mediaIds Array of media IDs to check
-     * @param int $maxAttempts Maximum number of attempts (default: 10)
-     * @param int $sleepSeconds Seconds to sleep between attempts (default: 2)
-     * @return bool True if all media ready, false otherwise
+     * @param array  $mediaIds         Array of media IDs to check
+     * @param int    $maxAttempts      Maximum number of attempts (default: 10)
+     * @param int    $sleepSeconds     Seconds to sleep between attempts (default: 2)
+     * @return array{allReady: bool, anyFailed: bool, timedOut: bool, statuses: array<string,string>}
+     *         `allReady` : true seulement si TOUS les médias demandés ont atteint READY.
+     *         `anyFailed` : true si au moins un média a atteint le statut terminal FAILED (dans ce
+     *         cas `allReady` est toujours false, et on n'attend pas les tentatives restantes — un
+     *         média FAILED ne redeviendra jamais READY).
+     *         `timedOut` : true si `maxAttempts` a été épuisé sans qu'aucun média n'ait basculé
+     *         FAILED, mais sans que tous n'aient atteint READY non plus (encore PROCESSING/UPLOADED).
+     *         `statuses` : dernier statut observé par média demandé (id, gid complet).
+     *
+     * ⚠️ Re-review 27/09/2026 : interroge désormais `ShopifyApi::getMediaStatusByIds()` (champ
+     * racine `nodes(ids:)`, fragment MediaImage) au lieu de `checkMediaStatus()`
+     * (`product.media(first:50)`, sans pagination). Deux défauts corrigés d'un coup :
+     *  - un produit à plus de 50 médias pouvait laisser un média demandé HORS de la première page,
+     *    jamais vu par le polling ;
+     *  - PLUS GRAVE : un média demandé mais ABSENT de la réponse (page tronquée, suppression
+     *    concurrente...) ne faisait basculer AUCUN indicateur à false — `$allReady` restait à
+     *    `true` par défaut puisque la boucle ne trouvait simplement rien à contredire pour cet
+     *    identifiant. `nodes(ids:)` cible EXACTEMENT les identifiants demandés ; un identifiant
+     *    absent de la réponse (`null`) est maintenant traité comme NON PRÊT, jamais comme prêt par
+     *    défaut.
      */
     private function waitForMediaToBeReady($shopifyProductId, $mediaIds, $maxAttempts = 10, $sleepSeconds = 2)
     {
         $this->log("Waiting for media to be ready for product ID: " . $shopifyProductId, LOG_DEBUG);
 
-        // Prepare media IDs for query (remove prefixes)
-        $mediaIdsForQuery = [];
-        foreach ($mediaIds as $id) {
-            $mediaIdsForQuery[] = str_replace('gid://shopify/MediaImage/', '', $id);
-        }
+        $lastKnownStatuses = [];
 
         // Try up to maxAttempts times
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
-            // Check media status
-            $mediaStatus = $this->shopifyApi->checkMediaStatus($shopifyProductId);
+            $response = $this->shopifyApi->getMediaStatusByIds($mediaIds);
 
-            if (empty($mediaStatus) || empty($mediaStatus->data) || empty($mediaStatus->data->product) || empty($mediaStatus->data->product->media) || empty($mediaStatus->data->product->media->nodes)) {
+            if (empty($response) || empty($response->data) || !isset($response->data->nodes) || !is_array($response->data->nodes)) {
                 $this->log("Media status check failed on attempt " . $attempt, LOG_WARNING);
                 sleep($sleepSeconds);
                 continue;
             }
 
-            // Check if all media are ready
+            // Index par identifiant retourné — ne suppose PAS que l'ordre de la réponse suit
+            // l'ordre des IDs demandés (documenté ainsi par Shopify, mais une correspondance par
+            // id est plus robuste et rend le "absent" trivial à détecter : simplement pas de clé).
+            // Factorisé (re-review 27/09/2026, point 1c) : réutilisé aussi par la vérification des
+            // médias en attente d'un cycle précédent, cf. indexMediaStatusResponseById().
+            $byId = $this->indexMediaStatusResponseById($response);
+
             $allReady = true;
+            $anyFailed = false;
             $readyCount = 0;
-            $totalMedia = count($mediaStatus->data->product->media->nodes);
 
-            foreach ($mediaStatus->data->product->media->nodes as $media) {
-                // Check if this is one of our media
-                $mediaId = str_replace('gid://shopify/MediaImage/', '', $media->id);
+            foreach ($mediaIds as $mediaId) {
+                $status = isset($byId[$mediaId]) ? $byId[$mediaId] : null;
 
-                if (in_array($mediaId, $mediaIdsForQuery)) {
-                    if ($media->status !== 'READY') {
-                        $allReady = false;
-                        $this->log("Media " . $mediaId . " status: " . $media->status . " (not ready)", LOG_DEBUG);
-                    } else {
-                        $readyCount++;
-                        $this->log("Media " . $mediaId . " is ready", LOG_DEBUG);
-                    }
+                if ($status === null) {
+                    // CRITIQUE (re-review 27/09/2026) : un identifiant demandé mais ABSENT de la
+                    // réponse ne doit JAMAIS être traité comme prêt par défaut.
+                    $allReady = false;
+                    $lastKnownStatuses[$mediaId] = 'MISSING_FROM_RESPONSE';
+                    $this->log("Media " . $mediaId . " absent de la réponse nodes() sur la tentative " . $attempt, LOG_WARNING);
+                    continue;
+                }
+
+                $lastKnownStatuses[$mediaId] = $status;
+
+                if ($status === 'FAILED') {
+                    $anyFailed = true;
+                    $allReady = false;
+                    $this->log("Media " . $mediaId . " status: FAILED (terminal, asynchrone)", LOG_ERR);
+                } elseif ($status !== 'READY') {
+                    $allReady = false;
+                    $this->log("Media " . $mediaId . " status: " . $status . " (not ready)", LOG_DEBUG);
+                } else {
+                    $readyCount++;
+                    $this->log("Media " . $mediaId . " is ready", LOG_DEBUG);
                 }
             }
 
-            $this->log("Media ready: " . $readyCount . "/" . count($mediaIdsForQuery) . " on attempt " . $attempt, LOG_DEBUG);
+            $this->log("Media ready: " . $readyCount . "/" . count($mediaIds) . " on attempt " . $attempt, LOG_DEBUG);
+
+            if ($anyFailed) {
+                // Terminal : un média FAILED ne redeviendra jamais READY, inutile d'attendre les
+                // tentatives restantes.
+                $this->log("Aborting poll after " . $attempt . " attempt(s): at least one media reached FAILED", LOG_ERR);
+                return array('allReady' => false, 'anyFailed' => true, 'timedOut' => false, 'statuses' => $lastKnownStatuses);
+            }
 
             if ($allReady) {
                 $this->log("All media are ready after " . $attempt . " attempts", LOG_INFO);
-                return true;
+                return array('allReady' => true, 'anyFailed' => false, 'timedOut' => false, 'statuses' => $lastKnownStatuses);
             }
 
             // Sleep before next attempt
@@ -6188,7 +7459,7 @@ class ImportProducts extends CommonObject
         }
 
         $this->log("Not all media became ready after " . $maxAttempts . " attempts", LOG_WARNING);
-        return false;
+        return array('allReady' => false, 'anyFailed' => false, 'timedOut' => true, 'statuses' => $lastKnownStatuses);
     }
 
     /**
@@ -7410,7 +8681,7 @@ class ImportProducts extends CommonObject
      * @param string $categoryLabel Category label for logging
      * @return bool Success status
      * @since 2.0.33
-     * @version     2.5.7
+     * @version     2.6.0
      */
     private function uploadCategoryImageToCollection($collectionId, $categoryId, $categoryLabel)
     {

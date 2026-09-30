@@ -1,7 +1,7 @@
 -- =====================================================
 -- MIGRATION v2.3.0 -> v2.3.1 (DOLI2SHOP)
 -- Date: 2026-06-23
--- Version: 2.5.3
+-- Version: 2.6.0
 -- Description: Création de la table llx_doli2shop_stores (Epic 47, Story 47-1).
 --              Table de configuration multi-boutiques Shopify par entité.
 --              Seeding de la boutique par défaut effectué en PHP (StoreService::ensureDefaultStore).
@@ -14,6 +14,13 @@
 --              réparation d'une table déjà incomplète est couverte séparément et automatiquement
 --              par doli2shopRepairStoresTableSchema() (lib/doli2shop.lib.php), appelée depuis
 --              modDoli2Shop::init() avant le seeding (AC1).
+--              MàJ story doublon-is-default-boutiques-non-empeche (v2.6.0) : colonne générée
+--              default_key + index unique associé, alignés ici sur sql/llx_doli2shop_stores.sql
+--              (23 colonnes de référence désormais) — même motif de single-source-of-truth que
+--              ci-dessus. Cette branche CREATE ne joue de toute façon plus pour une install déjà
+--              migrée (MigrationManager ne rejoue jamais une version déjà marquée appliquée) : la
+--              protection réelle pour le parc existant est la migration dédiée
+--              update_2.6.0_2.6.0b.sql, câblée séparément avec sa propre clé de version.
 -- Author: P'tite Tête
 -- Copyright 2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
 -- License: http://www.gnu.org/licenses/gpl.html GNU General Public License
@@ -44,6 +51,7 @@ SET @sqlstmt := IF(@exist_table = 0,
         fk_categorie_invoice int(11)      DEFAULT NULL COMMENT ''Catégorie Dolibarr factures (TYPE_INVOICE) boutique (Story 47-5)'',
         fk_categorie_proposal int(11)     DEFAULT NULL COMMENT ''Catégorie Dolibarr devis (TYPE_PROPOSAL) boutique (Story 48-2)'',
         is_default           tinyint(1)   NOT NULL DEFAULT 0,
+        default_key          int(11)      GENERATED ALWAYS AS (IF(is_default = 1, entity, NULL)) VIRTUAL COMMENT ''Colonne generee (story doublon-is-default) : NULL si is_default=0, sinon entity'',
         active               tinyint(1)   NOT NULL DEFAULT 1,
         license_status       varchar(20)  NOT NULL DEFAULT ''unknown'' COMMENT ''Statut licence boutique : valid|invalid|unknown (Story 47-6)'',
         license_checked      datetime     DEFAULT NULL COMMENT ''Dernière vérification licence (Story 47-6)'',
@@ -86,6 +94,14 @@ SET @sqlstmt := IF(@exist = 0,
 PREPARE stmt FROM @sqlstmt;
 EXECUTE stmt;
 DEALLOCATE PREPARE stmt;
+
+-- ⚠️ PAS de bloc gardé ici pour uk_doli2shop_stores_default_key (contrairement à
+-- sql/llx_doli2shop_stores.sql) : cette migration est câblée AVANT update_2.6.0_2.6.0b.sql dans
+-- modDoli2Shop::init() — un rejeu qui l'exécuterait réellement (install jamais migrée) trouverait
+-- la colonne default_key pas encore ajoutée (ADD COLUMN vit dans update_2.6.0_2.6.0b.sql, câblée
+-- après). L'index est donc du ressort EXCLUSIF de cette migration dédiée, jamais dupliqué ici
+-- (SqlMigrationsIntegrationTest rejoue les migrations câblées dans l'ordre de $migrations et
+-- aurait échoué sur "Unknown column 'default_key'" si ce bloc avait été dupliqué ici).
 
 
 -- ============================================================================

@@ -12,7 +12,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.org>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.1.6
  * @link        https://doli2shop.ptitetete.org
  */
@@ -119,10 +119,39 @@ if ($action == 'connect') {
     // aucun mécanisme de refresh, tuant la synchronisation de la boutique. Couvre les DEUX
     // chemins (connexion initiale ET reconnexion 'reconnect:<id>'/'new', cf. $_SESSION
     // ci-dessus) puisqu'ils partagent ce même unique point de construction de l'URL proxy.
+    //
+    // Story 61-3 (AC2/AC9) — annonce de la capacité 'oauth_pickup_v1' : ce module sait
+    // désormais recevoir un pickup_token (admin/oauth_receive.php) plutôt que les credentials
+    // en clair dans l'URL de retour.
+    //
+    // ⚠️ CORRECTION DU 31/08 — LA CONTRAINTE D'ORDRE DE DÉPLOIEMENT EST SUPPRIMÉE, PAS DOCUMENTÉE.
+    //
+    // La première version envoyait la valeur combinée dans `client_capability` :
+    //     'client_capability' => 'token_refresh_v1,oauth_pickup_v1'
+    // Or le proxy EN PRODUCTION AUJOURD'HUI compare par ÉGALITÉ STRICTE
+    // (`$dolibarr_client_capability === 'token_refresh_v1'`, cf. shopify_return.php avant cette
+    // story). Une valeur combinée ne matche donc PAS : `expiring=1` n'est plus posé, et chaque
+    // nouvelle connexion OAuth reçoit SILENCIEUSEMENT un jeton non expirant — régression sur la
+    // story 51-1, invisible jusqu'à l'échéance Shopify du 01/01/2027, où ces boutiques
+    // cesseraient de se synchroniser.
+    //
+    // Un commentaire « ne pas livrer avant le proxy » ne protège de rien : il suffit qu'une
+    // release soit taguée avant un déploiement FTP pour que le parc prenne le défaut. La
+    // solution est donc structurelle, et non procédurale :
+    //
+    //   - `client_capability` conserve EXACTEMENT sa valeur historique scalaire. Un proxy non à
+    //     jour continue de la reconnaître, à l'octet près : aucune régression possible.
+    //   - les capacités étendues voyagent dans un paramètre DISTINCT, `client_capabilities`
+    //     (au pluriel), qu'un ancien proxy ignore purement et simplement.
+    //
+    // Les deux moitiés deviennent ainsi déployables dans n'importe quel ordre.
     $proxy_params = [
         'state' => $state,
         'returnurl' => $return_url,
-        'client_capability' => 'token_refresh_v1'
+        // Valeur héritée, inchangée — lue par les proxys de toutes générations.
+        'client_capability' => 'token_refresh_v1',
+        // Liste étendue — ignorée par un proxy antérieur à la story 61-3.
+        'client_capabilities' => 'token_refresh_v1,oauth_pickup_v1',
     ];
 
     $redirect_url = $oauth_proxy_url . '?' . http_build_query($proxy_params);

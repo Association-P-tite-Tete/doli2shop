@@ -11,7 +11,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       1.0.0
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -147,7 +147,7 @@ $langs->loadLangs(array(
 // Get available sales channels for collections configuration
 // FIX #152 v2.1.2: Moved AFTER access control + improved error handling
 $availablePublications = [];
-if (getDolGlobalString('DOLI2SHOP_STORE_HOSTNAME') && getDolGlobalString('DOLI2SHOP_ACCESS_TOKEN')) {
+if (getDolGlobalString('DOLI2SHOP_STORE_HOSTNAME') && doli2shopCredentialIsConfigured('DOLI2SHOP_ACCESS_TOKEN')) {
     try {
         $shopifyApi = new ShopifyApi($db);
         // Check if API initialization was successful
@@ -636,11 +636,14 @@ if ($action == 'updateConfig') {
         if ($current_tab == 'settings') {
             // Review 49-9 HIGH-2 : pour une boutique SECONDAIRE, location_id peut être encore vide
             // (boutique en cours de configuration) — ne pas bloquer la sauvegarde de l'onglet.
+            // Story secret-app-affiche-en-clair-setup (Task 2, décision n°6) : les 3 credentials
+            // Shopify (shopify_access_token/shopify_api_key/shopify_api_secret_key) ne sont plus
+            // ici — un champ laissé vide ne doit plus bloquer l'enregistrement (leur écran ne les
+            // pré-remplit plus, cf. Task 1). Leur validation de remplacement propre, PAR CHAMP et
+            // testée contre l'état DB + POST, vit plus bas (AC6/AC6bis), après la construction de
+            // $values et $credentialPostValues.
             $required_fields = array(
                 'shopify_store_hostname',
-                'shopify_access_token',
-                'shopify_api_key',
-                'shopify_api_secret_key',
                 'dolibarr_procate'
             );
             if ($perStoreIsDefault || $perStoreStoreId <= 0) {
@@ -677,9 +680,6 @@ if ($action == 'updateConfig') {
             global $dolibarr_main_url_root;
             $values = array(
                 'shopify_store_hostname' => GETPOST('shopify_store_hostname', 'alphanohtml') ?: '',
-                'shopify_access_token' => GETPOST('shopify_access_token', 'alphanohtml') ?: '',
-                'shopify_api_key' => GETPOST('shopify_api_key', 'alphanohtml') ?: '',
-                'shopify_api_secret_key' => GETPOST('shopify_api_secret_key', 'alphanohtml') ?: '',
                 'shopify_location_id' => GETPOST('shopify_location_id', 'alphanohtml') ?: '',
                 'dolibarr_procate' => GETPOST('dolibarr_procate', 'int') ?: '0',
                 'dolibarr_customer_category' => GETPOST('dolibarr_customer_category', 'int') ?: '0',
@@ -688,6 +688,42 @@ if ($action == 'updateConfig') {
                 'max_orders_per_sync' => GETPOST('max_orders_per_sync', 'int') ?: 10,
                 'products_per_cron_update' => GETPOST('products_per_cron_update', 'int') ?: 10,
             );
+
+            // Story secret-app-affiche-en-clair-setup (Task 2, décision n°5) : les 3 credentials
+            // Shopify ne sont plus jamais pré-remplis à l'écran (Task 1) — le formulaire ne peut
+            // donc plus compter sur un round-trip pour les préserver. Un champ POST vide pour l'un
+            // d'eux signifie désormais « ne pas y toucher », jamais « écraser par une chaîne
+            // vide » : on ne l'ajoute à $values QUE si le POST correspondant est non vide.
+            // ConfigurationMigrator::saveConfigurationValue() force l'écriture même pour une
+            // valeur vide (cf. constat de la story) — c'est cette omission volontaire de la clé,
+            // pas un test sur la valeur, qui protège le secret existant (AC2). Logique extraite en
+            // fonction PURE (lib/doli2shop.lib.php) pour rester testable sans démarrer cette page.
+            //
+            // Re-review (HIGH AC10) : cette page ne lit plus JAMAIS la valeur réelle d'un credential
+            // sensible — uniquement doli2shopCredentialIsConfigured() (booléen). $credentialPostValues
+            // reste une exception assumée et documentée : ce sont des valeurs SAISIES par
+            // l'utilisateur dans CETTE requête (jamais lues depuis la base), transmises telles
+            // quelles à ConfigurationMigrator::saveConfigurationValue() pour l'écriture — leur
+            // trajet n'a rien à voir avec le rendu HTML de cette page.
+            $credentialPostValues = array();
+            $currentCredentialDbConfigured = array();
+            foreach (doli2shopSetupCredentialFieldDefinitions() as $credFieldName => $credDef) {
+                $credentialPostValues[$credFieldName] = (string) GETPOST($credFieldName, 'alphanohtml');
+                $currentCredentialDbConfigured[$credDef['const']] = doli2shopCredentialIsConfigured($credDef['const']);
+            }
+            $values = array_merge($values, doli2shopFilterNonEmptyCredentialPostValues($credentialPostValues));
+
+            // Story secret-app-affiche-en-clair-setup (Task 3, décision n°6 amendée Validate 29/09,
+            // AC6/AC6bis) : validation de remplacement PAR CHAMP, INDÉPENDANTE pour chacun des 3 —
+            // jamais un OR global. Ne s'applique pas à une boutique secondaire, qui n'écrit de
+            // toute façon jamais ces constantes globales (garde-fou existant, cf.
+            // $globalCredentialFields plus bas) — même condition que shopify_location_id ci-dessus.
+            if ($perStoreIsDefault || $perStoreStoreId <= 0) {
+                $missingCredentialFields = doli2shopValidateCredentialReplacement($currentCredentialDbConfigured, $credentialPostValues);
+                if (!empty($missingCredentialFields)) {
+                    throw new Exception($langs->trans("ErrorFieldRequired") . ': ' . $langs->trans(reset($missingCredentialFields)));
+                }
+            }
 
             // v2.2.1: Alertes proactives (Story 30.1) — sauvegardées via constantes Dolibarr
             dolibarr_set_const($db, 'DOLI2SHOP_ALERT_ENABLED', GETPOST('alert_enabled', 'int') ? '1' : '0', 'chaine', 0, '', $conf->entity);
@@ -1102,8 +1138,14 @@ if ($action == 'updateConfig') {
                     }
                 } else {
                     // Review 49-9 MEDIUM-3 : depuis une boutique SECONDAIRE, ne JAMAIS réécrire les
-                    // credentials globaux (champs hidden postés avec les valeurs de la défaut ; un HTML
-                    // modifié pourrait sinon altérer la config globale depuis l'onglet d'une secondaire).
+                    // credentials globaux (un HTML modifié pourrait sinon altérer la config globale
+                    // depuis l'onglet d'une secondaire).
+                    // Story secret-app-affiche-en-clair-setup (Task 4, AC4) : vérifié intact et
+                    // toujours suffisant avec la nouvelle construction de $values (Task 2) — les 3
+                    // champs credentials n'y figurent désormais que si le POST correspondant est
+                    // non vide (au lieu d'y figurer toujours), mais restent interceptés ici par leur
+                    // nom de champ dès qu'ils y figurent, quelle que soit la raison. Pas de second
+                    // mécanisme ajouté.
                     $globalCredentialFields = array('shopify_store_hostname', 'shopify_access_token', 'shopify_api_key', 'shopify_api_secret_key');
                     if (!$perStoreIsDefault && $perStoreStoreId > 0 && in_array($fieldName, $globalCredentialFields, true)) {
                         continue;
@@ -1218,7 +1260,7 @@ doli2shopRenderAdminTopBar($db);
 // All configuration is retrieved directly using getDolGlobalString/Int/Bool functions
 
 // Check if Shopify API is configured (v2.0.27)
-$shopify_configured = !empty(getDolGlobalString('DOLI2SHOP_API_KEY')) && !empty(getDolGlobalString('DOLI2SHOP_ACCESS_TOKEN'));
+$shopify_configured = doli2shopCredentialIsConfigured('DOLI2SHOP_API_KEY') && doli2shopCredentialIsConfigured('DOLI2SHOP_ACCESS_TOKEN');
 
 // ========================================
 // v2.2.0 Story 4.2: Health Dashboard Widget
@@ -1456,11 +1498,22 @@ if ($current_tab == 'settings' || !$shopify_configured) {
             print '</tr>';
         }
 
-        // Hidden inputs to preserve values on form submission
+        // Hidden input to preserve the hostname on form submission — jamais un secret, cf. juste
+        // en dessous pour les 3 credentials.
         print '<input type="hidden" name="shopify_store_hostname" value="' . htmlspecialchars(getDolGlobalString('DOLI2SHOP_STORE_HOSTNAME'), ENT_QUOTES, 'UTF-8') . '">';
-        print '<input type="hidden" name="shopify_access_token" value="' . htmlspecialchars(getDolGlobalString('DOLI2SHOP_ACCESS_TOKEN'), ENT_QUOTES, 'UTF-8') . '">';
-        print '<input type="hidden" name="shopify_api_key" value="' . htmlspecialchars(getDolGlobalString('DOLI2SHOP_API_KEY'), ENT_QUOTES, 'UTF-8') . '">';
-        print '<input type="hidden" name="shopify_api_secret_key" value="' . htmlspecialchars(getDolGlobalString('DOLI2SHOP_API_SECRET_KEY'), ENT_QUOTES, 'UTF-8') . '">';
+
+        // Story secret-app-affiche-en-clair-setup (Task 1/2, AC1) : le round-trip par
+        // <input type="hidden"> des 3 credentials Shopify disparaît — un champ `hidden` reste tout
+        // aussi exposé côté source HTML qu'un champ visible (cf. constat de la story). Remplacé
+        // par le même bloc masqué (statut Configuré/Non configuré + champ vide) que le mode
+        // manuel ci-dessous, pour que les 2 modes passent par la même fonction. Classe `oddeven`
+        // sur les 3 lignes : même convention que la bannière et « Connected Store » ci-dessus dans
+        // cette branche (pas d'alternance pair/impair préexistante ici).
+        // Re-review LOW : mention « boutique par défaut » ajoutée sous le bloc quand la boutique
+        // ADMIN active est une boutique SECONDAIRE — ces 3 credentials restent GLOBAUX (jamais
+        // per-store), donc toujours ceux de la boutique par défaut, quelle que soit la boutique
+        // affichée dans la barre de contexte.
+        print doli2shopRenderCredentialFieldsBlock($langs, array('oddeven', 'oddeven', 'oddeven'), $currentAdminStoreIsSecondary);
     } else {
         // Manual configuration: show all fields (only when NOT using OAuth)
         print '<tr class="oddeven">';
@@ -1484,23 +1537,18 @@ if ($current_tab == 'settings' || !$shopify_configured) {
         print '<td><input type="text" name="shopify_store_hostname" value="' . getDolGlobalString('DOLI2SHOP_STORE_HOSTNAME') . '" size="40"> <span class="help-icon" title="' . $langs->trans("ShopifyStoreHostnameHelp") . '">?</span></td>';
         print '</tr>';
 
-        // Access token
-        print '<tr class="impair">';
-        print '<td class="titlefieldcreate required">' . $langs->trans("ShopifyAccessToken") . '</td>';
-        print '<td><input type="text" name="shopify_access_token" value="' . getDolGlobalString('DOLI2SHOP_ACCESS_TOKEN') . '" size="40"> <span class="help-icon" title="' . $langs->trans("ShopifyAccessTokenHelp") . '">?</span></td>';
-        print '</tr>';
-
-        // API Key
-        print '<tr class="pair">';
-        print '<td class="titlefieldcreate required">' . $langs->trans("ShopifyApiKey") . '</td>';
-        print '<td><input type="text" name="shopify_api_key" value="' . getDolGlobalString('DOLI2SHOP_API_KEY') . '" size="40"> <span class="help-icon" title="' . $langs->trans("ShopifyApiKeyHelp") . '">?</span></td>';
-        print '</tr>';
-
-        // API Secret Key
-        print '<tr class="impair">';
-        print '<td class="titlefieldcreate required">' . $langs->trans("ShopifyApiSecretKey") . '</td>';
-        print '<td><input type="text" name="shopify_api_secret_key" value="' . getDolGlobalString('DOLI2SHOP_API_SECRET_KEY') . '" size="40"> <span class="help-icon" title="' . $langs->trans("ShopifyApiSecretKeyHelp") . '">?</span></td>';
-        print '</tr>';
+        // Story secret-app-affiche-en-clair-setup (Task 1/2, AC1, AC10) : les 3 lignes
+        // Access token / API Key / API Secret Key n'affichent plus jamais la valeur réelle en
+        // `value="..."` — remplacées par le même bloc masqué (statut Configuré/Non configuré +
+        // champ vide + aide) que le mode OAuth ci-dessus. La classe CSS `required` disparaît avec
+        // elles (ces 3 champs ne sont plus dans $required_fields, cf. Task 2 — l'aide « laisser
+        // vide pour conserver » porte déjà l'information correcte).
+        // Re-review LOW : alternance impair/pair/impair restaurée à l'identique du rendu
+        // d'origine (hostname=pair juste au-dessus, puis access_token/api_key/api_secret_key,
+        // puis location_id=pair juste en dessous — la séquence complète doit rester pair/impair/
+        // pair/impair/pair, inchangée). Mention « boutique par défaut » ajoutée en vue secondaire,
+        // même motif que la branche OAuth ci-dessus.
+        print doli2shopRenderCredentialFieldsBlock($langs, array('impair', 'pair', 'impair'), $currentAdminStoreIsSecondary);
     }
     
     // Location ID
@@ -1683,6 +1731,10 @@ if ($current_tab == 'settings' || !$shopify_configured) {
     print '<br><center>';
     print '<input type="submit" class="button" value="' . $langs->trans("Save") . '">';
     print '</center>';
+
+    // Story 63-23 : le <form> ouvert (ligne ~1231) n'était jamais refermé sur ce chemin —
+    // fermeture implicite de fin de document, fragile si un futur <form> venait s'imbriquer.
+    print '</form>';
 
 } elseif ($current_tab == 'orders' && $shopify_configured) {
 
@@ -2987,6 +3039,9 @@ if ($current_tab == 'settings' || !$shopify_configured) {
     
 } else {
     print '<div class="warning">'.$langs->trans("ShopifyConfigurationRequired").'</div>';
+    // Story 63-23 : ce 4e chemin (tab hors settings/orders/products, ex. ?tab=xyz) partage le
+    // meme <form> jamais referme sur ce chemin - meme correctif que le chemin settings.
+    print '</form>';
 }
 
 // v2.1.6: Bouton Enregistrer et fermeture formulaire déplacés avant section Maintenance
@@ -3006,7 +3061,7 @@ function isProductConfigurationComplete($entity)
     try {
         // Check required Shopify settings using constants (v2.0.27)
         if (empty(getDolGlobalString('DOLI2SHOP_STORE_HOSTNAME', '', $entity)) ||
-            empty(getDolGlobalString('DOLI2SHOP_ACCESS_TOKEN', '', $entity)) ||
+            !doli2shopCredentialIsConfigured('DOLI2SHOP_ACCESS_TOKEN') ||
             empty(getDolGlobalString('DOLI2SHOP_LOCATION_ID', '', $entity))) {
             return false;
         }
@@ -3035,7 +3090,7 @@ function isOrderConfigurationComplete($entity)
     try {
         // Check required Shopify settings using constants (v2.0.27)
         if (empty(getDolGlobalString('DOLI2SHOP_STORE_HOSTNAME', '', $entity)) ||
-            empty(getDolGlobalString('DOLI2SHOP_ACCESS_TOKEN', '', $entity)) ||
+            !doli2shopCredentialIsConfigured('DOLI2SHOP_ACCESS_TOKEN') ||
             empty(getDolGlobalString('DOLI2SHOP_LOCATION_ID', '', $entity))) {
             return false;
         }

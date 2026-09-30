@@ -8,7 +8,7 @@
  * @package     ShopifyIntegration
  * @subpackage  Class
  * @category    class
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.0.0
  * @author      P'tite Tête <doli2shop@ptitetete.com>
  * @copyright   2022-2025 Robert Steinbacher<robert.steinbacher@xivtech.de>
@@ -278,6 +278,36 @@ class ShopifyApi
             $entity = (isset($conf->entity) && $conf->entity > 0) ? (int)$conf->entity : 1;
         }
 
+        // Story loadconfiguration-is-default-sans-verification-entity (AC1, durci en Review 3
+        // couches 2026-09-26, finding MEDIUM) : si $store->entity diffère de l'entité de CE
+        // chargement, traiter $store EXACTEMENT comme s'il n'avait jamais été fourni — pour TOUT
+        // ce qui suit dans cette méthode, pas seulement isDefaultStore. La 1ère version de ce
+        // correctif ne gardait la garde que sur isDefaultStore : un $store en désaccord d'entité
+        // écrasait quand même hostname/access_token/api_key/api_secret/location_id/refresh_token
+        // dans $config (bloc plus bas) et laissait $this->fkStore pointer sur le rowid d'une
+        // boutique ÉTRANGÈRE à l'entité chargée — soit exactement le risque que la garde
+        // isDefaultStore prétendait écarter, contourné par un autre chemin. En nullant $store ICI,
+        // AVANT tout calcul qui en dépend (storeRowid, cacheKey, l'écrasement des 5 champs de
+        // connexion, l'overlay P2 conditionné par storeRowid>0), la suite de la méthode retombe
+        // intégralement sur le chemin legacy de l'entité de chargement, sans qu'aucune valeur de
+        // la boutique étrangère ne soit jamais lue. Un désaccord signale un bug appelant
+        // (confusion Multi Company, construction manuelle d'un $store hors StoreService) — jamais
+        // observé dans le dépôt à ce jour (tous les appelants passent un $store issu de
+        // StoreService, déjà filtré par entité) — journalisé LOG_ERR, jamais silencieux. Si
+        // $store->entity est absent (objet minimal ne portant pas cette propriété), on ne peut pas
+        // constater de désaccord : comportement inchangé (chemin store normal), pour ne pas casser
+        // un appelant qui construirait un $store partiel légitime.
+        if ($store !== null && isset($store->entity) && (int) $store->entity !== $entity) {
+            $this->log(
+                'loadConfiguration() - $store->entity (' . (int) $store->entity . ') diffère de '
+                . 'l\'entité de chargement (' . $entity . ') — traité comme si $store n\'avait '
+                . 'jamais été fourni (bug appelant probable : boutique hors entité passée à '
+                . 'forStore())',
+                LOG_ERR
+            );
+            $store = null;
+        }
+
         // Déterminer le rowid boutique pour la clé de cache composite
         $storeRowid = ($store !== null && !empty($store->rowid)) ? (int)$store->rowid : 0;
         $cacheKey   = $entity . ':' . $storeRowid;
@@ -288,7 +318,9 @@ class ShopifyApi
         // Hotfix 2.5.2 (AC2) : porter is_default sur l'instance, INDÉPENDAMMENT du cache de
         // config ci-dessous (qui ne mémorise que $this->config, jamais les autres propriétés
         // d'instance) — sinon un hit de cache laisserait $this->isDefaultStore à sa valeur par
-        // défaut (false) pour une boutique par défaut passée via forStore().
+        // défaut (false) pour une boutique par défaut passée via forStore(). $store est déjà
+        // nullé ci-dessus en cas de désaccord d'entité : cette ligne dérive donc naturellement
+        // isDefaultStore=false dans ce cas, sans logique dupliquée.
         $this->isDefaultStore = ($store !== null) && !empty($store->is_default);
 
         // Check cache first to avoid unnecessary reloads (TRUE OPTIMIZATION)
@@ -860,10 +892,26 @@ class ShopifyApi
      * DOLI2SHOP_* (copie « boutique par défaut / chemin historique »). Chaque écriture est
      * vérifiée individuellement — même pattern que oauth_receive.php — jamais silencieuse.
      *
+     * Story write-default-store-constants-flag-reconnect-hors-contrat (AC1, Task 1 — décision
+     * assumée) : la 4ᵉ écriture (remise à zéro de DOLI2SHOP_TOKEN_RECONNECT_REQUIRED) reste
+     * volontairement HORS du contrat de retour ($ok ne reflète que le triplet de jeton). Une
+     * autre option (faire échouer $ok si cette 4ᵉ écriture échoue seule) romprait la distinction
+     * que le hotfix 2.5.2 (point 3, cf. persistRefreshedToken()) a précisément établie entre
+     * « le jeton est persisté » et « le flag est à jour » : côté chemin fkStore===0 (plus bas,
+     * persistRefreshedToken()), le retour de CETTE méthode EST le retour de persistRefreshedToken()
+     * lui-même — un échec isolé du flag ferait alors passer par markReconnectRequired(), qui
+     * repose « reconnexion requise » sur les deux copies, y compris celle qui vient de recevoir
+     * un jeton pourtant valide. Le flag se corrige de lui-même au prochain refresh réussi (nouvel
+     * appel à cette méthode) ou via fetchFreshTokenState() (point 2 : adoption de la copie la
+     * plus fraîche) — auto-guérison jugée suffisante pour ne pas complexifier le contrat de
+     * retour. Journalisé distinctement (AC2) pour ne jamais confondre cet échec isolé avec un
+     * échec de persistance du jeton lui-même.
+     *
      * @param  string $accessToken  Nouvel access_token
      * @param  string $refreshToken Nouveau refresh_token
      * @param  string $expiresAt    Échéance calculée
-     * @return bool true si les 3 écritures ont réussi
+     * @return bool true si les 3 écritures du TRIPLET DE JETON ont réussi — indépendamment du
+     *              résultat de la remise à zéro du flag reconnexion (voir docblock ci-dessus)
      * @since 2.5.2
      */
     private function writeDefaultStoreTokenConstants(string $accessToken, string $refreshToken, string $expiresAt): bool
@@ -873,7 +921,19 @@ class ShopifyApi
         $ok = $ok && (dolibarr_set_const($this->db, 'DOLI2SHOP_REFRESH_TOKEN', $refreshToken, 'chaine', 0, '', $this->entity) > 0);
         $ok = $ok && (dolibarr_set_const($this->db, 'DOLI2SHOP_TOKEN_EXPIRES_AT', $expiresAt, 'chaine', 0, '', $this->entity) > 0);
         if ($ok) {
-            dolibarr_set_const($this->db, 'DOLI2SHOP_TOKEN_RECONNECT_REQUIRED', '0', 'yesno', 0, '', $this->entity);
+            $flagReset = (dolibarr_set_const($this->db, 'DOLI2SHOP_TOKEN_RECONNECT_REQUIRED', '0', 'yesno', 0, '', $this->entity) > 0);
+            if (!$flagReset) {
+                // AC2 : journalisé À PART des 3 écritures ci-dessus — le triplet de jeton, lui,
+                // a réussi ($ok est vrai à ce stade). Ne pas confondre avec un échec de
+                // persistance du jeton lui-même (message distinct, cf. Dev Notes de la story).
+                $this->log(
+                    'writeDefaultStoreTokenConstants() - le triplet de jeton a été persisté avec '
+                    . 'succès mais la remise à zéro de DOLI2SHOP_TOKEN_RECONNECT_REQUIRED a échoué '
+                    . 'seule (entity=' . $this->entity . ') — non bloquant (hors contrat de retour,'
+                    . ' cf. docblock), le flag se corrigera au prochain refresh réussi',
+                    LOG_ERR
+                );
+            }
         }
         return $ok;
     }
@@ -1613,6 +1673,162 @@ class ShopifyApi
 
         // Should not reach here, but safety fallback
         throw new Exception("GraphQL API error: Max retries exceeded");
+    }
+
+    /**
+     * Vérifie qu'une réponse GraphQL Shopify (celle renvoyée par executeGraphQL(), TELLE QUELLE)
+     * est exploitable ET qu'elle porte bien la valeur attendue au chemin donné sous `data`.
+     *
+     * Story 62-6 (AC1/AC2/AC3, F1 — jeton Shopify révoqué => faux succès) : extraction du signal
+     * déjà répété 3 fois avant cette fonction — `ShopifyOrderManager::fetchHistoricalOrdersBatch()`
+     * (Story 63-18), `ShopifyApi::deleteProduct()` (Story 58-5),
+     * `ShopifyProductImporter::getProductsBatch()`/`getProductFromShopify()`. `executeGraphQL()`
+     * ne lève JAMAIS d'exception sur un 401 persistant (après refresh+retry) ni sur une erreur
+     * GraphQL de premier niveau : elle renvoie la réponse Shopify décodée telle quelle (`errors`
+     * présent — tableau OU chaîne, format également observé empiriquement chez Shopify, cf.
+     * `:1543-1551` — et/ou `data` absent).
+     *
+     * Le signal générique seul (`!isset($response->data) || isset($response->errors)`, modèle
+     * 63-18) traite un `data` présent mais dont le sous-chemin attendu est absent comme un SUCCÈS
+     * à valeur vide — c'est le comportement VOULU par 63-18 (`data->orders` absent = plage de
+     * commandes épuisée, pas une erreur) mais l'INVERSE de ce qu'exige un comptage
+     * (`data->productsCount` absent = schéma Shopify cassé, jamais un total à 0 déguisé en
+     * succès — gap trouvé par le Validate du 2026-09-23). D'où le paramètre `$path`, sur le
+     * modèle `deleteProduct()`/58-5, qui vérifie `!isset($response->data->productDelete)` — un
+     * chemin SPÉCIFIQUE, pas la seule présence générique de `data`.
+     *
+     * @param mixed $response Réponse décodée de ShopifyApi::executeGraphQL() — stdClass attendu
+     *                         (json_decode($body, false)) ; un tableau associatif est également
+     *                         accepté (defensive code historique des deux endpoints get_count).
+     * @param array $path Chemin des clés à lire sous `data`, ex. ['productsCount', 'count'].
+     *                     Un chemin vide se limite au signal générique (présence de `data`, pas
+     *                     d'`errors`) — à ne PAS utiliser pour un comptage (cf. ci-dessus).
+     * @return array{success: bool, value: mixed} `success` false si la réponse est inexploitable
+     *              (pas de `data`, `errors` présent et non vide — tableau ou chaîne — ou chemin
+     *              absent/valeur null à un maillon quelconque du chemin).
+     * @since 2.6.0
+     */
+    public static function extractGraphQLDataPath($response, array $path)
+    {
+        $failure = ['success' => false, 'value' => null];
+
+        if ($response === null) {
+            return $failure;
+        }
+
+        $isArrayResponse = is_array($response);
+
+        if (!$isArrayResponse && !is_object($response)) {
+            return $failure;
+        }
+
+        $data = $isArrayResponse ? ($response['data'] ?? null) : ($response->data ?? null);
+        $errors = $isArrayResponse ? ($response['errors'] ?? null) : ($response->errors ?? null);
+
+        // (CORRECTION VALIDATE 2026-09-23 / AC1) : `errors` en chaîne non vide compte aussi
+        // comme un échec — ne jamais se limiter à is_array($errors) (cf. :1543-1551 ci-dessus).
+        if ($data === null || !empty($errors)) {
+            return $failure;
+        }
+
+        $cursor = $data;
+        foreach ($path as $key) {
+            if (is_array($cursor)) {
+                if (!isset($cursor[$key])) {
+                    return $failure;
+                }
+                $cursor = $cursor[$key];
+            } elseif (is_object($cursor)) {
+                if (!isset($cursor->$key)) {
+                    return $failure;
+                }
+                $cursor = $cursor->$key;
+            } else {
+                return $failure;
+            }
+        }
+
+        return ['success' => true, 'value' => $cursor];
+    }
+
+    /**
+     * Exécute le comptage produits Shopify (`get_count`) et retourne un tableau JSON-ready +
+     * code HTTP, prêt à `http_response_code()`/`echo json_encode()` par l'appelant.
+     *
+     * Story 62-6, CRITICAL (review 3 couches 2026-09-23) : avant ce correctif, la logique
+     * (appel `executeGraphQL()` + lecture de `extractGraphQLDataPath()` + calcul de `$total` +
+     * `throw` sur échec) vivait DUPLIQUÉE dans les 2 fichiers ajax, et le seul test de câblage
+     * existant (`AjaxGetCountGraphQLFailureGuardTest`) prouvait par lecture de source que les
+     * fichiers APPELAIENT `extractGraphQLDataPath()`, jamais qu'ils UTILISAIENT réellement son
+     * retour — une mutation locale à un fichier ajax (`$total = isset(...) ? ... : 0` en
+     * ignorant `$countSignal`, ou un `throw` remplacé par `$total = 0;`) survivait donc en
+     * silence. En centralisant TOUTE la logique ici, dans une fonction pure testée à
+     * l'EXÉCUTION avec un double de `$shopifyApi` (n'importe quel objet exposant
+     * `executeGraphQL($data)`), ces mutations ne peuvent plus se nicher que dans CE point
+     * unique, couvert par `ShopifyApiGraphQLDataPathTest`/`AjaxGetCountGraphQLFailureGuardTest`.
+     * Les 2 fichiers ajax n'ont plus qu'à appeler cette fonction et échoer son retour tel quel.
+     *
+     * @param object $shopifyApi Objet exposant executeGraphQL($data) — ShopifyApi réel ou double
+     *                            de test (voir `AjaxGetCountGraphQLFailureGuardTest`).
+     * @param string $logPrefix  Préfixe de contexte pour `dol_syslog()` (nom du fichier ajax
+     *                            appelant + action), ex. `'wizard_sync.php (get_count)'`.
+     * @return array{httpCode:int, body:array<string,mixed>}
+     * @since 2.6.0
+     */
+    public static function buildProductsCountAjaxResponse($shopifyApi, $logPrefix)
+    {
+        try {
+            $countQuery = array('query' => '{ productsCount { count } }');
+            $countResult = $shopifyApi->executeGraphQL($countQuery);
+
+            $countSignal = self::extractGraphQLDataPath($countResult, array('productsCount', 'count'));
+            if (!$countSignal['success']) {
+                throw new Exception('Shopify GraphQL response unusable while counting products: ' . json_encode($countResult));
+            }
+
+            return array(
+                'httpCode' => 200,
+                'body' => array(
+                    'success' => true,
+                    'total' => (int) $countSignal['value'],
+                ),
+            );
+        } catch (Exception $e) {
+            return self::buildProductsCountAjaxFailure($logPrefix, $e);
+        }
+    }
+
+    /**
+     * Formate une réponse ajax d'échec uniforme pour `get_count` : message générique côté client,
+     * détail complet (classe, message, fichier:ligne) en `dol_syslog(..., LOG_ERR)` — jamais perdu,
+     * jamais exposé au client. Pattern déjà en place dans `ajax/sync_products_batch.php` depuis la
+     * Story 63-19/LOW 10 ; centralisé ici (Story 62-6, MEDIUM review 3 couches) pour que
+     * `ajax/wizard_sync.php` cesse de renvoyer `$e->getMessage()` brut au client — lequel, depuis
+     * ce correctif, contient le `json_encode()` intégral de la réponse Shopify.
+     *
+     * Public (pas seulement appelée par `buildProductsCountAjaxResponse()` ci-dessus) : les 2
+     * fichiers ajax l'utilisent aussi directement pour uniformiser l'échec de construction de
+     * `ShopifyApi`/`ShopifyApi::forStore()` (avant même le premier appel GraphQL).
+     *
+     * @param string    $logPrefix Préfixe de contexte pour `dol_syslog()`.
+     * @param Exception $e         Exception capturée.
+     * @return array{httpCode:int, body:array<string,mixed>}
+     * @since 2.6.0
+     */
+    public static function buildProductsCountAjaxFailure($logPrefix, Exception $e)
+    {
+        dol_syslog(
+            $logPrefix . ': ' . get_class($e) . ': ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine(),
+            LOG_ERR
+        );
+
+        return array(
+            'httpCode' => 500,
+            'body' => array(
+                'success' => false,
+                'message' => 'An internal error occurred while counting products. See server logs for details.',
+            ),
+        );
     }
 
     /**
@@ -3580,9 +3796,20 @@ class ShopifyApi
     /**
      * Create product media
      *
+     * MEDIUM (re-review 3 couches 27/09/2026, story
+     * apparier-les-images-une-a-une-au-lieu-de-tout-detruire) : découpe en lots d'au plus 200 —
+     * même prudence et même marge que getMediaStatusByIds() ci-dessous et
+     * fillInventoryReferenceQuantities() (~:4071, `nodes(ids:)` borné à 250 par Shopify). Un très
+     * gros catalogue d'images pour un seul produit ne doit jamais risquer une mutation rejetée
+     * pour dépassement de taille. Chaque lot est exécuté séparément et les résultats (`media`,
+     * `mediaUserErrors`) sont fusionnés — transparent pour l'appelant (même forme de réponse)
+     * tant que le nombre de médias reste sous la limite d'un lot, ce qui couvre la quasi-totalité
+     * des cas réels.
+     *
      * @param string $productId Shopify product ID
      * @param array $mediaInputs Media inputs
-     * @return object Response from Shopify
+     * @return object Réponse fusionnée : `$response->data->productCreateMedia->media` et
+     *                `->mediaUserErrors` concaténés sur tous les lots
      */
     public function createProductMedia($productId, $mediaInputs)
     {
@@ -3602,12 +3829,32 @@ class ShopifyApi
             }
         }';
 
-        $variables = [
-            'media' =>  $mediaInputs,
-            'productId' =>  'gid://shopify/Product/' . $productId
-        ];
+        $allMedia = [];
+        $allMediaUserErrors = [];
 
-        return $this->executeGraphQL(['query' => $query, 'variables' => $variables]);
+        foreach (array_chunk($mediaInputs, 200) as $chunk) {
+            $variables = [
+                'media' =>  $chunk,
+                'productId' =>  'gid://shopify/Product/' . $productId
+            ];
+
+            $response = $this->executeGraphQL(['query' => $query, 'variables' => $variables]);
+
+            if (isset($response->data->productCreateMedia->media) && is_array($response->data->productCreateMedia->media)) {
+                $allMedia = array_merge($allMedia, $response->data->productCreateMedia->media);
+            }
+            if (isset($response->data->productCreateMedia->mediaUserErrors) && is_array($response->data->productCreateMedia->mediaUserErrors)) {
+                $allMediaUserErrors = array_merge($allMediaUserErrors, $response->data->productCreateMedia->mediaUserErrors);
+            }
+        }
+
+        $result = new \stdClass();
+        $result->data = new \stdClass();
+        $result->data->productCreateMedia = new \stdClass();
+        $result->data->productCreateMedia->media = $allMedia;
+        $result->data->productCreateMedia->mediaUserErrors = $allMediaUserErrors;
+
+        return $result;
     }
 
 
@@ -4423,6 +4670,13 @@ class ShopifyApi
     /**
      * Check the status of media for a product
      *
+     * ⚠️ CONSERVÉE pour compatibilité mais N'EST PLUS APPELÉE par
+     * `ImportProducts::waitForMediaToBeReady()` depuis la re-review 3 couches du 27/09/2026 (story
+     * apparier-les-images-une-a-une-au-lieu-de-tout-detruire) : elle liste les 50 premiers médias
+     * du PRODUIT (`media(first: 50)`, sans pagination), ce qui laissait un identifiant simplement
+     * absent de la page sans jamais faire échouer le polling. Remplacée par
+     * getMediaStatusByIds() ci-dessous, qui cible exactement les identifiants demandés.
+     *
      * @param string $productId Shopify product ID
      * @return object Response from Shopify
      */
@@ -4446,6 +4700,66 @@ class ShopifyApi
         ];
 
         return $this->executeGraphQL(['query' => $query, 'variables' => $variables]);
+    }
+
+    /**
+     * Récupère le statut FINAL d'un ensemble PRÉCIS d'identifiants de médias, via le champ
+     * racine `nodes(ids:)` de l'Admin GraphQL API — remplace checkMediaStatus() dans
+     * ImportProducts::waitForMediaToBeReady() (re-review 3 couches 27/09/2026, story
+     * apparier-les-images-une-a-une-au-lieu-de-tout-detruire) : checkMediaStatus() listait les 50
+     * premiers médias du PRODUIT (`media(first: 50)`, sans pagination) — un produit à plus de 50
+     * médias, ou un identifiant simplement absent de cette page (course concurrente, permission),
+     * ne remontait AUCUNE erreur, et le polling pouvait croire « tout est prêt » sans jamais avoir
+     * vu le statut réel du média concerné.
+     *
+     * `nodes(ids:)` cible EXACTEMENT les identifiants passés — aucune pagination nécessaire, et un
+     * identifiant introuvable revient explicitement à `null` dans le tableau de réponse (jamais
+     * silencieusement absent).
+     *
+     * MEDIUM (re-review 3 couches 27/09/2026) : `nodes(ids:)` est borné à 250 identifiants par
+     * appel côté Shopify — découpe en lots d'au plus 200 (même marge que
+     * fillInventoryReferenceQuantities(), ~:4071), résultats fusionnés en une seule réponse.
+     *
+     * @param array $mediaIds IDs Shopify (gid://shopify/MediaImage/...) dont on veut le statut
+     * @return object Réponse fusionnée — `$response->data->nodes` (tableau, `null` pour tout ID
+     *                introuvable ; chaque entrée non nulle porte `id`, `status`, `mediaContentType`
+     *                via le fragment MediaImage)
+     * @since 2.6.0
+     */
+    public function getMediaStatusByIds(array $mediaIds)
+    {
+        $query = '
+        query getMediaStatusByIds($ids: [ID!]!) {
+            nodes(ids: $ids) {
+                id
+                ... on MediaImage {
+                    status
+                    mediaContentType
+                }
+            }
+        }';
+
+        $allNodes = [];
+
+        foreach (array_chunk(array_values($mediaIds), 200) as $chunk) {
+            $variables = [
+                'ids' => $chunk,
+            ];
+
+            $this->log("getMediaStatusByIds - Fetching status for " . count($chunk) . " media (lot)", LOG_DEBUG);
+
+            $response = $this->executeGraphQL(['query' => $query, 'variables' => $variables]);
+
+            if (isset($response->data->nodes) && is_array($response->data->nodes)) {
+                $allNodes = array_merge($allNodes, $response->data->nodes);
+            }
+        }
+
+        $result = new \stdClass();
+        $result->data = new \stdClass();
+        $result->data->nodes = $allNodes;
+
+        return $result;
     }
 
     /**
@@ -5474,7 +5788,7 @@ GRAPHQL;
      * @param string $collectionId The collection ID (legacy resource ID)
      * @return object|null Collection details or null if not found
      * @since 2.0.31
-     * @version     2.5.7 Story 51-2 : ajout lecture `sources` + fallback undefinedField
+     * @version     2.6.0 Story 51-2 : ajout lecture `sources` + fallback undefinedField
      */
     public function getCollectionDetails($collectionId)
     {
@@ -5639,7 +5953,7 @@ GRAPHQL;
      * @param string $collectionId The collection ID (legacy resource ID)
      * @return bool True if Smart Collection, false if Manual Collection
      * @since 2.0.31
-     * @version     2.5.7 Story 51-2 : tolérance `sources` (CollectionConditionsSource/CollectionSubCollectionsSource)
+     * @version     2.6.0 Story 51-2 : tolérance `sources` (CollectionConditionsSource/CollectionSubCollectionsSource)
      */
     public function isSmartCollection($collectionId)
     {

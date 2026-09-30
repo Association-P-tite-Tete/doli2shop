@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.5.7
+ * @version     2.6.0
  * @since       2.1.6
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -106,18 +106,17 @@ if ($targetStore === null) {
     exit;
 }
 
-// Cas voisin (anomalie connue, story backlog `doublon-is-default-boutiques-non-empeche`) : si
+// Cas voisin (anomalie normalement empêchée depuis la migration update_2.6.0_2.6.0b.sql — index
+// unique uk_doli2shop_stores_default_key — mais possible sur une installation restée en état
+// incohérent AVANT cette migration, cf. story `doublon-is-default-boutiques-non-empeche`) : si
 // PLUSIEURS lignes portent `is_default = 1`, la résolution retient la première de
 // `StoreService::getAll()`, qui peut différer de la boutique affichée comme courante par
 // `admin/setup.php`. On ne bloque pas (la boutique retenue reste nommée explicitement dans le
 // texte de confirmation ci-dessous), mais on journalise l'anomalie pour qu'elle soit corrigée à
-// la source.
-$defaultStoreCount = 0;
-foreach ($allStores as $storeForAnomalyCheck) {
-    if (!empty($storeForAnomalyCheck->is_default)) {
-        $defaultStoreCount++;
-    }
-}
+// la source. Détection mutualisée avec `StoreService::getDefault()` via
+// `doli2shopCountDefaultStores()` (AC6, Validate 2026-09-23, point 6) — jamais une seconde boucle
+// de comptage ad hoc en parallèle.
+$defaultStoreCount = doli2shopCountDefaultStores($allStores);
 if ($defaultStoreCount > 1) {
     dol_syslog("Doli2Shop disconnect_oauth: anomalie " . $defaultStoreCount . " boutiques is_default=1 pour l'entite " . $conf->entity . " - resolution retenue sur la boutique #" . (int) $targetStore->rowid, LOG_WARNING);
 }
@@ -173,8 +172,28 @@ if ($action == 'disconnect' && verifToken()) {
         }
     }
 
-    // 2. Purge des commandes synchronisées, bornée à la boutique déconnectée (AC2). Les tables
-    //    `doli2shop_products_mapping` et `doli2shop_collections_mapping` promises par l'ancien
+    // Story reconnect-flag-jamais-remis-a-zero-disconnect-oauth.md (AC2 — DÉCISION DU MAINTENEUR,
+    // review 3 couches 2026-09-23) : REMPLACE le choix initial du Dev Agent Record ci-dessous
+    // (conservé en historique) — le flag "reconnexion requise"
+    // (`stores.token_reconnect_required` / DOLI2SHOP_TOKEN_RECONNECT_REQUIRED) EST DÉSORMAIS
+    // REMIS À 0 aussi à la déconnexion, sur la boutique EXPLICITEMENT ciblée par CE disconnect
+    // ($targetStore résolu ci-dessus par doli2shopResolveOAuthDisconnectStore() — jamais un
+    // contexte implicite) : ligne `stores` toujours, constante DOLI2SHOP_TOKEN_RECONNECT_REQUIRED
+    // seulement si $targetIsDefault (invariant Epic 47 inchangé). Best-effort journalisé (voir
+    // doli2shopResetReconnectRequiredAfterDisconnect(), lib/doli2shop.lib.php) — appelé APRÈS le
+    // $db->commit() plus bas, jamais dans ce bloc $error/rollback : un échec isolé de cette
+    // écriture ne doit jamais faire échouer un disconnect par ailleurs réussi.
+    //
+    // Ancien choix (Task 1 du Dev Agent Record, ne plus s'y fier) : « ne pas toucher au flag au
+    // disconnect », justifié par le fait qu'une reconnexion complète le remet de toute façon à 0.
+    // Ce raisonnement restait vrai, mais laissait un signal "reconnexion requise" affiché pour une
+    // boutique déjà déconnectée — trompeur pour l'admin entre le disconnect et la prochaine
+    // reconnexion. Le mainteneur a tranché pour l'effacement immédiat.
+
+    // 2. Purge des commandes synchronisées, bornée à la boutique déconnectée (AC2 de
+    //    deconnexion-oauth-ignore-le-multi-boutiques.md, story distincte de celle documentée
+    //    juste au-dessus). Les tables `doli2shop_products_mapping` et
+    //    `doli2shop_collections_mapping` promises par l'ancien
     //    texte n'existent dans AUCUN fichier sql/ du dépôt (AC3, Validate constat n°3) — le code
     //    mort correspondant est retiré, sans y substituer de nouvelle purge (llx_doli2shop_products
     //    et llx_doli2shop_collections ne sont pas touchées ; llx_doli2shop_collections n'a d'ailleurs
@@ -199,6 +218,12 @@ if ($action == 'disconnect' && verifToken()) {
 
     if (!$error) {
         $db->commit();
+
+        // AC2 (décision mainteneur, review 3 couches 2026-09-23) : best-effort journalisé, APRÈS
+        // le commit ci-dessus, jamais dans le $error/rollback qui gouverne la suppression des
+        // constantes et la purge des commandes plus haut.
+        doli2shopResetReconnectRequiredAfterDisconnect($db, $storeService, $targetStore, $targetIsDefault, (int) $conf->entity);
+
         dol_syslog("Doli2Shop disconnect_oauth: Successfully disconnected Shopify OAuth for entity " . $conf->entity . " (store #" . $targetStoreId . ")", LOG_INFO);
         setEventMessages($langs->trans("ShopifyDisconnectSuccess"), null, 'mesgs');
         header('Location: ' . dol_buildpath('/doli2shop/admin/setup.php', 1) . '?tab=settings&disconnected=1&store_id=' . $targetStoreId);
