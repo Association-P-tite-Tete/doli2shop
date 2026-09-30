@@ -54,6 +54,55 @@
 4. **En cas de souci de synchronisation**, ouvrez le nouvel écran de journal et téléchargez le CSV
    avant de nous écrire — cela remplace un envoi de `dolibarr.log` complet.
 
+## SITE — 30 septembre 2026 : LES E-MAILS TRANSACTIONNELS UTILISENT ENFIN UN VRAI SMTP
+
+> Hotfix `hotfix-site-smtp-transactionnel`. Constat de production (30/09, deux essais réels du
+> mainteneur, destinataires sur des fournisseurs différents) : une demande de déliaison éligible
+> est marquée « envoyé » en base, mais l'e-mail n'arrive jamais. Cause racine : aucun `.env`
+> n'existe en production, donc les e-mails transactionnels (déliaison, renvoi de licence, rappels
+> d'expiration, tickets support) retombaient systématiquement sur la remise locale de
+> l'hébergeur — un succès rapporté côté serveur, indépendant du sort réel du message une fois
+> sorti du serveur. Les campagnes, elles, délivrent déjà : elles lisent leur configuration SMTP
+> dans les réglages du site (Emailing > Paramètres), jamais dans `.env`.
+
+### 🐛 Les e-mails transactionnels utilisent désormais la même configuration SMTP que les campagnes
+
+- **Correctif** : les e-mails transactionnels lisent désormais la configuration SMTP dans l'ordre
+  suivant, en s'arrêtant à la première source renseignée — les réglages SMTP du site (la même
+  source que les campagnes, qui délivrent déjà) ; à défaut, le fichier de configuration unique ;
+  à défaut, les variables d'environnement historiques. Si aucune des trois n'est configurée,
+  l'envoi échoue désormais **explicitement** et s'affiche comme un échec dans le journal
+  d'événements — jamais plus un faux « envoyé ».
+- **Expéditeur cohérent** : l'adresse et le nom d'expéditeur suivent désormais la source SMTP
+  réellement retenue, plutôt qu'une adresse figée indépendante du compte utilisé — un défaut qui
+  aurait fait rejeter les messages par certains fournisseurs (Gmail/Workspace notamment) si un
+  vrai SMTP avait été branché sans ce correctif.
+- ⚠️ **Trouvé pendant une relecture indépendante, pas dans la rédaction initiale** : sans un
+  chargement correctement protégé du fichier de configuration unique, la nouvelle logique aurait
+  fait planter **chaque** envoi transactionnel avec une erreur technique brute — y compris quand
+  les réglages SMTP du site suffisaient déjà. Corrigé avant toute mise en production. De même,
+  l'envoi ne peut désormais plus jamais faire remonter d'erreur technique non gérée jusqu'à
+  l'appelant (formulaire de déliaison public, écran d'administration, tâche planifiée d'expiration,
+  formulaire de support) : un échec d'envoi se traduit toujours par un résultat propre, jamais par
+  une page cassée ou une tâche planifiée interrompue en cours de lot.
+- **Aucune action mainteneur requise au déploiement** : les réglages SMTP déjà en place pour les
+  campagnes (Emailing > Paramètres) sont réutilisés tels quels par les e-mails transactionnels,
+  sans rien à reconfigurer.
+- **Preuve mesurée, pas seulement lue dans le code** : la sélection de source est testée en
+  tableaux purs (sans base ni réseau), et un envoi réel est exercé contre un serveur SMTP de test
+  local qui exige une authentification — reproduisant le cas réel où le compte authentifié diffère
+  de l'adresse d'expédition affichée — pour vérifier que les deux ne sont jamais confondus. Un
+  scénario supplémentaire vérifie qu'en l'absence de toute configuration, l'échec est immédiat
+  (aucune tentative réseau) plutôt que de retomber sur l'ancien comportement.
+- **Hors périmètre de ce hotfix**, déjà tracé en story backlog séparée : le bornage de délai de la
+  configuration SMTP des campagnes elle-même (chemin distinct, non touché ici) et l'oracle
+  temporel résiduel (~10 secondes) déjà documenté lors du correctif précédent sur ce même chemin.
+
+> ⚠️ **Procédure de vérification post-déploiement (mainteneur, pas un agent)** : soumettre une
+> déliaison réelle sur la licence de test déjà liée à une boutique de test, vérifier la réception
+> de l'e-mail (dossier principal vs indésirable, expéditeur cohérent), et confirmer dans l'écran
+> d'événements le badge « envoyé » — jamais « échec » — avant de considérer l'incident clos.
+
 ## MODULE 2.6.0 — DÉTAIL COMPLET : CHAQUE CYCLE DE SYNCHRONISATION LAISSE SA TRACE
 
 > Ce détail story par story n'est pas embarqué dans le paquet d'installation (garde-fou de
