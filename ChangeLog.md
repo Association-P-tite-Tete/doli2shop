@@ -54,6 +54,87 @@
 4. **En cas de souci de synchronisation**, ouvrez le nouvel écran de journal et téléchargez le CSV
    avant de nous écrire — cela remplace un envoi de `dolibarr.log` complet.
 
+## SITE — 30 septembre 2026 : DÉLIER UNE LICENCE SHOPIFY LAISSE ENFIN L'ABONNEMENT « INACTIF »
+
+> Hotfix `hotfix-site-deliaison-abonnement-reste-actif`. Constat de production (30/09, test réel
+> du mainteneur) : une licence de test liée puis déliée via le self-service
+> (`shopify-app/unlink-serial.php`) reste affichée **« ACTIVE / Abonnement actif »** en rouvrant
+> l'app Shopify, alors qu'aucune licence n'est plus rattachée à la boutique. Cause racine :
+> la liaison d'une licence DoliStore crée une ligne `shopify_subscriptions` "pseudo-abonnement"
+> (`subscription_id = 'dolistore_<serial>'`, `status = 'active'`) qui n'est PAS un abonnement
+> Shopify Billing réel — un simple marqueur. La déliaison ne remettait que `license_id` à `NULL`,
+> jamais `status` : la ligne survivait indéfiniment `active` sans licence, et cinq endroits du
+> site faisaient confiance à ce seul champ pour afficher « actif ».
+
+### 🐛 Une licence déliée ne laisse plus derrière elle un abonnement fantôme « actif »
+
+- **Correctif à la source (Fix 1)** : la déliaison — self-service (`unlink-serial.php`) **et**
+  back-office mainteneur (`admin/license_edit.php`, même défaut exact) — annule désormais le
+  pseudo-abonnement DoliStore orphelin (`status = 'canceled'`, `canceled_at` renseigné) **dans la
+  même transaction** que le retrait de la licence. Un **vrai** abonnement Shopify Billing payé
+  séparément (souscrit via Shopify, jamais via une licence DoliStore) n'est pas affecté : il
+  continue d'exister tel quel, comportement strictement inchangé.
+- **Balayage complet du site** pour tout autre chemin détachant une licence d'une boutique
+  (suppression d'abonnement/de licence, révocation, webhook de désinstallation, cron
+  d'expiration) : aucun autre ne crée cet état orphelin — les suppressions retirent la ligne
+  entière plutôt que de la laisser `active` sans licence, la révocation ne touche jamais le lien
+  boutique, et les chemins webhook ne concernent que de vrais abonnements Shopify Billing.
+- **Défense en profondeur (Fix 2)** : un prédicat partagé (`PseudoSubscriptionPolicy`) est branché
+  aux cinq points de lecture qui calculaient « abonnement actif » sur la seule foi du `status` —
+  l'app Shopify elle-même et trois écrans d'administration du module (Licence, Diagnostic, Santé)
+  affichaient une licence « valide » alors qu'aucune n'était rattachée. Ce filet neutralise aussi
+  tout résidu déjà présent en production avant ce correctif.
+- ⚠️ **Trouvé et corrigé par deux passes de review 3 couches indépendantes, pas dans la rédaction
+  initiale** : le prédicat de défense en profondeur ci-dessus était bien **appelé** pour décider si
+  le statut devait s'afficher « actif », mais plusieurs replis (l'app Shopify pour une boutique
+  sans licence chargée, et le champ imbriqué `subscription.status` de trois réponses du module)
+  réinjectaient ensuite la valeur **brute** du statut en base — jamais passée au crible du même
+  prédicat. Pour un résidu déjà orphelin en production avant le déploiement de ce hotfix, ces
+  replis auraient donc continué d'afficher « actif », exactement le bug que ce hotfix prétend
+  fermer. Corrigé avant toute mise en production.
+- ⚠️ **Le premier filet de test posé pour ce correctif s'est lui-même révélé insuffisant**, et a dû
+  être durci sur alerte d'une seconde review : il cherchait une forme de code précise à interdire
+  (« liste noire ») — une reformulation strictement équivalente (un opérateur `?:`/`??`, une
+  variable intermédiaire) rétablissait le bug sans que le filet s'en aperçoive. Remplacé par une
+  vérification qui lit réellement la structure du code (même lexeur que PHP) et n'autorise qu'un
+  ensemble fermé de formes exactes pour chacun de ces replis — toute autre forme, quelle qu'elle
+  soit, est désormais rejetée.
+- **Deux incohérences supplémentaires corrigées sur le même principe** (trouvées par la seconde
+  review) : un écran du module pouvait recevoir `subscription.status: 'canceled'` (déjà corrigé
+  ci-dessus) **et**, dans le même appel, `subscription_canceled: false` — les deux champs étaient
+  calculés à partir de deux sources différentes du statut. Les deux dérivent désormais de la même
+  décision. Par ailleurs, une réactivation ne réinitialise plus la date d'annulation que pour un
+  pseudo-abonnement DoliStore — un vrai abonnement Shopify Billing réellement annulé garde
+  désormais sa date réelle, y compris si une licence DoliStore est liée par la suite à la même
+  boutique.
+- **Signalé au mainteneur, non traité ici (story séparée à ouvrir)** : la ré-liaison d'une licence
+  DoliStore réactive inconditionnellement `status = 'active'` de la ligne d'abonnement existante,
+  y compris quand il s'agit d'un vrai abonnement Shopify Billing par ailleurs annulé/suspendu côté
+  Shopify — comportement préexistant à ce hotfix, non introduit par lui, mais rencontré pendant
+  l'investigation.
+- Un cinquième point de lecture, sans appelant connu vérifié (ni le module, ni le JavaScript du
+  site), est fermé (HTTP 410) plutôt que corrigé défensivement — même traitement que
+  `linkSerial()` sur ce même fichier (story 61-12).
+- **Traçage** : l'événement de déliaison enregistre désormais si un pseudo-abonnement orphelin a
+  été fermé à cette occasion, pour distinguer ce cas d'un vrai abonnement Shopify Billing dans
+  l'historique.
+- **Ce que ce correctif NE change PAS** : ni la synchronisation de données, ni le téléchargement
+  du module — les deux mécanismes réels qui les autorisent vérifient déjà la présence d'une
+  licence, pas le seul statut d'abonnement. Seul l'**affichage** était trompeur.
+- **Non-régression vérifiée** : un abonnement Shopify Billing réel sans licence DoliStore
+  rattachée (cas légitime, un marchand qui paie directement via Shopify) continue de s'afficher
+  « actif » exactement comme avant, sous ses deux formes réelles observées en production.
+- **Re-liaison d'une licence précédemment déliée** : la date d'annulation n'est plus laissée
+  périmée sur la ligne réactivée — sans ce correctif, les écrans d'administration (fiche
+  abonnement, fiche licence) auraient affiché un abonnement de nouveau actif à côté d'une date
+  d'annulation passée, trompeuse de la même façon que le défaut principal de ce hotfix.
+- **Tests** : logique de décision couverte par exécution (fonctions pures, sans connexion à une
+  base), et son câblage à chaque point de lecture verrouillé par un garde-fou qui échoue si l'un
+  des cinq sites est un jour débranché. Suite complète du site rejouée, verte.
+- **Action mainteneur après déploiement** : une requête de mesure (lecture seule) est fournie pour
+  compter, en production, les pseudo-abonnements déjà orphelins avant ce correctif — une requête
+  corrective séparée, commentée, reste à exécuter manuellement après revue de ce résultat.
+
 ## SITE — 30 septembre 2026 : LES E-MAILS TRANSACTIONNELS UTILISENT ENFIN UN VRAI SMTP
 
 > Hotfix `hotfix-site-smtp-transactionnel`. Constat de production (30/09, deux essais réels du
