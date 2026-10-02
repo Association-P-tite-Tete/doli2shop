@@ -58,6 +58,160 @@
 4. **En cas de souci de synchronisation**, ouvrez le nouvel écran de journal et téléchargez le CSV
    avant de nous écrire — cela remplace un envoi de `dolibarr.log` complet.
 
+## SITE — 2 octobre 2026 : LA LICENCE D'UN ABONNÉ SHOPIFY SUIT ENFIN SA PÉRIODE PAYÉE
+
+> Story `cycle-de-vie-licences-shopify-billing`. **Site uniquement** (`website/`, une migration SQL et
+> cinq fichiers de langue de l'app embarquée) ; **aucun fichier du module Dolibarr** n'est modifié et
+> le contrat d'API est inchangé (mêmes champs ; un champ additif `canceled_until` sur chacun des quatre points de lecture : `check`, `status`, `get-license-by-shop`, `validate-dolibarr`). Constat de
+> départ : `licenses.expires_at` d'une licence payée par Shopify était posée **une seule fois** à
+> l'activation et jamais prolongée ; toutes les lectures (app, téléchargement, API, cron) se calquent
+> sur cette date — un abonné mensuel aurait été coupé à J+30. Aucun abonné mensuel n'existe en
+> production aujourd'hui : le défaut était théorique, le premier mensuel l'aurait rendu réel.
+
+### Ce que ça change pour vos clients
+
+- **L'échéance d'une licence Shopify suit `currentPeriodEnd` (+ 3 jours de marge)** et reste tenue à
+  jour : un abonné qui se renouvelle n'est plus jamais coupé. Shopify n'envoie aucun webhook de
+  renouvellement : une **relecture quotidienne** (étape 0 du cron d'expiration, zéro ligne de crontab à
+  ajouter) lit chaque abonnement par `node(id:)` avec le jeton stocké de la boutique.
+- **Annuler un abonnement ne coupe plus l'accès tout de suite** : la licence reste valide, le
+  téléchargement et la synchronisation continuent jusqu'à la fin de la période payée (dernière fin de
+  période lue + 3 jours). L'app affiche « Abonnement annulé — accès jusqu'au JJ/MM » avec un bouton de
+  réabonnement. Se réabonner avant l'échéance ne coupe rien ; **après** l'échéance, le réabonnement
+  remet la licence en service **sans ressaisie du numéro de série**.
+- **Désinstaller l'app** reste la seule déconnexion (jeton révoqué), mais le lien licence↔boutique est
+  conservé : réinstaller avant l'échéance retrouve la licence sans ressaisie. Une **déliaison
+  volontaire d'une licence DoliStore** reste une déconnexion immédiate (inchangé).
+- **Plus d'avertissement « votre licence expire » (J-30 / J-7) pour un abonné actif** : un mensuel
+  l'aurait reçu le jour même de son activation. Les annulés, gelés et désinstallés le reçoivent encore
+  (la date est alors définitive).
+- L'écran de l'app affiche « Prochain renouvellement : <date> » pour un abonné actif, à la place d'un
+  décompte « Expire dans N jours » faux (5 langues).
+
+### 🔧 Mécanique
+
+- **Politique pure** `database/ShopifyBillingLifecyclePolicy.php` (échéance, monotonie, candidats,
+  décision par lecture, définition unique « annulé mais payé ») et runner
+  `shopify-app/billing/lib/subscription_period_sync.php` ; réseau injecté, aucune base ni appel
+  Shopify dans les tests. Lecture réseau hors transaction, ligne relue `FOR UPDATE` et décision
+  recalculée sur la ligne fraîche (le webhook peut passer entre-temps).
+- **Une lecture qui échoue n'écrit jamais** (réseau, HTTP ≠ 200, `errors`, `node` nul…). Un 401/403
+  n'est qu'**un compteur** : la boutique n'est marquée désinstallée qu'après **3 nuits consécutives**
+  d'échec d'authentification (un jeton simplement régénéré ne crée plus de trou de prolongation) ;
+  `expires_at` n'est jamais modifié sur un échec. Temps borné : 10 s par appel, 120 s au total,
+  reprise le lendemain, les plus urgentes d'abord.
+- **`expires_at` n'est jamais raccourci** (une prolongation commerciale posée à la main survit),
+  sauf changement de plan détecté. `revoked` / `suspended` ne sont jamais touchées. Une licence
+  `expired` ou `canceled` d'un abonnement réel **actif** est remise `active` (webhook, callback et
+  relecture partagent le même code : même état final quel que soit l'ordre).
+- **Successeur d'un changement de plan** : la ligne garde l'ancien identifiant (CANCELLED côté Shopify)
+  tant que le webhook n'est pas passé ; un statut non ACTIVE n'est jamais appliqué sans avoir cherché
+  un abonnement ACTIVE d'un autre identifiant (adopté ; plusieurs candidats = aucune écriture).
+- **Alerte de péremption** : boutique payeuse dont la dernière lecture réussie date de plus de 48 h
+  et dont l'échéance tombe dans les 48 h, ou payeur actif sans jeton -> ERROR dans le journal du cron
+  et événement `shopify_period_sync_stale` (au plus un par boutique et par 24 h).
+- **Lecteurs de statut alignés** : l'app, `checkSubscription`, `getStatus`, `validate-dolibarr` et
+  `get-license-by-shop` appellent tous la même définition (`isCanceledButPaid`) ; la branche Shopify de
+  `get-license-by-shop` **compare enfin `expires_at`** (elle ne comparait aucune date).
+  `cancelSubscription` et `syncSubscriptionStatus` (appelée automatiquement par le module à l'ouverture
+  de l'onglet licence) **ne posent plus `licenses.status = canceled`** pour un abonnement réel annulé.
+- La requête d'expiration du cron est **inchangée** (octet pour octet, verrouillée par un hash) : une
+  seule règle, la date, aucune exemption Shopify.
+- Migration `015_add_subscription_period_synced_at.sql` (idempotente par `information_schema`,
+  MySQL 5.7+ / MariaDB 10.3+, aucun backfill) : `period_synced_at`, `period_sync_auth_failures`. Le
+  runner tolère son absence (WARNING, sans compteur ni suivi de péremption).
+- Outil de test corrigé : une chaîne interpolée valant exactement `)` tronquait le corps d'une méthode
+  dans les garde-fous par tokens.
+
+### 🔒 Garde-fous ajoutés par la revue 3 couches du 02/10
+
+- **Webhook tardif de l'ancien abonnement** : après un changement de plan (ou une annulation suivie d'un
+  réabonnement), le `CANCELLED` de l'**ancien** identifiant pouvait arriver après l'`ACTIVE` du nouveau,
+  réécrire `subscription_id` et passer la ligne `canceled` : le filet ne la relisait plus et la licence
+  expirait alors que le client paie. Désormais un statut non actif pour un identifiant qui n'est plus celui
+  de la ligne **n'écrit rien** (réponse 200), et le filet relit aussi les lignes `canceled` dont la licence
+  est « annulée mais payée » non échue, pour **adopter le successeur** ACTIVE.
+- **401/403 sur 3 nuits consécutives, vraiment consécutives** : tout résultat autre qu'un 401/403 (y
+  compris 5xx ou réseau) remet le compteur à 0 ; deux échecs comptés doivent être espacés d'au moins 20 h
+  (un passage manuel ne compte pas pour une nuit de plus) ; une réinstallation remet le compteur à 0 ; une
+  boutique passée `app_installed = 0` par le filet reste signalée (ERROR + événement) tant que sa licence est
+  payée non échue.
+- **Le cron n'expire plus un payeur dont on n'a pas pu relire l'état** : pour une licence liée à un
+  abonnement réel `active` dont la dernière relecture réussie date de plus de 48 h (ou jamais), l'expiration
+  (et l'e-mail « licence expirée ») est différée jusqu'à `expires_at` + 7 jours, avec une ERROR journalisée ;
+  au-delà, expiration normale. La requête d'expiration reste identique, la décision se prend en PHP.
+  Jamais pour une boutique **désinstallée** ou **sans jeton** (le filet ne pouvait de toute façon pas la lire :
+  expiration normale). L'ERROR n'est journalisée (et comptée) qu'**une fois par 24 h et par boutique**, pas sept
+  nuits d'alertes identiques.
+- **Avertissements J-30/J-7** : supprimés seulement si la ligne est réelle `active` **et** la synchro date de
+  moins de 48 h ; sinon on avertit normalement.
+- Un intervalle de facturation absent ou hors `ENUM` (`EVERY_90_DAYS`…) n'est jamais écrit (journalisé, pas
+  d'exception chaque nuit) ; une licence `lifetime` n'est jamais réécrite ni expirée par un webhook ou le filet.
+
+### ⚠️ Limites assumées et suites
+
+- **Annulation dans les heures qui suivent un renouvellement non encore relu** : un `CANCELLED` n'a pas de
+  `currentPeriodEnd` (null hors ACTIVE, documenté par Shopify) et rien ne permet d'inférer sûrement qu'un
+  renouvellement a été payé (annulation normale relue pendant la grâce, gel non payé, redélivrance du webhook).
+  Si la boutique renouvelle puis annule avant la relecture nocturne, l'échéance reste « dernière fin de période
+  lue + 3 jours » : le client perd la période qu'il vient de payer. Fenêtre assumée et documentée (arbitrage M2) ;
+  une tentative d'inférence a été écrite puis **retirée** (elle offrait une période entière à toute annulation
+  normale).
+- **Panne de relecture de plus de 48 h** : pendant cette panne, un payeur mensuel peut recevoir l'avertissement
+  J-30 (compromis retenu : ne jamais priver d'avertissement un client que la relecture ne voit plus). Un abonnement
+  **gelé puis annulé** retrouve l'accès au plus 3 jours (marge de grâce) après sa dernière fin de période lue.
+- **Intervalle de facturation hors ENUM** (`EVERY_90_DAYS`, inconnu) : règle unique pour le webhook, le callback
+  et le filet — on n'invente JAMAIS ni prix ni intervalle : prix et nom confirmés écrits, `billing_interval` de la
+  ligne conservé (nouvelle ligne : valeur par défaut de la colonne), `expires_at` depuis la fin de période confirmée
+  + 3 jours quand elle existe, type de licence dérivé de l'intervalle conservé. ERROR journalisée avec la valeur
+  brute et comptée (événement `billing_interval_unsupported`), une fois par 24 h et par boutique.
+- **Licence introuvable, révoquée ou suspendue** (à la lecture, ou devenue telle entre la lecture et l'écriture) :
+  aucun domaine autorisé, rien de lié, rien de réactivé, aucun événement « réactivée ». La ligne licence est
+  **verrouillée en début d'activation** (`SELECT status … FOR UPDATE` : lecture courante, pas le snapshot InnoDB, qui
+  ne verrait pas une révocation admin tardive) et « bloquée » se décide sur CE résultat — jamais sur le nombre de
+  lignes de l'UPDATE (qui vaut 0 quand les valeurs sont identiques : webhook et callback dans la même seconde, cas
+  courant ; un client qui vient de payer ne doit jamais être bloqué). Le webhook, jusque-là en autocommit, passe par
+  une transaction courte (begin, verrou, écriture, commit, rollback sur erreur).
+- **Client qui a PAYÉ et dont la licence est bloquée** : événement `paid_license_blocked` (identifiant de licence,
+  source, raison — aucune donnée personnelle) + ERROR, une fois par nuit et par boutique, pour que le support le
+  voie ; le client reçoit un message l'invitant à contacter le support.
+- **Intervalle hors ENUM sans fin de période confirmée** : jamais d'échéance d'un an inventée — `expires_at` =
+  maintenant + 30 jours (le filet prolonge chaque nuit tant que Shopify confirme ACTIVE). Limite connue : l'étiquette
+  `shopify_annual` d'une telle licence neuve (défaut de colonne ANNUAL ; les plans Doli2Shop sont mensuel/annuel
+  uniquement).
+- **Changement de plan** : le plan **confirmé par Shopify** l'emporte sur le paramètre `new_plan` (non signé) ; le
+  repli 250 / 25 € en dur ne s'applique que si Shopify n'a pas répondu.
+- **Changement de plan annuel -> mensuel** : l'échéance est **raccourcie** (voulu : le plan change, la date suit
+  la période du nouvel abonnement) ; mensuel -> annuel la prolonge.
+- Le texte des avertissements J-30/J-7 d'un abonné **annulé** ne propose pas le réabonnement (suite).
+- Les listes « expirent dans 30 jours » du back-office (`admin/index.php`, `admin/licenses.php`,
+  `Database::getExpiringLicenses()`) ne sont pas encore alignées (LOW, reporté).
+- Le runner n'a **jamais été exécuté** hors tests (la base locale est la production) : voir l'action
+  mainteneur ci-dessous.
+
+### ✅ Actions mainteneur avant/après déploiement
+
+1. **Avant le déploiement, sur une base jetable** (MySQL 5.7+ et MariaDB 10.3+) : rejouer la migration 015
+   **deux fois de suite** ; le second passage ne doit émettre aucun `ALTER`.
+2. Lancer la **migration 015** (`admin/migrate.php`, « Exécuter toutes les migrations en attente ») : trois
+   colonnes (`period_synced_at`, `period_sync_auth_failures`, `period_sync_last_failure_at`).
+3. **Avant le prochain cron de 02:00** : premier passage en lecture `php cron/sync_shopify_billing_periods.php
+   --dry-run` (affiche le plan d'actions, n'écrit rien ; lit Shopify une fois par boutique) ; confronter à
+   votre connaissance du parc, en particulier la boutique de test de l'association (la doc ne
+   dit pas si un abonnement de test se renouvelle comme un vrai). À observer au dry-run : que Shopify renvoie
+   bien `currentPeriodEnd` et `test` (champs vérifiés dans la doc Admin API 2026-04, jamais encore lus en réel).
+4. **Juste après le déploiement, lancer un passage réel** (`php cron/sync_shopify_billing_periods.php`, sans
+   option) : sans cela, `get-license-by-shop` (qui compare désormais `expires_at`) est appelé avant la première
+   prolongation d'un abonné dont la date serait déjà passée.
+5. Requête de lecture seule pour repérer les licences Shopify passées `canceled` par l'ancien
+   `syncSubscriptionStatus` (elles ne sont remises `active` qu'au réabonnement, ou par le filet si
+   l'abonnement est actif) :
+   `SELECT l.id, l.serial_number, l.status, l.expires_at, s.status AS subscription_status FROM licenses l JOIN
+   shopify_subscriptions s ON s.license_id = l.id WHERE l.source = 'shopify' AND l.status = 'canceled' AND
+   s.subscription_id NOT LIKE 'dolistore\_%';`
+6. Vérifier que le cron d'expiration tourne réellement en production (requêtes de vérification dans la
+   story) : sans lui, rien n'expire et le runner chaîné ne tourne pas non plus.
+
 ## SITE — 2 octobre 2026 : UNE BOUTIQUE DONT LA LICENCE EST DÉLIÉE PEUT ENFIN EN RELIER UNE
 
 > Hotfix `hotfix-site-deliaison-religature-impossible`, suite du correctif du 30/09. Après une
