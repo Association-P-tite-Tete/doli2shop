@@ -40,6 +40,10 @@
 - **Client avec un préfixe de table de base de données personnalisé (`≠ llx_`)** : les migrations
   SQL du module s'appliquent désormais correctement — un défaut qui bloquait la mise à jour du
   schéma sans ce correctif (dossier support Europe Loisirs).
+- **Erreur fatale « Cannot redeclare function dol_time_plus_duree() » corrigée** : selon l'ordre de
+  chargement des bibliothèques Dolibarr, elle pouvait arrêter une page, un webhook, une tâche
+  planifiée ou l'API (signalée en combinant Doli2Shop avec un autre module). Le module utilise
+  désormais la fonction du cœur Dolibarr.
 
 ### À faire par vous après la mise à jour
 
@@ -678,6 +682,25 @@ présentait toujours comme un secret à provisionner et à régénérer périodi
 - **Aucune action n'est requise côté client** : ce changement ne touche à aucune logique de
   vérification de signature (déjà figée par le cutover ci-dessus), uniquement à une exigence de
   configuration devenue sans objet.
+
+## MODULE 2.6.0 — DÉTAIL COMPLET : LE MODULE NE PEUT PLUS FAIRE PLANTER LE CHARGEMENT DU CŒUR DOLIBARR (`dol_time_plus_duree`)
+
+### 🔴 Un polyfill du module pouvait provoquer « Cannot redeclare function dol_time_plus_duree() »
+
+`lib/compatibility.lib.php` déclarait sa propre `dol_time_plus_duree()` (3 paramètres) alors que le cœur
+Dolibarr la définit, sans garde, dans `core/lib/date.lib.php` (4 paramètres, identique sur 18, 23 et 24).
+Le cœur ne charge ce fichier que paresseusement : dès qu'il le chargeait **après** le module (calcul
+d'heure serveur, substitutions, numérotation...), c'était une erreur fatale. Constaté sur l'instance de
+test partagée, où la suite d'un autre module s'arrêtait net avec Doli2Shop actif.
+
+- Le module ne déclare plus cette fonction : il charge la définition du cœur (`date.lib.php` ne contient
+  que des déclarations de fonctions, aucun effet de bord).
+- Les autres polyfills (`getDolGlobal*`, `currentToken`, `verifToken`) ont été vérifiés sur les trois
+  cœurs : sans risque équivalent, `functions.lib.php` étant toujours chargé avant le code du module.
+- Tests : `CompatibilityDolTimePlusDureeTest` rejoue le scénario dans un processus PHP séparé, toujours
+  sur un faux cœur fixture (donc aussi en CI, sans test ignoré) et en plus sur les cœurs 18, 23 et 24
+  quand ils sont installés ; l'ancien polyfill le fait échouer dans tous les cas.
+- Délai de livraison en jours (`'d'`) : inchangé (`+ n × 86400 s`), sauf si `MAIN_DATE_IN_MEMORY_ARE_NOT_GMT` est actif : le cœur suit alors le fuseau du serveur (±1 h au passage d'heure). Un repli local couvre le cas où `date.lib.php` serait introuvable.
 
 ## MODULE 2.6.0 — DÉTAIL COMPLET : `MigrationManager` SUBSTITUE ENFIN LE PRÉFIXE DE TABLE CHEZ LES CLIENTS `!= llx_`
 

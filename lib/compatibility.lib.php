@@ -152,34 +152,22 @@ if (!function_exists('currentToken')) {
     }
 }
 
-// dol_time_plus_duree - Adds a duration to a timestamp
-// Defined in core/lib/date.lib.php but not always loaded in webhook/CRON context
-if (!function_exists('dol_time_plus_duree')) {
-    /**
-     * Add a delay to a date
-     * @param int    $time     Timestamp
-     * @param int    $duration Duration value to add
-     * @param string $unit     Unit: 'd' for days, 'm' for months, 'y' for years
-     * @return int             New timestamp
-     * @since 2.2.0 Compatibility polyfill for webhook context
-     */
-    function dol_time_plus_duree($time, $duration, $unit = 'd')
-    {
-        if ($unit == 'd') {
-            return $time + (86400 * $duration);
-        } elseif ($unit == 'm') {
-            $dt = new DateTime();
-            $dt->setTimestamp($time);
-            $dt->modify('+' . (int)$duration . ' months');
-            return $dt->getTimestamp();
-        } elseif ($unit == 'y') {
-            $dt = new DateTime();
-            $dt->setTimestamp($time);
-            $dt->modify('+' . (int)$duration . ' years');
-            return $dt->getTimestamp();
-        }
-        return $time + (86400 * $duration);
-    }
+// dol_time_plus_duree - NE PLUS JAMAIS la déclarer ici.
+// Le cœur la définit dans core/lib/date.lib.php (18 :123, 23 :125, 24 :126) SANS garde
+// function_exists, avec une autre signature ($time, $duration_value, $duration_unit,
+// $ruleforendofmonth = 0). Un polyfill déclaré ici rend fatal « Cannot redeclare
+// dol_time_plus_duree() » dès que le cœur fait ensuite son require_once de date.lib.php, ce
+// qu'il fait paresseusement (dol_now('tzserver'), make_substitutions, get_next_value...) : le
+// fichier n'est PAS chargé systématiquement par main.inc.php, même dans le contexte webhook/CRON.
+// On charge donc la définition du cœur ; date.lib.php ne contient que des déclarations de
+// fonctions (aucun include ni code de tête sur 18/23/24) et le require_once du cœur devient un no-op.
+// DOL_DOCUMENT_ROOT n'est pas garanti par la garde de tête (DOLIBARR_INC_FOR_MODULES suffit) : d'où defined().
+//
+// Autres polyfills (getDolGlobal*, currentToken, verifToken) : sans risque équivalent, car
+// functions.lib.php est chargé par master.inc.php/main.inc.php avant tout code module.
+if (!function_exists('dol_time_plus_duree') && defined('DOL_DOCUMENT_ROOT')
+    && is_readable(DOL_DOCUMENT_ROOT . '/core/lib/date.lib.php')) {
+    require_once DOL_DOCUMENT_ROOT . '/core/lib/date.lib.php';
 }
 
 /**

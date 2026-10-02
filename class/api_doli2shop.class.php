@@ -22,11 +22,9 @@ if (!defined('DOL_DOCUMENT_ROOT') && !defined('DOLIBARR_INC_FOR_MODULES')) {
     exit();
 }
 
-// Pré-charger le core date.lib.php AVANT lib/compatibility.lib.php (tiré par
-// LoggerTrait via StoreService) : compatibility.lib.php polyfille dol_time_plus_duree()
-// avec un guard function_exists, mais le core date.lib.php n'a PAS de guard — s'il est
-// chargé APRÈS le polyfill (cas du cycle Restler), fatal "Cannot redeclare".
-// Même parade que le modèle apiptitetete (chargement défensif en tête de fichier).
+// Pré-charger le core date.lib.php avant lib/compatibility.lib.php (tiré par LoggerTrait via
+// StoreService). Depuis 2.6.0 compatibility.lib.php charge lui-même date.lib.php du cœur au lieu de
+// polyfiller dol_time_plus_duree() ; ce pré-chargement est conservé comme ceinture, sans effet.
 if (defined('DOL_DOCUMENT_ROOT') && is_file(DOL_DOCUMENT_ROOT . '/core/lib/date.lib.php')) {
     require_once DOL_DOCUMENT_ROOT . '/core/lib/date.lib.php';
 }

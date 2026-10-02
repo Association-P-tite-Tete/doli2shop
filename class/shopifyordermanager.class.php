@@ -3170,7 +3170,7 @@ class ShopifyOrderManager
      * Définit la date de livraison de la commande
      *
      * @param Commande $order
-     * @param string $createdAt
+     * @param int $createdAt Timestamp de création de la commande
      * @param int $shippingDaysDelivery
      */
     private function setDeliveryDate(&$order, $createdAt, $shippingDaysDelivery = 0)
@@ -3183,7 +3183,10 @@ class ShopifyOrderManager
             $delay += $weekends;
         }
 
-        $order->delivery_date = dol_time_plus_duree($createdAt, $delay, 'd');
+        // Repli local si date.lib.php du coeur est indisponible (le module ne declare plus la fonction).
+        $order->delivery_date = function_exists('dol_time_plus_duree')
+            ? dol_time_plus_duree($createdAt, $delay, 'd')
+            : $createdAt + 86400 * (int) $delay;
     }
 
     /**
