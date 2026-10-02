@@ -54,6 +54,83 @@
 4. **En cas de souci de synchronisation**, ouvrez le nouvel écran de journal et téléchargez le CSV
    avant de nous écrire — cela remplace un envoi de `dolibarr.log` complet.
 
+## SITE — 2 octobre 2026 : UNE BOUTIQUE DONT LA LICENCE EST DÉLIÉE PEUT ENFIN EN RELIER UNE
+
+> Hotfix `hotfix-site-deliaison-religature-impossible`, suite du correctif du 30/09. Après une
+> déliaison, l'app affichait bien « Abonnement annulé » mais ne proposait que les plans payants
+> Shopify : le formulaire « J'ai une licence DoliStore » n'existait que sur l'écran d'une
+> boutique jamais abonnée. Une boutique déliée ne pouvait donc plus relier (ni changer de) licence
+> depuis l'app. **Site uniquement** (`website/`) ; la présentation côté module Dolibarr est une suite
+> à ouvrir (AC7b, voir la story).
+>
+> **Correctif associé, trouvé en route (le plus grave des deux)** : du 29/09 au 02/10, la
+> confirmation des webhooks de facturation (`webhooks/billing/handler.php`) interrogeait
+> `... on AppRecurringPricingDetails`, un type qui **n'existe pas** dans le schéma Admin API
+> (l'union `AppPricingDetails` = `AppRecurringPricing | AppUsagePricing`). Shopify rejette toute la
+> requête : la confirmation échouait toujours et **aucun webhook `app_subscriptions/update` n'était
+> appliqué** — annulations, expirations et gels d'abonnement payant compris, avec seulement une
+> ligne ERROR au journal. Fragment corrigé ; garde-fou `GraphqlFragmentTypeNamesGuardTest` (liste
+> fermée des types vérifiés dans la doc, mutation vérifiée). Les webhooks rejetés pendant la
+> fenêtre ne sont pas rejoués automatiquement : à rapprocher (voir la story).
+
+### 🐛 Délier une licence ramène la boutique à l'écran de choix, avec le formulaire de liaison
+
+- **App embarquée** : un pseudo-abonnement DoliStore délié (sans licence rattachée) retrouve l'écran
+  `subscription-choice` (plans + formulaire de liaison) avec le bandeau « Aucune licence liée à
+  cette boutique ». La décision est une fonction pure (`PseudoSubscriptionPolicy::resolveAppScreen()`),
+  testée par exécution. Un vrai abonnement Shopify (`gid://`, `charge_`) annulé/expiré, ou une
+  licence DoliStore liée expirée, continue d'afficher l'écran « expiré » (non-régression).
+- **Écran « expiré »** : propose aussi le formulaire de liaison, mais **uniquement pour un
+  pseudo-abonnement DoliStore** (jamais pour un vrai abonnement Shopify annulé : la liaison le
+  réactiverait à tort). Formulaire extrait en partial partagé `templates/partials/dolistore-link-form.php`.
+- **Liaison d'un autre serial** (`link-serial.php::linkLicense()`) : la ligne porte désormais
+  `dolistore_<nouveau serial>` (elle gardait l'ancien) et l'**ancienne licence est libérée** dans la
+  même transaction (`shopify_shop_domain`/`shopify_subscription_id` à NULL, domaine révoqué), tracée
+  dans `serial_linked` (`previous_license_id`, `previous_serial`). Un abonnement `gid://`/`charge_`
+  n'est jamais touché.
+
+- **Boutique déliée qui paie un plan Shopify** (`shopify-app/billing/callback.php`) : la ligne
+  pseudo-abonnement est convertie immédiatement, avec le plan **réellement souscrit** (nom, prix,
+  intervalle lus chez Shopify par une requête `node(id:)` séparée, après la preuve de paiement) et le
+  `gid://` confirmé ; la licence Shopify créée prend le type et l'échéance de ce plan (mensuel = +30
+  jours, annuel = +1 an, règle partagée avec le webhook). Si Shopify ne fournit pas le plan, repli
+  **explicite et journalisé** sur « Doli2Shop Pro » 250 EUR annuel jusqu'à correction par le webhook
+  `app_subscriptions/update`. Même correction pour la branche « nouvel abonnement » (qui posait
+  toujours 250 EUR / annuel / +1 an). Si une licence DoliStore était encore liée à la ligne, elle est
+  **détachée** (pas reprise par l'abonnement payant) et tracée (`serial_unlinked`,
+  `replaced_by_paid_plan`). Écritures de la branche « abonnement existant » dans une transaction,
+  extraites dans `billing/lib/existing_subscription_activation.php` et prouvées par exécution.
+- **Webhook avant callback** : Shopify envoie souvent `app_subscriptions/update` avant la fin du
+  callback. Le webhook applique désormais la **même** conversion et le **même** détachement que le
+  callback (helper partagé `doli2shopConvertPseudoToPaid`, en transaction, avant l'activation de la
+  licence) : la licence DoliStore liée n'est plus « réactivée » en licence Shopify (échéance et
+  champs client intacts). Les deux ordres donnent le même état final (testé par exécution ; la suite
+  d'`activateLicense()` y est simulée, limite assumée).
+- **Webhook non actif sur un pseudo-abonnement** : tant que la ligne est un pseudo-abonnement
+  DoliStore, un webhook DECLINED / PENDING / FROZEN / CANCELLED / EXPIRED n'écrit rien (ni
+  `subscription_id`, ni plan, ni statut) et ne désactive pas la licence DoliStore du client ; la
+  conversion et le détachement ont lieu au passage à ACTIVE.
+- **Expiration des licences d'un abonné Shopify actif : reporté en story dédiée** (décision
+  mainteneur 02/10) « cycle de vie des licences Shopify Billing ». Constat : `expires_at` est posé une
+  fois à la souscription et jamais prolongé, et toutes les lectures (app, téléchargement, API, cron)
+  se calquent sur `expires_at`. `cron/expire_licenses.php` est inchangé par ce hotfix.
+- Robustesse : une erreur de journalisation après commit ou de lecture du plan après un paiement
+  confirmé ne fait plus échouer la réponse.
+- **Ré-liaison d'un autre serial** : un événement `serial_unlinked` (`reason = relinked_other_serial`)
+  est aussi écrit côté ancienne licence, après le commit, et seulement si la libération a réellement
+  modifié une ligne. Les écritures de `linkLicense()` sont extraites dans `lib/license_link_writes.php`.
+
+### 🏷️ « Licence déliée » plutôt qu'« annulé » (site)
+
+- App : badge d'en-tête « Licence déliée » (5 langues, clés `license_unlinked_badge` et
+  `no_license_linked`). Valeur technique en base inchangée (`status = 'canceled'`).
+- API : champs **additifs** `subscription_unlinked` (`getLicenseByShop`) et `subscription.unlinked`
+  (`getStatus`) ; `subscription_canceled`, `valid` et `subscription.status` sont inchangés (anciens
+  modules compatibles), `message` = « Aucune licence liée à cette boutique » pour ce cas.
+- Back-office : badge « Licence déliée » et libellé « Délié le » (`subscriptions.php`,
+  `subscription_view.php`), y compris pour le résidu `active` antérieur au correctif du 30/09. Le
+  filtre/compteur « Annulés » compte toujours ces lignes (valeur technique).
+
 ## SITE — 30 septembre 2026 : DÉLIER UNE LICENCE SHOPIFY LAISSE ENFIN L'ABONNEMENT « INACTIF »
 
 > Hotfix `hotfix-site-deliaison-abonnement-reste-actif`. Constat de production (30/09, test réel
