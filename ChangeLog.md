@@ -58,6 +58,119 @@
 4. **En cas de souci de synchronisation**, ouvrez le nouvel écran de journal et téléchargez le CSV
    avant de nous écrire — cela remplace un envoi de `dolibarr.log` complet.
 
+## SITE — 3 octobre 2026 : UNE LICENCE RÉVOQUÉE OU SUSPENDUE NE PASSE PLUS POUR VALIDE
+
+> Story `licence-revoquee-non-exclue-lectures-boutique` (65-4). **Site uniquement** (`website/`) ; **aucun fichier du module
+> Dolibarr n'est modifié** (`@version` 2.6.0). Constat : plusieurs lectures du site (réponse servie au module, état de
+> l'abonnement, app Shopify embarquée) recomposaient chacune leur propre liste de statuts « coupés » et oubliaient `revoked`
+> et `suspended` : une licence révoquée (avoir, fraude) dont la boutique avait une ligne d'abonnement `active` s'affichait
+> valide. Le **téléchargement** du module restait refusé (quatre barrières) : le défaut était un défaut d'**état et d'affichage**.
+
+### 🐛 Une règle centrale, utilisée par tous les lecteurs
+
+- **`LicenseStatusPolicy`** (nouveau, `website/database/`) : seul `active` est utilisable (forme positive, fail-closed : `pending`, valeur
+  inconnue, casse inattendue ⇒ refusé) ; `revoked` et `suspended` sont des décisions humaines que la facturation ne réécrit jamais.
+  Les deux copies de `isLicenseValid()` délèguent à cette règle ; les statuts déjà corrects (`active`, `expired`, `canceled`, annulé mais payé,
+  pseudo-abonnement délié, licence DoliStore liée) gardent exactement leurs réponses.
+- **Ce que voit désormais un client dont la licence est révoquée/suspendue** (les API de licence sont **anonymes** : un
+  `shop_domain` suffit — elles ne disent donc jamais « révoquée » ni « suspendue », ni la date de révocation ; seul l'écran de l'app
+  embarquée, derrière la session authentifiée de la boutique, le dit) :
+  - **API `get-license-by-shop`** : `valid:false`, `can_download:false`, `subscription_canceled:true` (le module installé affiche « Annulé »),
+    `license.status` = `canceled`, `message` générique « Licence non utilisable — contactez le support (doli2shop@ptitetete.org)… ».
+  - **API `validate-dolibarr` (celle que lit le module)** : `status:'canceled'`, `can_support:false`, `mode:'degraded'`, `action:'renew'`,
+    `warning_message` générique avec l'adresse du support (prioritaire sur le texte du module), `renewal_url` = lien de reprise `mailto:`
+    (un paiement sur une licence bloquée n'a aucun effet), plus d'offre de renouvellement DoliStore/Shopify.
+  - **Boutiques liées par le module** (cas majoritaire du parc, aucune ligne d'abonnement) : une licence bloquée liée à la boutique est désormais
+    retrouvée (repli `findBlockedByShopifyShop`) au lieu de « saisissez votre numéro de série ».
+  - **Synchronisation de la boutique par défaut** : une licence **révoquée** coupe la synchronisation via une `sync_stops_at` **signée** = début du
+    jour courant UTC (toujours passée, ne révèle ni `revoked_at` ni le motif ; jamais repoussée si une date plus précoce existe) — le module vérifie
+    déjà cette signature, aucune modification module. Une licence **suspendue** (réversible) garde sa synchronisation.
+  - **App Shopify embarquée** : écran dédié « Licence révoquée / suspendue — contactez le support » (5 langues), **sans plans payants**, avec l'adresse
+    du support en texte sélectionnable et un lien `mailto:`. La page support de l'app reste fermée.
+  - **`check` / `status`** : `has_subscription` et `status` ne disent plus « actif » (`pending` : faux) ; `action=status` publie `canceled` et propose
+    « Contacter le support » au lieu de souscrire, même si la ligne d'abonnement est annulée ou expirée.
+  - **Support (`validate_support`)** : seule une licence `active` répond « support valide » ; toute réponse de refus porte l'adresse de contact et le lien
+    de reprise. Rien n'est ouvert côté création de ticket : cette API n'en protège aucune.
+- **Téléchargement** : les trois chemins (API, app, redirection) résolvent la licence comme les lecteurs de statut — un client servi « valide » grâce à
+  une licence de remplacement n'obtient plus un refus au téléchargement.
+- **Licence de remplacement** : un client dont la licence a été révoquée puis qui a lié une nouvelle licence ACTIVE par le module (la ligne d'abonnement
+  pointant encore l'ancienne) est servi sur sa licence active.
+- **Une écriture ne ramollit plus une décision humaine** (`LicenseRepository::updateStatus()`) : une synchronisation d'abonnement dont Shopify renvoie
+  `EXPIRED`/`DECLINED` ne repasse plus une licence `revoked`/`suspended` en `canceled` (donc de nouveau réactivable par un paiement). Clause SQL atomique ;
+  `revoke()` et le formulaire admin ne sont pas bridés.
+
+### ⚙️ Actions mainteneur avant déploiement
+
+- **Requêtes en lecture seule** (aucune base n'a été ouverte par le développement) — à lancer AVANT de déployer :
+  `SELECT status, COUNT(*) FROM licenses GROUP BY status;` · licences `pending` · licences `revoked`/`suspended` liées à une ligne d'abonnement `active`
+  (`SELECT l.serial_number, l.status, l.revoked_at, s.shop_domain FROM licenses l JOIN shopify_subscriptions s ON s.license_id = l.id WHERE l.status IN ('revoked','suspended') AND s.status = 'active';`)
+  = les boutiques qui verront l'écran dédié et dont la synchronisation sera coupée (révoquées) dès le déploiement · révoquées sans `revoked_at`.
+- Nouveau fichier `database/LicenseStatusPolicy.php` et `shopify-app/templates/license-blocked.php` : aucun motif d'exclusion FTP ne les touche (vérifié sur
+  `deploy-website.yml`).
+
+### ✅ Vérification
+
+- Suite du site : **1616 tests** verts sur une copie avec `vendor/` copié ; `LicenseStatusPolicyTest` (produit cartésien des statuts, parité avec l'ancien
+  `isLicenseValid`, matrice pseudo/réel, double de base pour `updateStatus`) et `LicenseStatusWiringGuardTest` (liste blanche par tokens sur les lecteurs).
+  **Prouvé par exécution** : toutes les décisions (règle centrale, réponse `validate-dolibarr` d'une licence bloquée, date signée et sa signature RSA vérifiée sur domaine|valeur,
+  résolution du téléchargement, matrice des statuts, `updateStatus` sur un double de base, rendu du gabarit). **Prouvé seulement par tokens** (`api/billing.php` et
+  `shopify-app/index.php` ne s'exécutent pas sans base) : que chaque lecteur appelle ces décisions, dans le bon ordre, avec les bons arguments — un appel correct alimenté par la
+  mauvaise variable n'est vu que par la relecture.
+- **51 mutations croisées**, toutes rouges (retirer `revoked` de la liste ; forme positive remplacée par une liste négative ; appel retiré dans chacun des
+  lecteurs L1, L3, L5, L10, L13, L16 (×2), les deux `isLicenseValid()` et la licence de remplacement ; clause SQL de `updateStatus` retirée ; liste littérale
+  réintroduite ; date signée jamais posée ; `subscription_canceled` faux ; statut réel requalifié ; écran dédié remplacé ; message d'expiration qui écrase
+  le message bloqué).
+
+## SITE — 3 octobre 2026 : L'ADRESSE D'UNE LICENCE N'EST PLUS ÉCRASÉE PAR CELLE DE LA BOUTIQUE SHOPIFY
+
+> Story `licence-email-ecrase-par-email-boutique-shopify` (« deux adresses »). **Site uniquement**
+> (`website/`, une migration SQL) ; **aucun fichier du module Dolibarr** n'est modifié. Constat : à chaque
+> ouverture de l'app Shopify (et à chaque renouvellement de jeton, liaison d'un serial, activation d'abonnement),
+> le site réécrivait l'adresse et le nom de la **licence** avec ceux du **propriétaire de la boutique**. Un acheteur
+> DoliStore qui reliait sa licence à une boutique perdait donc son adresse, et les e-mails de licence
+> (confirmation de déliaison, rappels d'expiration, renvoi) partaient chez le propriétaire de la boutique.
+
+### 🐛 Deux adresses : celle de la licence, celle de la boutique
+
+- **L'adresse et le nom de la LICENCE** (saisis à l'achat DoliStore, à l'import CSV ou par l'admin) ne sont plus
+  écrasés. Ceux du **propriétaire de la boutique** sont stockés à part, sur l'abonnement
+  (`shopify_subscriptions.shop_owner_email` / `shop_owner_name`), et ne sont écrits que s'ils changent. Les e-mails
+  de licence partent vers l'adresse de la licence. Une correction faite par l'admin n'est plus réécrasée.
+- **Licences créées par Shopify** : leur adresse **suit** celle de la boutique tant qu'elle n'a pas divergé (un
+  propriétaire qui change d'adresse continue de recevoir ses rappels) ; jamais pour une licence DoliStore.
+- **Licence sans adresse utilisable** (vide, `@shop.temp`, `.unknown`) : une licence Shopify retombe sur l'adresse de
+  sa boutique ; une licence DoliStore ne reçoit **rien** (jamais vers un placeholder). Garde unique du destinataire,
+  partagée par les e-mails de licence, les campagnes, la tâche planifiée d'expiration (qui compte ces licences sans
+  erreur ni marqueur) et le renvoi depuis l'admin. La fiche licence de l'admin **avertit** dans ce cas.
+- **Déliaison libre-service dont l'e-mail ne peut pas partir** (licence sans adresse utilisable, ou envoi en échec) : la page
+  reste identique pour l'utilisateur (anti-énumération), mais un événement `unlink_confirmation_undeliverable` (sans donnée
+  personnelle, motif `no_usable_address` ou `send_failed`) signale le cas au support. Une adresse à partie locale non ASCII
+  est considérée inutilisable (envoi non garanti sans SMTPUTF8). Procédure : corriger l'adresse dans la fiche d'édition de la licence (ou délier depuis l'admin).
+- **Back-office** : la fiche licence montre l'« Adresse de la licence » et l'« Adresse de la boutique Shopify »
+  (repère quand elles diffèrent) ; la fiche abonnement montre l'adresse de la boutique. **App embarquée** : l'adresse
+  de la licence affichée à la boutique est **masquée** (elle peut être celle d'un tiers).
+- Effet de bord voulu : le **nom** d'un client DoliStore ne se synchronise plus avec celui du propriétaire de la
+  boutique. Le module Dolibarr du client reçoit désormais, par l'API de validation, l'adresse de la **licence** (celle
+  de l'acheteur) et non plus celle de la boutique.
+- **Aucune adresse dans `billing_events` ni dans les journaux** : le remplissage d'une adresse manquante est tracé par
+  l'événement `license_contact_filled` (identifiants et code de champ, jamais la valeur). Les garde-fous de données
+  personnelles interdisent désormais `shop_owner_*` partout.
+- **RGPD** : les consignes envoyées à l'administrateur (`shop/redact`, `customers/redact`, `customers/data_request`)
+  listent maintenant aussi les données du **site** (`shopify_subscriptions.shop_owner_*`, `licenses.customer_*`), avec la
+  requête d'effacement par boutique. Aucun effacement automatique n'est ajouté.
+
+### ⚙️ Action mainteneur — migration 016
+
+- Appliquer `website/database/migrations/016_add_shop_owner_contact_to_subscriptions.sql` (`admin/migrate.php`).
+  Idempotente (rejouée deux fois sur MySQL et MariaDB jetables), elle ajoute les deux colonnes **sans rien recopier** : elles
+  se remplissent au premier relevé de la boutique (ouverture de l'app), sans toucher une adresse de licence utilisable
+  (une adresse corrigée par l'admin n'est donc jamais prise pour celle de la boutique, ni écrasée). Code déployé avant la
+  migration : sans effet sur l'app (colonnes absentes tolérées).
+- Adresses **déjà écrasées** en production : aucune restauration automatique n'est possible (rien ne distingue une adresse
+  écrasée d'un acheteur qui est aussi le propriétaire). Requêtes de **repérage en lecture seule** fournies dans
+  `website/database/queries_licence_email_rattrapage.sql`, à lancer par le mainteneur ; correction licence par licence dans
+  la fiche d'édition.
+
 ## SITE — 2 octobre 2026 : LA LICENCE D'UN ABONNÉ SHOPIFY SUIT ENFIN SA PÉRIODE PAYÉE
 
 > Story `cycle-de-vie-licences-shopify-billing`. **Site uniquement** (`website/`, une migration SQL et
@@ -418,6 +531,22 @@
 > déliaison réelle sur la licence de test déjà liée à une boutique de test, vérifier la réception
 > de l'e-mail (dossier principal vs indésirable, expéditeur cohérent), et confirmer dans l'écran
 > d'événements le badge « envoyé » — jamais « échec » — avant de considérer l'incident clos.
+
+## MODULE 2.6.0 — 2 octobre 2026 : UNE LICENCE DÉLIÉE S'AFFICHE « LICENCE DÉLIÉE », PAS « ANNULÉ »
+
+> Story `module-libelle-licence-deliee` (65-2). Côté module uniquement : le site sert déjà le signal.
+
+- **Écran Licence** (`admin/shopify_license.php`) : une boutique dont la licence DoliStore a été déliée
+  affiche « Licence déliée » et la note « Aucune licence liée à cette boutique. La licence DoliStore
+  n'est pas annulée : elle reste réutilisable. », sans badge « Shopify » ni ligne « Plan ». Badge au
+  style natif du thème (aucune couleur ajoutée).
+- **Santé et diagnostic** (`admin/health.php`, `admin/diagnostic.php`) : mode de licence « Aucun
+  système détecté » en avertissement, sans plan, avec la même note ; le champ `licence_mode` de l'export de diagnostic vaut `none` pour une licence déliée (et non plus `shopify`).
+- **Relier une licence** : en état « déliée », l'écran propose le bouton « Relier une licence DoliStore » (page de liaison du site) à côté de « Accéder à l'application Shopify », et la note indique où relier.
+- Une vraie annulation d'abonnement Shopify reste « Annulé » ; un site ancien (sans le champ
+  `subscription_unlinked`) garde l'affichage historique. Jamais « déliée » sur une licence valide.
+- Décision centralisée dans `doli2shopResolveLicenseDisplayState()` (fonction pure, testée par
+  exécution) ; 2 nouvelles clés de langue dans les 5 langues.
 
 ## MODULE 2.6.0 — DÉTAIL COMPLET : CHAQUE CYCLE DE SYNCHRONISATION LAISSE SA TRACE
 

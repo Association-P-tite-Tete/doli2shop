@@ -719,6 +719,17 @@ class ShopifyDiagnosticHealth
 
         $payload = isset($data['data']) ? $data['data'] : $data;
 
+        // Story 65-2 : licence déliée (champ additif du site) — pas de mode « Shopify » ni de plan.
+        $licenseDisplayState = doli2shopResolveLicenseDisplayState($payload);
+        if (!empty($payload['found']) && $licenseDisplayState['state'] === 'unlinked') {
+            $this->addCheck('support', $this->langs->transnoentities('LicenseMode'),
+                $this->langs->trans('LicenseModeNone'), 'warning');
+            $this->licenceMode = array('mode' => 'none', 'source' => null, 'plan_name' => null, 'license_type' => null);
+            $this->addCheck('support', $this->langs->transnoentities('SupportValidity'),
+                $this->langs->trans('SupportInvalid'), $licenseDisplayState['cardClass'], $this->langs->trans($licenseDisplayState['noteKey']));
+            return true;
+        }
+
         if (!empty($payload['found']) && $payload['source'] === 'shopify') {
             $this->addCheck('support', $this->langs->transnoentities('LicenseMode'),
                 $this->langs->trans('LicenseModeShopify'), 'success');
@@ -734,7 +745,7 @@ class ShopifyDiagnosticHealth
                     $payload['license']['serial_number'], 'info');
             }
             $isValid = !empty($payload['valid']);
-            $isCanceled = !empty($payload['subscription_canceled']);
+            $isCanceled = ($licenseDisplayState['state'] === 'canceled');
             $validityStatus = $isValid ? $this->langs->trans('SupportValid') : $this->langs->trans('SupportInvalid');
             $validityClass = $isValid ? 'success' : 'error';
             if (isset($payload['license']['days_remaining']) && $payload['license']['days_remaining'] !== null) {

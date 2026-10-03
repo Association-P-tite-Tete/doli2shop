@@ -1560,6 +1560,151 @@ function doli2shopGetGenuinelyExpiredStatuses(): array
 }
 
 /**
+ * Décide de l'état d'affichage d'une licence à partir du payload de `get-license-by-shop`.
+ *
+ * Story module-libelle-licence-deliee (65-2, v2.6.0) : une boutique dont la licence DoliStore a
+ * été déliée est servie par le site avec `subscription_unlinked: true` (champ additif) ET les
+ * champs historiques d'une annulation (`subscription_canceled: true`, `valid: false`). Sans cette
+ * fonction, les écrans affichaient « Annulé », ce qui est faux : la licence reste réutilisable.
+ *
+ * Fonction PURE : aucune E/S, aucun global, aucune traduction (les écrans traduisent les clés).
+ * - `unlinked` : `subscription_unlinked === true` (booléen strict) ET `valid !== true` ;
+ * - `canceled` : pas `unlinked` et `subscription_canceled` non vide (comportement historique) ;
+ * - `default` sinon. Un site ancien (clé absente) retombe donc sur le comportement historique.
+ *
+ * @param array|null $payload Payload (déjà déplié) de get-license-by-shop
+ * @return array Clés : state, titleKey, badgeKey, noteKey, badgeClass, cardClass
+ * @version 2.6.0
+ * @since   2.6.0
+ */
+function doli2shopResolveLicenseDisplayState($payload)
+{
+    if (!is_array($payload)) {
+        $payload = array();
+    }
+
+    $isUnlinked = isset($payload['subscription_unlinked']) && $payload['subscription_unlinked'] === true
+        && (!isset($payload['valid']) || $payload['valid'] !== true);
+
+    if ($isUnlinked) {
+        return array(
+            'state' => 'unlinked',
+            'titleKey' => 'LicenseUnlinked',
+            'badgeKey' => 'LicenseUnlinked',
+            'noteKey' => 'LicenseUnlinkedNote',
+            'badgeClass' => 'badge badge-status0',
+            'cardClass' => 'warning',
+        );
+    }
+
+    if (!empty($payload['subscription_canceled'])) {
+        return array(
+            'state' => 'canceled',
+            'titleKey' => 'SubscriptionCanceled',
+            'badgeKey' => 'Canceled',
+            'noteKey' => 'SubscriptionCanceled',
+            'badgeClass' => 'status-badge canceled',
+            'cardClass' => 'warning',
+        );
+    }
+
+    return array(
+        'state' => 'default',
+        'titleKey' => '',
+        'badgeKey' => '',
+        'noteKey' => '',
+        'badgeClass' => '',
+        'cardClass' => '',
+    );
+}
+
+/**
+ * URL de la page de liaison d'un numéro de série DoliStore sur le site OFFICIEL (même forme que
+ * l'action `link_serial` servie par get-license-by-shop quand found:false).
+ *
+ * Dérivée de la constante par défaut DOLI2SHOP_BILLING_API_ENDPOINT_DEFAULT, JAMAIS de l'endpoint
+ * configurable (modifiable par un administrateur : `javascript:`, vide, autre hôte) — et la page
+ * de liaison du site code de toute façon son redirect_uri sur le site officiel. Garde https://
+ * strict (imposé par l'expression régulière, ancrée sur `https://`) : retourne '' (pas de bouton) si le domaine boutique est vide ou si la base n'est pas
+ * en https.
+ *
+ * @param string      $shopDomain       Domaine boutique (xxx.myshopify.com)
+ * @param string|null $officialEndpoint Surcharge réservée aux tests ; null = constante par défaut
+ * @return string URL absolue https, ou '' si indisponible
+ * @version 2.6.0
+ * @since   2.6.0
+ */
+function doli2shopBuildLinkSerialUrl($shopDomain, $officialEndpoint = null)
+{
+    $shopDomain = trim((string) $shopDomain);
+    if ($shopDomain === '') {
+        return '';
+    }
+    $endpoint = ($officialEndpoint === null) ? DOLI2SHOP_BILLING_API_ENDPOINT_DEFAULT : (string) $officialEndpoint;
+    if (!preg_match('#^(https://[^/?\#]+(?:/[^?\#]*)?)/api/[^/?\#]*(\?.*)?$#', $endpoint, $m)) {
+        return '';
+    }
+    return rtrim($m[1], '/') . '/shopify-app/link-serial.php?shop=' . urlencode($shopDomain);
+}
+
+/**
+ * Choix du RENDU de la carte de licence de admin/shopify_license.php (fonction pure, testée par
+ * exécution) : titre, badge, note, classe de carte, et ce qui est masqué pour une licence déliée
+ * (badge source, plan, détails de licence — il n'y a plus ni licence ni abonnement).
+ *
+ * @param array $displayState Résultat de doli2shopResolveLicenseDisplayState()
+ * @param bool  $isValid      Champ `valid` du payload
+ * @return array Clés : cardClass, titleKey, badgeClass, badgeKey, noteKey, showSourceBadge, showPlan, showLicenseDetails, showRelinkAction
+ * @version 2.6.0
+ * @since   2.6.0
+ */
+function doli2shopResolveLicenseCardLayout($displayState, $isValid)
+{
+    $state = isset($displayState['state']) ? $displayState['state'] : 'default';
+
+    if ($state === 'unlinked') {
+        return array(
+            'cardClass' => $displayState['cardClass'],
+            'titleKey' => $displayState['titleKey'],
+            'badgeClass' => $displayState['badgeClass'],
+            'badgeKey' => $displayState['badgeKey'],
+            'noteKey' => $displayState['noteKey'],
+            'showSourceBadge' => false,
+            'showPlan' => false,
+            'showLicenseDetails' => false,
+            'showRelinkAction' => true,
+        );
+    }
+
+    if ($state === 'canceled') {
+        $badgeClass = 'status-badge canceled';
+        $badgeKey = 'Canceled';
+    } else {
+        $badgeClass = 'status-badge ' . ($isValid ? 'active' : 'expired');
+        $badgeKey = $isValid ? 'Active' : 'Expired';
+    }
+    if ($isValid) {
+        $titleKey = 'LicenseActive';
+    } elseif ($state === 'canceled') {
+        $titleKey = 'SubscriptionCanceled';
+    } else {
+        $titleKey = 'LicenseExpired';
+    }
+
+    return array(
+        'cardClass' => $isValid ? 'success' : 'error',
+        'titleKey' => $titleKey,
+        'badgeClass' => $badgeClass,
+        'badgeKey' => $badgeKey,
+        'noteKey' => '',
+        'showSourceBadge' => true,
+        'showPlan' => true,
+        'showLicenseDetails' => true,
+        'showRelinkAction' => false,
+    );
+}
+
+/**
  * Affiche le bandeau d'avertissement si licence expirée / jamais liée / non vérifiable (mode
  * dégradé), et l'alerte de période de grâce quand le serveur transmet une date d'arrêt de
  * synchronisation.
