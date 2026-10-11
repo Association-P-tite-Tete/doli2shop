@@ -10,7 +10,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       1.0.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -606,8 +606,8 @@ class modDoli2Shop extends DolibarrModules
 					// 2.6.0e_2.6.0f : colonne images_priority_requeue sur llx_doli2shop_products —
 					// marque un produit DIFFERE (budget de polling images epuise, ou lot precedent
 					// encore en cours) pour un traitement PRIORITAIRE au cycle de contenu/stock
-					// suivant (ORDER BY des requetes de selection de importProducts(), ~488-521 et
-					// ~582-610). Re-review 3 couches (28/09/2026, HIGH) de la story
+					// suivant (ORDER BY des requetes de selection de importProducts(), desormais
+					// buildSimpleProductsCandidatesSql() / buildParentProductsCandidatesSql()). Re-review 3 couches (28/09/2026, HIGH) de la story
 					// apparier-les-images-une-a-une-au-lieu-de-tout-detruire. Cle de version
 					// DISTINCTE et fichier NEUF (meme regle qu'au-dessus) : "e_f", suite de "d_e".
 					// fk_store CONDITIONNEL : meme motif preexistant que shopify_media_ids
@@ -631,6 +631,20 @@ class modDoli2Shop extends DolibarrModules
 					[
 						'version' => '2.6.0f_2.6.1',
 						'file' => dol_buildpath('/doli2shop/sql/update_2.6.0f_2.6.1.sql', 0)
+					],
+					// 2.6.1_2.6.2 : colonne last_content_sync sur llx_doli2shop_products (hotfix 2.6.2,
+					// story cron-export-produits-famine-modifications-jamais-propagees) — reference STABLE
+					// du dernier contenu synchronise, qu'un tms en ON UPDATE CURRENT_TIMESTAMP ne peut pas
+					// porter. DDL idempotent + backfill (NULL pour les produits modifies sur les 30 derniers
+					// jours, sinon tms) : le backfill ne depend PAS de la boutique par defaut (ni fk_store,
+					// ni entity), il reste donc en SQL, avant ensureDefaultStore() sans conflit avec
+					// l'invariant migration/seeding (CLAUDE.dolibarr.md paragraphe 14). Cle de version
+					// NEUVE et fichier NEUF. L'ORDER BY des requetes de selection de importProducts()
+					// (decrit dans les commentaires de 2.6.0e_2.6.0f ci-dessus) est desormais produit par
+					// ImportProducts::buildSimpleProductsCandidatesSql() / buildParentProductsCandidatesSql().
+					[
+						'version' => '2.6.1_2.6.2',
+						'file' => dol_buildpath('/doli2shop/sql/update_2.6.1_2.6.2.sql', 0)
 					]
 				];
 
@@ -778,6 +792,16 @@ class modDoli2Shop extends DolibarrModules
 						dol_syslog("Doli2Shop: Backfill fk_store — no-op (aucune ligne à backfiller)", LOG_DEBUG);
 					} else {
 						dol_syslog("Doli2Shop: Backfill fk_store échoué (non bloquant)", LOG_WARNING);
+					}
+					// Hotfix 2.6.2 : une table en échec ne défait plus les autres ; on le dit ici, et on
+					// prévient l'admin quand des correspondances de mode différent n'ont pas été fusionnées.
+					$backfillReport = $storeServiceForBackfill->getLastBackfillReport();
+					if (!empty($backfillReport['errors'])) {
+						dol_syslog("Doli2Shop: Backfill fk_store — " . (int) $backfillReport['errors'] . " table(s) en échec (voir journal du module), les autres sont rattachées (entity=" . $conf->entity . ")", LOG_WARNING);
+					}
+					if (!empty($backfillReport['conflicts']) && function_exists('setEventMessages')) {
+						$langs->load('doli2shop@doli2shop');
+						setEventMessages($langs->trans('Doli2ShopBackfillConflictsWarning', (int) $backfillReport['conflicts']), null, 'warnings');
 					}
 				} catch (\Throwable $e) {
 					// Échec backfill ne doit pas bloquer l'activation du module

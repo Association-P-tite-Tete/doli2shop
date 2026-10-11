@@ -1,5 +1,232 @@
 # CHANGELOG SHOPIFY INTEGRATION FOR DOLIBARR ERP CRM
 
+## 2.6.2 — 11 octobre 2026 : CORRECTIF CRITIQUE — LES MODIFICATIONS DE PRODUITS ET DE PRIX DOLIBARR ATTEIGNENT ENFIN SHOPIFY
+
+> **Hotfix.** À installer dès que possible si vous modifiez des produits ou des prix dans Dolibarr
+> et comptez sur la tâche planifiée pour les envoyer à Shopify.
+> **Après avoir remplacé les fichiers du module, désactivez puis réactivez-le** (Accueil > Configuration > Modules) :
+> c'est l'activation qui applique la migration de base de données de cette version.
+
+### En bref
+
+- **La tâche planifiée d'export ne propageait plus les modifications de prix ni de contenu faites dans Dolibarr — depuis
+  la version 2.2.0 au moins.** Corrigé : un prix modifié passe désormais en tête de file, les autres modifications
+  suivent par une part réservée du budget, et tous les produits (déclinaisons comprises) sont servis à tour de rôle.
+- **Les déclinaisons supprimées volontairement dans Dolibarr ne sont plus recréées** par l'outil « Réparer les
+  déclinaisons » (bouton grisé quand Dolibarr fait foi), et un produit délié ne touche plus la fiche Shopify de son
+  ancien parent.
+- **Réactiver le module ne produit plus l'erreur « Duplicate entry 'card-1-1' »** (doublon de correspondance de
+  paiement) ; une base déjà touchée est réparée automatiquement.
+- **Deux attributs Dolibarr de même libellé ne sont plus refusés en boucle par Shopify** : ils sont fusionnés en une
+  seule option, et un produit qui dépasserait la limite d'options de la boutique est refusé localement, avec un message
+  qui nomme les options en cause, sans rien envoyer.
+- **Stock : plus de quantité de référence « 0 » inventée.** Une ligne dont la référence de stock est inconnue est
+  refusée seule, sans bloquer les autres lignes du lot.
+
+### Ce qui ne marchait pas — et depuis quand
+
+- **La tâche planifiée d'export des produits n'a jamais envoyé à Shopify une modification de contenu ou de
+  prix faite dans Dolibarr. Et ce depuis au moins la version 2.2.0.** Seules la synchronisation manuelle
+  (qui force l'envoi) et la création initiale d'un produit fonctionnaient.
+  Cause : le module comparait la date de modification du produit à la « date de dernière synchronisation »
+  de sa table de correspondance. Or cette date est mise à jour automatiquement par la base de données à
+  la moindre écriture sur la ligne, et le module écrit sur cette ligne (verrou anti-concurrence) **avant**
+  de décider s'il y a quelque chose à envoyer : la date de dernière synchronisation valait donc toujours
+  « maintenant », et aucune modification n'était jamais « plus récente ». Relevé sur la production de
+  l'association : écart de 0 seconde sur 70 décisions sur 70.
+- **Le cron retraitait toujours les 10 mêmes produits (famine).** La liste des produits à traiter n'avait
+  aucun critère d'ancienneté ni de modification : à chaque passage, ce sont toujours les mêmes plus petits
+  identifiants qui passaient en tête (un envoi de stock chacun), et la limite par passage (10 par défaut)
+  était consommée par les produits simples avant que les produits à déclinaisons soient seulement regardés.
+  Les produits à déclinaisons n'étaient jamais traités dès qu'il y avait 10 produits simples éligibles, c'est-à-dire
+  sur tout catalogue moyen.
+- **Des déclinaisons supprimées volontairement dans Dolibarr étaient recréées, et un produit « délié » restait
+  rattaché à la fiche Shopify de son ancien parent.** Quand on supprime une déclinaison dans Dolibarr (le produit
+  enfant, lui, reste, parce qu'il a eu des commandes), le bouton « Réparer les déclinaisons » la recréait au passage
+  suivant, même quand Dolibarr est la source de vérité des produits ; il créait aussi, en passant, une seconde option
+  « Finition (Effet) » à côté de « Finition-Effet » (le module ne retrouvait un attribut existant que par son code
+  technique, pas par son libellé), ce qui portait la fiche à 4 options alors que Shopify en accepte 3 : le produit
+  restait bloqué. Enfin, un enfant délié restait associé à la fiche Shopify de son ancien parent : au prochain passage
+  du cron, il aurait pu être envoyé comme un produit simple et remplacer toutes les variantes du parent par une seule,
+  en le passant en brouillon.
+- **La réactivation du module affichait « Duplicate entry 'card-1-1' » et le rattachement des réglages à la boutique ne
+  se terminait pas.** À chaque activation, le module recréait une correspondance de paiement « non rattachée » que le
+  rattachement à la boutique par défaut ne pouvait ensuite plus fusionner avec la correspondance déjà rattachée : la base
+  refusait, et ce refus annulait aussi le rattachement des quatre autres tables de réglages. Constaté sur la production
+  de l'association le 11 octobre 2026 ; systématique à chaque réactivation depuis la 2.5.3.
+
+### Ce qui change
+
+- **Un produit dont deux attributs Dolibarr portent le même libellé n'est plus refusé en boucle par Shopify, et plus jamais
+  envoyé à moitié.** Les attributs de même libellé (« Finition (Effet) » deux fois, majuscules, accents ou ponctuation près) sont
+  désormais fusionnés en une seule option Shopify, valeurs réunies — la même règle que l'import, sans rapprochement flou des
+  libellés contenant des chiffres. Avant l'envoi, le module contrôle le nombre d'options contre la limite réelle de la boutique
+  (lue chez Shopify, mémorisée 24 h, 3 par défaut) : s'il est dépassé, ou si une déclinaison active n'a pas de valeur pour
+  toutes les options, ou si deux déclinaisons deviennent identiques après fusion, le produit est **refusé localement** — aucun
+  envoi, donc aucune déclinaison supprimée par erreur chez Shopify — avec un message qui nomme les options et les déclinaisons
+  en cause, visible dans le rapport de synchronisation manuelle et dans le journal (et plus de trois tentatives inutiles).
+  Les variantes Shopify qui n'existent plus dans Dolibarr restent supprimées (Dolibarr fait foi) ; leurs SKU sont désormais
+  listés dans le journal avant l'envoi.
+- **Un prix modifié dans Dolibarr rend le produit prioritaire.** Le module garde désormais sa propre
+  date, stable, du « dernier contenu réellement synchronisé » (nouvelle colonne `last_content_sync`, jamais
+  touchée par le verrou, l'envoi de stock seul, ni les passages ignorés ou en échec), écrite à l'**instant de
+  début** de la synchronisation (une modification faite pendant l'envoi est donc revue au passage suivant). Un
+  produit dont le **prix** (ou celui d'une déclinaison) a été enregistré depuis cette date passe avant tous les
+  autres, le plus ancien d'abord. Les autres modifications (description, libellé…) sont servies par une **part
+  réservée** du budget (voir ci-dessous) et les mouvements de stock par la **rotation** équitable : une vente ne
+  passe jamais devant un vrai changement de prix. Un produit en échec garde son rang d'échec, et n'est retenté
+  qu'après un **délai croissant** (1 h, 2 h, 4 h, plafonné à 6 h ; nouvelles colonnes `last_failed_at` et
+  `failed_streak`, remise à zéro au premier succès de **contenu**, délai levé si le **prix** du produit est modifié après l'échec, jamais avant 1 h : une vente ne le lève pas, et une correction autre que le prix — libellé, image — ne le lève pas non plus : le contenu peut alors attendre jusqu'à 6 h) :
+  une poignée d'échecs permanents ne recrée pas la famine. Ce délai ne retarde **que le contenu** : le stock du produit
+  continue de partir à sa cadence normale. Une synchronisation interrompue (cron tué en cours de route) compte comme
+  un échec ; les passages ignorés (produit archivé, création d'un produit hors vente évitée) sortent de la tête de file.
+- **Les modifications hors prix ont un délai de propagation borné.** Un tiers de la limite par passage (arrondi au
+  supérieur, dans la limite des produits concernés) est **réservé** aux produits dont le contenu (libellé, description,
+  photos… ou une déclinaison) a changé dans Dolibarr depuis leur dernier envoi, le plus ancien d'abord : une
+  modification de libellé n'attend plus derrière des milliers de produits « vendus » (une vente fait aussi bouger la
+  date de modification) — avec N produits concernés et L par passage, elle part en au plus N / ceil(L/3) passages.
+  **Ce délai n'est pas court sous fort volume de ventes** : la part réservée est une file « premier arrivé, premier
+  servi » (le contenu envoyé le plus anciennement d'abord), et un produit modifié ou vendu depuis son dernier envoi y entre
+  à son rang d'ancienneté. Un libellé modifié sur un produit envoyé récemment passe donc **derrière** tous les produits
+  modifiés ou vendus avant lui : par exemple 600 produits vendus dans la journée, L = 10 (4 places réservées par passage),
+  cron horaire → jusqu'à 150 passages, soit environ 6 jours, avant que ce libellé soit envoyé ; avec L = 30
+  (10 places), 60 passages, soit 2,5 jours. Pour raccourcir ce délai, augmentez « Nombre de produits par mise à jour
+  Cron ». Les **prix** ne sont pas concernés (ils passent avant, dans le rang prioritaire).
+  Le reste du budget suit l'ordre habituel (prix, jamais synchronisés, échecs retentables, stock).
+  **Écart de fuseau** : la date d'un prix est écrite par PHP, les autres dates par la base ; le rang « prix » exige
+  donc aussi que la date de modification du produit ait bougé, et un prix « raté » par un décalage horaire est
+  rattrapé par la part réservée. En **multiprix**, seul le niveau de prix synchronisé est surveillé.
+- **Les produits à déclinaisons ne sont plus affamés.** Jusqu'à la moitié (arrondie à l'inférieur) de la part
+  principale du budget leur est réservée (dans la limite du nombre de produits à déclinaisons à traiter) ; avec un
+  créneau unique (limite de 1), celui-ci tourne entre les familles de produits à servir grâce à un **compteur
+  mémorisé** (par entité et par boutique), et non plus selon l'heure — qui figeait l'alternance sur un cron de période
+  paire ; le budget non consommé d'une part profite aux autres. Les produits dont seul le stock est à renvoyer tournent équitablement (le plus anciennement
+  envoyé d'abord) au lieu de toujours les mêmes.
+- **Arrêt propre à 240 secondes** (le délai du cron est de 300) : les produits restants attendent le passage suivant,
+  leurs images sont marquées pour passer en priorité. **Partage du temps entre boutiques** : la boutique de rang i sur
+  n a pour échéance le début du passage + 240 s × (i+1)/n (le temps qu'une boutique n'utilise pas profite aux
+  suivantes) et l'**ordre des boutiques tourne** d'un passage à l'autre, pour que ce ne soit pas toujours la même qui
+  ait la dernière tranche. Tant qu'il reste des produits à déclinaisons (ou des modifications de contenu) à traiter,
+  la part principale n'utilise que la moitié (resp. les deux tiers) du temps restant.
+- **Journal du cron exact** : total réel de candidats par passe, nombre examiné, ventilation (contenu envoyé,
+  stock seul, ignorés, échecs) et raison d'arrêt (budget produits, budget temps, fin de liste) — l'ancien
+  message « -1 produits parents traités » était un calcul faux.
+- **Compatibilité MariaDB** : la requête de sélection n'utilisait pas une forme valide sous `ONLY_FULL_GROUP_BY`
+  (acceptée par MySQL grâce à la clé primaire, refusée par MariaDB lorsque ce mode est actif). Vérifié sur les
+  deux moteurs, mode actif.
+- Aide du réglage « Nombre de produits par mise à jour Cron » complétée (5 langues).
+- **L'outil « Réparer les déclinaisons » ne recrée plus de liens quand Dolibarr fait foi.** Il est désormais
+  indisponible (bouton grisé, raison affichée en 5 langues, refus côté serveur) dès que la synchronisation des
+  produits de la boutique n'autorise pas le sens Shopify vers Dolibarr. Seul le **sens** de synchronisation décide :
+  la règle de conflit n'entre pas dans ce contrôle, l'outil reste donc utilisable en sens « les deux » (y compris avec
+  la configuration par défaut) ou Shopify vers Dolibarr.
+- **Un enfant délié ne touche plus jamais la fiche Shopify de son ancien parent.** Il est écarté de l'export (cron,
+  synchronisation manuelle, envoi de stock seul) et marqué « délié » dans sa ligne de correspondance quand Dolibarr
+  fait foi (le cron pose ce marqueur à chaque cycle et journalise, en avertissement, le nombre et les références des
+  enfants écartés) ; cette ligne est **conservée** (elle sert à rapprocher les commandes passées) et la variante
+  disparaît de Shopify par la synchronisation normale du produit parent. Son stock n'est plus envoyé non plus : un
+  enfant sans combinaison Dolibarr est reconnu comme délié par sa situation même (parent renseigné, plus de
+  déclinaison), avec ou sans marqueur, y compris en sens « les deux ».
+  En sens « les deux », un enfant jamais rattaché à un parent n'a donc plus son stock envoyé tant qu'il n'est pas
+  rattaché (utiliser « Réparer les déclinaisons »). Un enfant re-lié depuis voit son marqueur « délié » remis à zéro au
+  cycle suivant.
+- **Attributs et valeurs retrouvés par leur libellé.** Majuscules, accents, espaces, tirets, soulignés et parenthèses
+  ne comptent plus : « Finition (Effet) » retrouve l'attribut existant « Finition-Effet » au lieu d'en créer un
+  second ; les écritures non latines sont comparées telles quelles. Dès qu'un libellé contient un chiffre, seule une
+  correspondance exacte (casse et espaces près) est acceptée (« 2,5 cm » n'est pas « 25 cm »). La création d'un nouvel
+  attribut est journalisée.
+- **La réactivation du module ne produit plus l'erreur « Duplicate entry 'card-1-1' » et le rattachement des réglages à
+  la boutique se termine.** Les correspondances de paiement par défaut sont créées directement sur la boutique par
+  défaut ; chaque table de réglages est rattachée séparément (l'échec d'une ne défait plus les autres, il est journalisé).
+  **Une base déjà touchée est réparée automatiquement** à la prochaine activation : une correspondance « non rattachée »
+  identique à celle déjà rattachée est supprimée ; si les deux diffèrent, rien n'est supprimé, la correspondance rattachée
+  est conservée et un avertissement vous indique le nombre de conflits à examiner.
+- **Stock : le module n'invente plus jamais une quantité de référence « 0 ».** Une ligne de stock dont la référence
+  (quantité connue chez Shopify) est inconnue est refusée **seule** avant l'envoi, avec le motif « référence de stock
+  inconnue » ; les autres lignes du même lot partent et le refus est compté comme un échec (le lot entier n'est plus
+  bloqué). Un stock réellement à 0 connu de Shopify est, lui, toujours envoyé.
+
+### À savoir
+
+- **Migration (appliquée à l'activation du module — désactivez puis réactivez-le après la mise à jour)** : ajout des colonnes
+  `last_content_sync`, `last_failed_at` et `failed_streak`, et rattrapage des produits existants. Les produits (ou
+  déclinaisons) dont le **prix** a été enregistré **au cours des 30 derniers jours** sont marqués « à renvoyer » : ils
+  repartiront vers Shopify au fil des passages du cron (dans la limite par passage, du plus ancien au plus récent) — c'est
+  ce qui rattrape les prix restés bloqués. Le reste du catalogue ne repart pas en masse : **la reprise se fonde sur les
+  prix modifiés depuis 30 jours** ; les autres modifications (libellé, description…) faites avant la mise à jour
+  repartent **au fil des passages, à leur rang dans la part réservée** (voir « Les modifications hors prix ont un délai
+  de propagation borné » : le délai dépend du volume de ventes et de la limite par passage, il peut atteindre plusieurs
+  jours), ou plus tôt si le produit est modifié à nouveau.
+- **Le contenu est désormais renvoyé au plus une fois par jour et par produit.** La règle « contenu de plus de
+  24 h » n'a jamais pu s'appliquer jusqu'ici (la date de comparaison valait toujours « maintenant ») : elle est
+  enfin active. Après la mise à jour, attendez-vous donc à voir **plus d'envois de contenu** qu'avant (chaque
+  produit revient au plus une fois par jour, dans la limite du budget par passage).
+- **La cadence d'envoi du stock change : tous les produits tournent.** Avant, les mêmes 10 produits (les plus
+  petits identifiants) recevaient leur stock à chaque passage et les autres jamais ; désormais chaque produit est
+  servi à son tour, le plus anciennement envoyé d'abord. Sur un catalogue de N produits avec L produits par passage,
+  comptez N/L passages pour un tour complet (ex. 500 produits, 10 par passage, cron horaire : environ 50 heures).
+  Si votre catalogue est grand, augmentez « Nombre de produits par mise à jour Cron ».
+- **Effet des ventes, assumé** : un mouvement de stock (une vente) modifie la date de modification du produit côté
+  Dolibarr (mesuré sur Dolibarr 18, 23 et 24). Le produit est alors considéré « modifié » et son contenu renvoyé
+  une fois, mais **dans la rotation** (jamais avant un changement de prix), dans la limite du budget par passage.
+  Une détection par aspect (stock, prix, contenu) est prévue dans une version ultérieure.
+- **Produits hors vente jamais créés sur Shopify** (option « ne créer que les produits en vente ») : aucune ligne de
+  correspondance ne les fait sortir de la tête de la file, ils sont donc **examinés en dernier** à chaque passage (un
+  appel Shopify de recherche par SKU chacun), dans la limite du temps du passage : sur un catalogue qui en compte
+  beaucoup, la fin de file leur consacre du temps tant que le budget par passage n'est pas rempli par des produits réels.
+- Un prix écrit directement en base (import, script) sans passer par Dolibarr ne laisse pas de ligne d'historique de
+  prix : il n'est pas prioritaire et suit la rotation.
+- Le temps réel produit (déclencheurs de Dolibarr) reste délégué au cron : inchangé, hors périmètre de ce correctif.
+
+### Détail technique (module)
+
+- `class/importproducts.class.php` : `last_content_sync` écrite sous la même condition que `tms` (UPDATE, INSERT,
+  cascade des déclinaisons de `manageProductMapping()`) à l'instant de début de synchro, jamais par le verrou
+  `pending` ; `last_failed_at` écrite au passage en `failed`, remise à NULL au succès ; `checkProductNeedsUpdate()`
+  la lit en epoch calculé par le moteur SQL (`UNIX_TIMESTAMP`, plus de `strtotime()` PHP) (règle des 24 h et
+  déclinaisons comprises ; NULL = resynchroniser) ; rang « prix modifié » sur `llx_product_price.date_price`
+  (`Product::updatePrice()` → `_log_price()`, vérifié sur Dolibarr 18, 23 et 24) ; requêtes de candidats extraites en
+  méthodes pures (`buildSimpleProductsCandidatesSql()` / `buildParentProductsCandidatesSql()`) et boucle extraite
+  en `processCandidates()` / `runCandidatePasses()` ; commentaire erroné du FIX v2.4.1 corrigé.
+- Lot 4 : le compteur de rotation des passes est écrit **hors** de la transaction du cycle (après `commit()` ou
+  `rollback()`) ; l'âge du verrou `sync_lock` est calculé par le moteur SQL (`UNIX_TIMESTAMP()`), plus en PHP ; le
+  rétablissement du statut `failed` d'une retentative de contenu bloquée, comme toute sortie `skipped`, n'estampille
+  `last_stock_sync` que si aucun envoi de stock n'a été tenté.
+- `class/importproductscron.class.php` : échéance globale du cron (début + 240 s) passée à chaque `ImportProducts`.
+- `class/shopifyproductimporter.class.php` : le mapping créé par l'import Shopify → Dolibarr écrit `last_content_sync`
+  avec la même valeur que `tms` (sinon tout produit importé serait ré-exporté en masse).
+- `sql/llx_doli2shop_products.sql` et `sql/update_2.6.1_2.6.2.sql` (nouveau, câblé dans `modDoli2Shop`).
+- Stock : `ShopifyApi::inventorySetQuantities()` n'envoie plus jamais `changeFromQuantity: 0` inventé — une ligne sans référence de stock (ni `current_` ni `on_hand_shopify_quantity`) est refusée seule avant envoi (« référence de stock inconnue », persistante), les autres lignes du lot partent.
+- Tests : 4 fichiers neufs (intégration sur MySQL et MariaDB réels, `ONLY_FULL_GROUP_BY` actif, sur les deux
+  définitions de `tms` ; unitaires de budget/réserve/temps/décision/écritures ; garde-fou sur les écrivains de `tms`) et
+  un scénario de migration rejoué deux fois (groupe `db-migrations`), avec preuve de morsure par mutation.
+
+- Déclinaisons déliées (story `declinaisons-reliees-a-tort-et-enfants-delies`) : `class/variantrepairservice.class.php`
+  (gate `SyncFlowPolicy` par boutique injecté en SQL dans le comptage et la sélection, contrôle dans
+  `processStoreGroup()`, raison d'indisponibilité), `ajax/variant_repair_batch.php` (refus 409 côté serveur),
+  `admin/sync_products.php` ; `class/importproducts.class.php` (exclusion des enfants déliés dans la branche
+  « simples » du constructeur de candidats, partagée avec la part « contenu » ; garde dans `syncProduct()` juste
+  après la lecture du mapping ; marqueur `variant_repair_status = 2` posé seulement en flux produit
+  `dolibarr_to_shopify` exclusif, sans migration : la colonne existe) ; `class/shopifystocktrigger.class.php` et
+  `class/stockrecalageservice.class.php` (stock ignoré pour un enfant délié — marqueur 2 ou condition structurelle —, repli « une seule variante » neutralisé) ;
+  `class/shopifyproductimporter.class.php` (recherche exacte puis normalisée `\p{L}\p{N}`, plus petit identifiant en cas
+  de doublon, avertissement journalisé).
+- Tests : `UnlinkedChildrenIntegrationTest` (MySQL 3306 et MariaDB 3307 réels, scénario parent + 13 enfants dont 2 déliés),
+  `UnlinkedChildrenGuardsTest`, `ShopifyProductImporterOptionKeyTest`, extensions des tests du service de réparation et
+  du déclencheur de stock ; preuve de morsure par mutation pour chaque garde.
+
+- Rattachement des tables techniques (story `backfill-tables-techniques-doublon-paiement-annule-tout`) :
+  `class/paymentmethodsmapping.class.php` (`ensureDefaultMappings()` teste/insère sur la boutique par défaut, 0 seulement
+  sans boutique ; `getDolibarrPaymentId()` en boutique 0 : `ORDER BY fk_store DESC`) ; `class/storeservice.class.php`
+  (`backfillTechnicalTables()` : une transaction par table, anti-jointure sur les colonnes réelles des index uniques —
+  un `NOT EXISTS` sur la table mise à jour est refusé par MySQL (erreur 1093) —, suppression des orphelines de même mode
+  sur `payments` et `shipping_rules`, conservation + `LOG_WARNING` + compteur pour les modes différents, rapport
+  `getLastBackfillReport()`) ; `core/modules/modDoli2Shop.class.php` (message admin des conflits) ; `admin/oauth_receive.php`
+  (commentaire corrigé) ; message `Doli2ShopBackfillConflictsWarning` (5 langues).
+- Tests : `BackfillTechnicalTablesDuplicateIntegrationTest` (MySQL 3306 et MariaDB 3307 réels, schéma construit depuis les
+  vrais fichiers `sql/`), `StoreServiceTest`, `PaymentMethodsMappingDefaultSeedTest` ; preuve de morsure par mutation
+  (anti-jointure retirée, comparaison de mode retirée, seed revenu à `fk_store = 0`, transaction unique rétablie).
+
 ## 2.6.1 — 6 octobre 2026 : SYNTHÈSE — LE STOCK DOLIBARR REPART VERS SHOPIFY, L'API ET LES OUTILS DE MAINTENANCE REDEVIENNENT UTILISABLES
 
 > **Résumé de la version 2.6.1, pensé pour une lecture rapide.** Le détail complet, story par

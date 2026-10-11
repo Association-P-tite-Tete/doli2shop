@@ -128,7 +128,7 @@ CronJobProductsSyncDesc=Automatic export of products from Dolibarr to Shopify
 
 # Sync Settings
 MaxOrdersPerSyncHelp = Number of orders retrieved per batch during pagination. Synchronization continues automatically with subsequent batches. Recommended: 10-50.
-ProductsPerCronUpdateHelp = Maximum number of products to sync per cron job execution. Useful for large catalogs.
+ProductsPerCronUpdateHelp = Maximum number of products to sync per cron job execution. Useful for large catalogs. Products whose price changed in Dolibarr go first; up to a third of this number is reserved for other content changes (label, description, photos), oldest first, and up to half of the rest for products with variants, so that simple products cannot starve them.
 
 # Order settings help
 DeliveryDelayHelp = Number of days between order and expected delivery date
@@ -1790,6 +1790,7 @@ StockRecalageErrorDetail=Error details
 VariantRepairTitle=Variant repair (existing imports)
 VariantRepairIntro=Retroactively attaches products already imported as separate records to their parent, via a real Dolibarr declination — useful to repair a catalog imported before version 2.4.4 (variants invisible in the Dolibarr UI).
 VariantRepairDisabledWarning=The Dolibarr Variants module is not enabled; the repair cannot be started.
+VariantRepairBlockedFlow=The tool is unavailable: Dolibarr is the source of truth for products (Shopify to Dolibarr synchronization is not allowed for this store). It would recreate variants that you deliberately deleted in Dolibarr.
 VariantRepairCountLabel=%s product(s) to repair
 VariantRepairLastRunLabel=Last repair:
 VariantRepairLastRunSummary=%s — %s product(s) repaired, %s error(s)
@@ -2280,3 +2281,6 @@ ShopifyOrderNoCustomerIdentity=Order %s has no customer identity (no e-mail, no 
 SyncReportCollectionsAutomaticSkipped=%s collection(s) driven by conditions in Shopify: the module does not add products to them — switch the collection to manual if you want the module to fill it
 SyncReportCollectionsAutomaticRefused=%s collection(s) refused by Shopify (message pointing to an automatic collection): no product could be attached — add a condition or switch the collection to manual in Shopify
 SyncReportCollectionsDetailUnreadable=%s collection(s) skipped as a precaution: Shopify refuses to return their conditions, so the module cannot tell whether they are driven by conditions and adds no products to them
+Doli2ShopBackfillConflictsWarning=%s settings mapping(s) in conflict while attaching to the default store: the same key already existed, attached to the store, with a different value. The attached mapping is kept, the other one is left untouched (details in the module log).
+ProductOptionsLimitRefusal=Product %s refused before sending: %s options after merging attributes with the same label, Shopify accepts at most %s. Options: %s. Remove or group an attribute in Dolibarr.
+ProductVariantsDroppedRefusal=Product %s refused before sending: %s active variant(s) cannot be sent (%s). Shopify would delete the variants missing from the request; complete or fix these variants in Dolibarr.

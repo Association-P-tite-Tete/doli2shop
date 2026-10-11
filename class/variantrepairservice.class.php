@@ -8,7 +8,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       2.4.4
  * @link        https://doli2shop.ptitetete.org
  */
@@ -21,6 +21,7 @@ if (!defined('DOL_DOCUMENT_ROOT') && !defined('DOLIBARR_INC_FOR_MODULES')) {
 require_once dirname(__FILE__) . '/LoggerTrait.php';
 require_once dirname(__FILE__) . '/actionlogger.class.php';
 require_once dirname(__FILE__) . '/storeservice.class.php';
+require_once dirname(__FILE__) . '/syncflowpolicy.class.php';
 require_once dirname(__FILE__) . '/shopifyproductimporter.class.php';
 require_once dirname(__FILE__) . '/../lib/doli2shop.lib.php';
 
@@ -65,6 +66,26 @@ class VariantRepairService
     /** Borne haute de sécurité sur $limit (paramètre utilisateur via AJAX) */
     const MAX_BATCH_SIZE = 100;
 
+    /** Valeur de `variant_repair_status` : candidat réparable (défaut) */
+    const STATUS_CANDIDATE = 0;
+
+    /** Valeur de `variant_repair_status` : irréparable permanent (markPermanentlyUnfixable()) */
+    const STATUS_UNFIXABLE = 1;
+
+    /**
+     * Valeur de `variant_repair_status` : enfant DÉLIÉ volontairement dans Dolibarr (hotfix 2.6.2).
+     * Posée par ImportProducts::syncProduct() quand Dolibarr fait foi (flux produit dolibarr_to_shopify
+     * exclusif) et que le mapping a un parent sans ProductCombination. Jamais réparé, jamais exporté,
+     * jamais poussé en stock ; la ligne de mapping (et son shopifyVariantId) est CONSERVÉE.
+     */
+    const STATUS_UNLINKED = 2;
+
+    /** Raison d'indisponibilité : le flux produit n'autorise pas Shopify -> Dolibarr pour la boutique */
+    const BLOCK_FLOW_NOT_ALLOWED = 'flow_not_allowed';
+
+    /** @var SyncFlowPolicy|null Politique de synchronisation (paresseuse, 1 instance par service) */
+    private $syncFlowPolicy;
+
     /** @var DoliDB Gestionnaire de base de données */
     private $db;
 
@@ -98,6 +119,144 @@ class VariantRepairService
     public function isEnabled()
     {
         return (bool) isModEnabled('variants');
+    }
+
+    /**
+     * Factory protégée SyncFlowPolicy (mockable — pattern ImportProducts::createSyncFlowPolicy()).
+     *
+     * @return SyncFlowPolicy
+     */
+    protected function createSyncFlowPolicy()
+    {
+        return new SyncFlowPolicy($this->db, $this->entity);
+    }
+
+    /**
+     * @return SyncFlowPolicy
+     */
+    private function getSyncFlowPolicy()
+    {
+        if ($this->syncFlowPolicy === null) {
+            $this->syncFlowPolicy = $this->createSyncFlowPolicy();
+        }
+        return $this->syncFlowPolicy;
+    }
+
+    /**
+     * Raison pour laquelle la réparation est INTERDITE pour une boutique, '' si elle est permise
+     * (hotfix 2.6.2, AC1). L'outil écrit dans Dolibarr à partir de Shopify (il crée des
+     * ProductCombination) : il n'a donc de sens que si Shopify -> Dolibarr est autorisé pour
+     * `FLOW_PRODUCT_UPDATE` (`both` ou `shopify_to_dolibarr`). Sans condition sur la stratégie de conflit (D2 :
+     * son défaut legacy vaut `dolibarr_wins`, ce qui fermait l'outil en `both`). Sinon, il recréait les
+     * liens que le mainteneur avait volontairement supprimés (incident BASE_SLIM, 09/10/2026).
+     *
+     * @param int $storeRowId Rowid boutique (0 = chemin historique/fallback, politique globale)
+     * @return string '' | self::BLOCK_FLOW_NOT_ALLOWED
+     */
+    public function getStoreBlockReason($storeRowId)
+    {
+        $storeRowId = max(0, (int) $storeRowId);
+        $policy = $this->getSyncFlowPolicy();
+        if (!$policy->isAllowed(SyncFlowPolicy::FLOW_PRODUCT_UPDATE, 'shopify_to_dolibarr', $storeRowId)) {
+            return self::BLOCK_FLOW_NOT_ALLOWED;
+        }
+        return '';
+    }
+
+    /**
+     * Rowid de boutiques portant des lignes enfants (`fk_product_parent > 0`) dans l'entité.
+     * fk_store = 0 (chemin historique) y figure tel quel.
+     *
+     * @return int[]
+     */
+    protected function fetchChildStoreIds()
+    {
+        $sql = "SELECT DISTINCT p.fk_store FROM " . MAIN_DB_PREFIX . "doli2shop_products p";
+        $sql .= " WHERE p.entity = " . (int) $this->entity . " AND p.fk_product_parent > 0";
+        $sql .= " ORDER BY p.fk_store";
+        $storeIds = array();
+        $resql = $this->db->query($sql);
+        if ($resql) {
+            while ($obj = $this->db->fetch_object($resql)) {
+                $storeIds[] = (int) $obj->fk_store;
+            }
+            $this->db->free($resql);
+        } else {
+            $this->log('fetchChildStoreIds() - Erreur requête: ' . $this->db->lasterror(), LOG_ERR);
+        }
+        return $storeIds;
+    }
+
+    /**
+     * Boutiques de la portée demandée (une boutique précise, ou toutes celles portant des enfants).
+     *
+     * @param int $storeId Rowid boutique (0 = toutes)
+     * @return int[]
+     */
+    private function getScopeStoreIds($storeId)
+    {
+        return ((int) $storeId > 0) ? array((int) $storeId) : $this->fetchChildStoreIds();
+    }
+
+    /**
+     * Boutiques de la portée pour lesquelles la réparation est autorisée (AC1).
+     *
+     * @param int $storeId Rowid boutique (0 = toutes)
+     * @return int[]
+     */
+    public function getAllowedStoreIds($storeId = 0)
+    {
+        $allowed = array();
+        foreach ($this->getScopeStoreIds($storeId) as $scopeStoreId) {
+            if ($this->getStoreBlockReason($scopeStoreId) === '') {
+                $allowed[] = $scopeStoreId;
+            }
+        }
+        return $allowed;
+    }
+
+    /**
+     * Raison d'indisponibilité de l'outil pour la portée demandée : '' si au moins une boutique de la
+     * portée est autorisée (ou si la portée est vide : rien à bloquer), sinon la raison de la première
+     * boutique refusée. Sert au grisage du bouton, au message affiché ET au refus côté serveur de
+     * l'endpoint AJAX.
+     *
+     * @param int $storeId Rowid boutique (0 = toutes)
+     * @return string '' | BLOCK_FLOW_NOT_ALLOWED
+     */
+    public function getRepairUnavailableReason($storeId = 0)
+    {
+        $scope = $this->getScopeStoreIds($storeId);
+        if (empty($scope)) {
+            return '';
+        }
+        $firstReason = '';
+        foreach ($scope as $scopeStoreId) {
+            $reason = $this->getStoreBlockReason($scopeStoreId);
+            if ($reason === '') {
+                return '';
+            }
+            if ($firstReason === '') {
+                $firstReason = $reason;
+            }
+        }
+        return $firstReason;
+    }
+
+    /**
+     * Clause SQL du gate AC1 : ` AND p.fk_store IN (...)` limitée aux boutiques autorisées, ou
+     * ` AND 1 = 0` si aucune ne l'est (le compteur peut ainsi valoir 0 sans rien lire de plus).
+     *
+     * @param int $storeId Rowid boutique (0 = toutes)
+     * @return string
+     */
+    private function buildStoreGateSql($storeId)
+    {
+        $allowed = $this->getAllowedStoreIds($storeId);
+        if (empty($allowed)) {
+            return " AND 1 = 0";
+        }
+        return " AND p.fk_store IN (" . implode(',', array_map('intval', $allowed)) . ")";
     }
 
     /**
@@ -143,9 +302,14 @@ class VariantRepairService
         if ($storeId > 0) {
             $sql .= " AND p.fk_store = " . $storeId;
         }
+        // Hotfix 2.6.2 (AC1) : gate du sens de synchro, en SQL, pour les DEUX pools (rattachement et libellés).
+        $sql .= $this->buildStoreGateSql($storeId);
+        // `variant_repair_status = 2` (enfant délié) est exclu : seuls NULL / 0 sont des candidats de rattachement.
         $sql .= " AND ((pac.rowid IS NULL AND (p.variant_repair_status IS NULL OR p.variant_repair_status = 0))";
         if ($includeLabelOnly) {
-            $sql .= " OR (pac.rowid IS NOT NULL AND childp.label = parentp.label)";
+            // Un marqueur 2 (délié) avec une combinaison présente = relié à la main dans Dolibarr depuis : hors pool,
+            // processOneCandidate() ne le traite pas (cohérence compteur / traitement, convergence vers 0).
+            $sql .= " OR (pac.rowid IS NOT NULL AND childp.label = parentp.label AND (p.variant_repair_status IS NULL OR p.variant_repair_status <> 2))";
         }
         $sql .= ")";
 
@@ -288,6 +452,14 @@ class VariantRepairService
             }
         }
 
+        // Hotfix 2.6.2 (AC1) : contrôle de sécurité, en plus du gate SQL de la sélection — un appelant qui
+        // fournirait des candidats autrement (test, évolution future) ne doit jamais rattacher quand Dolibarr fait foi.
+        $blockReason = $this->getStoreBlockReason($storeRowId);
+        if ($blockReason !== '') {
+            $this->skipGroup($storeCandidates, $result, "boutique #$storeRowId : réparation interdite par le sens de synchronisation ($blockReason)");
+            return;
+        }
+
         $licenceCheck = $this->checkStoreLicence($store);
         if (empty($licenceCheck['allowed'])) {
             $reason = $licenceCheck['reason'] ?? 'unknown';
@@ -356,6 +528,17 @@ class VariantRepairService
         $shopifyVariantId = $candidate->shopifyVariantId;
 
         try {
+            // Hotfix 2.6.2 (AC2) : un enfant DÉLIÉ n'est JAMAIS re-rattaché, quelle que soit la façon dont il est
+            // arrivé jusqu'ici. linkDolibarrVariant() n'est pas appelé, rien n'est marqué ni supprimé.
+            if (isset($candidate->variant_repair_status) && (int) $candidate->variant_repair_status === self::STATUS_UNLINKED) {
+                $result['skipped']++;
+                $message = "Produit #$childId : déclinaison supprimée volontairement dans Dolibarr (variant_repair_status = 2), aucun rattachement";
+                $result['errorDetails'][] = $message;
+                $this->logAction(ActionLogger::RESULT_SKIPPED, $childId, $message);
+                $this->log('processOneCandidate() - ' . $message, LOG_WARNING);
+                return;
+            }
+
             if ($childId <= 0 || $parentId <= 0) {
                 $message = "Produit #$childId : mapping invalide (parent=$parentId), réparation impossible";
                 $result['errorDetails'][] = $message;
@@ -682,7 +865,7 @@ class VariantRepairService
         $storeId = (int) $storeId;
         $includeLabelOnly = (bool) $includeLabelOnly;
 
-        $sql = "SELECT p.fk_product, p.fk_product_parent, p.fk_store, p.shopifyProductId, p.shopifyVariantId";
+        $sql = "SELECT p.fk_product, p.fk_product_parent, p.fk_store, p.shopifyProductId, p.shopifyVariantId, p.variant_repair_status";
         $sql .= " FROM " . MAIN_DB_PREFIX . "doli2shop_products p";
         $sql .= " LEFT JOIN " . MAIN_DB_PREFIX . "product_attribute_combination pac ON pac.fk_product_child = p.fk_product";
         if ($includeLabelOnly) {
@@ -694,9 +877,14 @@ class VariantRepairService
         if ($storeId > 0) {
             $sql .= " AND p.fk_store = " . $storeId;
         }
+        // Hotfix 2.6.2 (AC1) : gate du sens de synchro, en SQL, pour les DEUX pools (rattachement et libellés).
+        $sql .= $this->buildStoreGateSql($storeId);
+        // `variant_repair_status = 2` (enfant délié) est exclu : seuls NULL / 0 sont des candidats de rattachement.
         $sql .= " AND ((pac.rowid IS NULL AND (p.variant_repair_status IS NULL OR p.variant_repair_status = 0))";
         if ($includeLabelOnly) {
-            $sql .= " OR (pac.rowid IS NOT NULL AND childp.label = parentp.label)";
+            // Un marqueur 2 (délié) avec une combinaison présente = relié à la main dans Dolibarr depuis : hors pool,
+            // processOneCandidate() ne le traite pas (cohérence compteur / traitement, convergence vers 0).
+            $sql .= " OR (pac.rowid IS NOT NULL AND childp.label = parentp.label AND (p.variant_repair_status IS NULL OR p.variant_repair_status <> 2))";
         }
         $sql .= ")";
         $sql .= " AND p.fk_product > " . (int) $afterFkProduct;

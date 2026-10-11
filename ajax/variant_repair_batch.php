@@ -27,7 +27,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       2.4.4
  * @link        https://doli2shop.ptitetete.org
  */
@@ -112,6 +112,22 @@ if ($storeId > 0) {
 
 $repairService = new VariantRepairService($db, $user, $conf->entity);
 
+// Hotfix 2.6.2 (AC1) : l'outil écrit dans Dolibarr à partir de Shopify. Si le sens de synchronisation
+// des produits ne l'autorise pas (Dolibarr fait foi), il est INDISPONIBLE — refus décidé ICI, côté
+// serveur, jamais seulement par le grisage du bouton. `finish` (accusé de fin) reste permis.
+$repairUnavailableReason = '';
+if ($action == 'get_count' || $action == 'repair_batch') {
+    $repairUnavailableReason = $repairService->getRepairUnavailableReason($storeId);
+}
+$repairUnavailableMessage = '';
+if ($repairUnavailableReason !== '') {
+    $repairUnavailableMessage = html_entity_decode(
+        $langs->trans('VariantRepairBlockedFlow'),
+        ENT_QUOTES,
+        'UTF-8'
+    );
+}
+
 // ===========================================
 // ACTION: get_count — nombre de candidats concernés (AC #3)
 // ===========================================
@@ -129,6 +145,7 @@ if ($action == 'get_count') {
         // renvoyés en plus, pour que le JS puisse expliquer un total à 0 plutôt que de le taire
         // (cf admin/sync_products.php, VariantRepairNothingToDoCheckLabels).
         $fixLabelsForCount = (bool) GETPOSTINT('fix_labels');
+        // (les comptages valent déjà 0 en SQL quand le gate AC1 refuse ; la raison est renvoyée pour l'affichage)
         $attachTotal = $repairService->countRepairCandidates($storeId, false);
         $combinedTotal = $repairService->countRepairCandidates($storeId, true);
         $labelOnlyTotal = max(0, $combinedTotal - $attachTotal);
@@ -139,7 +156,9 @@ if ($action == 'get_count') {
             'total' => $total,
             'attachTotal' => $attachTotal,
             'labelOnlyTotal' => $labelOnlyTotal,
-            'enabled' => $repairService->isEnabled(),
+            'enabled' => $repairService->isEnabled() && $repairUnavailableReason === '',
+            'unavailableReason' => $repairUnavailableReason,
+            'unavailableMessage' => $repairUnavailableMessage,
         ), JSON_HEX_TAG | JSON_HEX_AMP);
     } catch (Exception $e) {
         http_response_code(500);
@@ -152,6 +171,25 @@ if ($action == 'get_count') {
 // ACTION: repair_batch — traite un lot (AC #1, #2, #5)
 // ===========================================
 if ($action == 'repair_batch') {
+    if ($repairUnavailableReason !== '') {
+        http_response_code(409);
+        echo json_encode(array(
+            'success' => false,
+            'processed' => 0,
+            'repaired' => 0,
+            'skipped' => 0,
+            'errors' => 0,
+            'labelsFixed' => 0,
+            'unfixable' => 0,
+            'hasMore' => false,
+            'cursor' => null,
+            'errorDetails' => array(),
+            'unavailableReason' => $repairUnavailableReason,
+            'message' => $repairUnavailableMessage,
+        ), JSON_HEX_TAG | JSON_HEX_AMP);
+        exit;
+    }
+
     // Extend time limit for batch processing (pattern stock_recalage_batch.php)
     @set_time_limit(0);
 

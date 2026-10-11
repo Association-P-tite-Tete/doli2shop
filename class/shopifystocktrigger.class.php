@@ -9,7 +9,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       2.1.8
  */
 
@@ -1271,6 +1271,13 @@ class ShopifyStockTrigger
      */
     protected function resolveInventoryItemId($dolibarrProductId, $storeId, $api, $bypassApiResolutionCap = false)
     {
+        // Hotfix 2.6.2 : un enfant DÉLIÉ (variant_repair_status = 2, plus de déclinaison) ne pousse plus aucun
+        // stock — ni via la table d'inventaire (ancienne variante), ni via l'API (cf. resolveInventoryItemIdViaApi()).
+        if ($this->isUnlinkedChild($dolibarrProductId, $storeId)) {
+            $this->log("resolveInventoryItemId - produit Dolibarr ID " . (int) $dolibarrProductId . " : enfant délié de son ancien parent, aucun stock poussé vers Shopify", LOG_DEBUG);
+            return null;
+        }
+
         $viaDb = $this->getShopifyInventoryId($dolibarrProductId, $storeId);
         if (!empty($viaDb)) {
             return $viaDb;
@@ -1329,6 +1336,13 @@ class ShopifyStockTrigger
         $productRef = $this->getProductRef($dolibarrProductId);
         if ($productRef === null) {
             $this->log("Résolution API impossible : produit Dolibarr ID " . $dolibarrProductId . " introuvable", LOG_WARNING);
+            return null;
+        }
+
+        // Hotfix 2.6.2 : enfant délié -> ni mapping (getShopifyProductId() l'ignore), ni recherche par SKU,
+        // ni repli « une seule variante Shopify » : ce repli aurait retenu la DERNIÈRE variante du produit de
+        // l'ancien parent et y aurait écrasé son stock par celui de l'enfant délié.
+        if ($this->isUnlinkedChild($dolibarrProductId, $storeId)) {
             return null;
         }
 
@@ -1507,6 +1521,41 @@ class ShopifyStockTrigger
     }
 
     /**
+     * Le produit est-il un enfant DÉLIÉ (hotfix 2.6.2) ? Ligne de mapping `fk_product_parent > 0` (condition
+     * structurelle, indépendante du marqueur `variant_repair_status = 2`, D1) ET plus aucune
+     * `product_attribute_combination` pour ce produit (un enfant relié à la main depuis reprend sa vie
+     * de déclinaison : un marqueur périmé ne doit pas le priver de stock). Filtre entité ; fk_store seulement
+     * si storeId > 0 (invariant §14). Lecture en échec = false (jamais de blocage sur une erreur SQL).
+     *
+     * @param int $dolibarrProductId ID du produit Dolibarr
+     * @param int $storeId           Rowid boutique (0 = legacy, pas de filtre fk_store)
+     * @return bool
+     * @since 2.6.2
+     */
+    protected function isUnlinkedChild($dolibarrProductId, $storeId = 0)
+    {
+        $sql = "SELECT 1 FROM " . MAIN_DB_PREFIX . "doli2shop_products p";
+        $sql .= " WHERE p.fk_product = " . ((int) $dolibarrProductId);
+        $sql .= " AND p.entity = " . ((int) $this->entity);
+        if ((int) $storeId > 0) {
+            $sql .= " AND p.fk_store = " . ((int) $storeId);
+        }
+        // D1 : condition STRUCTURELLE (parent > 0 sans combinaison), indépendante du marqueur : le cron
+        // n'atteint jamais syncProduct() pour un enfant délié (exclusion SQL), le marqueur peut donc manquer.
+        $sql .= " AND (p.fk_product_parent > 0 OR p.variant_repair_status = 2)";
+        $sql .= " AND NOT EXISTS (SELECT 1 FROM " . MAIN_DB_PREFIX . "product_attribute_combination pac WHERE pac.fk_product_child = p.fk_product)";
+        $sql .= " LIMIT 1";
+
+        $resql = $this->db->query($sql);
+        if (!$resql) {
+            return false;
+        }
+        $found = ($this->db->num_rows($resql) > 0);
+        $this->db->free($resql);
+        return $found;
+    }
+
+    /**
      * Lit le shopifyProductId (legacyResourceId numérique, PAS un GID) mappé localement pour un
      * produit Dolibarr, filtré par boutique.
      *
@@ -1525,6 +1574,9 @@ class ShopifyStockTrigger
             $sql .= " AND fk_store = " . ((int) $storeId);
         }
         $sql .= " AND shopifyProductId IS NOT NULL AND shopifyProductId != ''";
+        // Hotfix 2.6.2 : le shopifyProductId d'un enfant délié est celui de son ANCIEN parent, jamais le sien.
+        $sql .= " AND ((COALESCE(fk_product_parent, 0) <= 0 AND (variant_repair_status IS NULL OR variant_repair_status <> 2))";
+        $sql .= " OR EXISTS (SELECT 1 FROM " . MAIN_DB_PREFIX . "product_attribute_combination pac WHERE pac.fk_product_child = " . MAIN_DB_PREFIX . "doli2shop_products.fk_product))";
         $sql .= " LIMIT 1";
 
         $resql = $this->db->query($sql);

@@ -12,7 +12,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.org>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       2.1.6
  * @link        https://doli2shop.ptitetete.org
  */
@@ -505,8 +505,10 @@ if ($targetsDefaultStore && !empty($previous_shop) && $previous_shop !== $shop) 
     // Review 3 couches du 09/09/2026 (HIGH, bord n°1) — MÊME classe de défaut que
     // disconnect_oauth.php, corrigée ici aussi plutôt que laissée en dette : le filtre `fk_store`
     // strict rate les lignes restées à `fk_store = 0` quand le backfill Epic 47-2
-    // (StoreService::backfillTechnicalTables(), chaque UPDATE ayant sa propre gestion d'erreur
-    // SANS transaction globale) a partiellement échoué. Ces orphelines ne sont incluses QUE si la
+    // (StoreService::backfillTechnicalTables(), qui traite chaque table dans SA transaction —
+    // l'échec d'une table n'annule pas les autres, mais la laisse non rattachée, de même qu'une
+    // orpheline conservée faute de pouvoir la fusionner sans perdre une correspondance) a
+    // partiellement échoué. Ces orphelines ne sont incluses QUE si la
     // cible est la boutique par défaut ET qu'aucune autre boutique n'existe — mono-boutique
     // garanti par construction, donc aucune ambiguïté d'appartenance. En multi-boutiques, une
     // orpheline peut appartenir à une secondaire : le filtre strict reste, un DELETE est

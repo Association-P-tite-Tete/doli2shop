@@ -8,7 +8,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       2.4.2
  * @link        https://doli2shop.ptitetete.org
  */
@@ -347,6 +347,10 @@ class StockRecalageService
         if ((int) $storeId > 0) {
             $sql .= " AND fk_store = " . (int) $storeId;
         }
+        // Hotfix 2.6.2 : les enfants DÉLIÉS (variant_repair_status = 2, plus de déclinaison) n'ont plus de
+        // stock à pousser — leur shopifyProductId est celui de leur ancien parent.
+        $sql .= " AND ((COALESCE(fk_product_parent, 0) <= 0 AND (variant_repair_status IS NULL OR variant_repair_status <> 2))";
+        $sql .= " OR EXISTS (SELECT 1 FROM " . MAIN_DB_PREFIX . "product_attribute_combination pac WHERE pac.fk_product_child = " . MAIN_DB_PREFIX . "doli2shop_products.fk_product))";
         $sql .= " ORDER BY fk_product";
         $sql .= $this->db->plimit((int) $limit, (int) $offset);
 

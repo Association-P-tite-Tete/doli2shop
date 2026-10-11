@@ -1,6 +1,6 @@
 -- Description: This file contains the SQL code to create the table used to store the mapping between Dolibarr products and Shopify products.
 -- Date: 2026-06-23
--- Version: 2.3.2
+-- Version: 2.6.2
 -- Author: P'tite Tête
 -- Copyright   2022-2025 Robert Steinbacher<robert.steinbacher@xivtech.de>
 -- Copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
@@ -32,9 +32,21 @@ CREATE TABLE llx_doli2shop_products
   -- Timestamps
   tms                 datetime NOT NULL,
   last_stock_sync     datetime DEFAULT NULL COMMENT 'Dernière sync stock effective (push Shopify réussi)',
+  -- Hotfix 2.6.2 : référence STABLE « dernier contenu synchronisé ». tms ne peut pas la porter : sur toute
+  -- base migrée il est TIMESTAMP ... ON UPDATE CURRENT_TIMESTAMP (update_2.1.5_2.1.6.sql), donc le verrou
+  -- 'pending' posé AVANT la décision le ramène à NOW(). Écrite uniquement par une vraie synchro de contenu
+  -- (productSet exécuté), jamais par le verrou, le stock seul, skipped ni failed.
+  last_content_sync   datetime DEFAULT NULL COMMENT 'Dernière synchro de CONTENU réussie (productSet), jamais touchée par le verrou pending ni le stock seul',
+  -- Hotfix 2.6.2 (R4) : horodatage du dernier passage en `failed`. Le cron ne retente une ligne `failed`
+  -- qu'après un délai croissant (failed_streak, plafond 6 h) : sans cela, dix échecs permanents reprendraient
+  -- chacun une place à chaque cycle. Remis à NULL par un succès de CONTENU.
+  last_failed_at      datetime DEFAULT NULL COMMENT 'Dernier passage en failed (le cron ne retente le contenu qu apres un delai croissant), NULL apres un succes de contenu',
+  -- Hotfix 2.6.2 (S5) : échecs CONSÉCUTIFS du contenu ; délai avant retentative = min(6 h, 1 h × 2^(streak − 1)),
+  -- levé si le produit est modifié après l'échec. Remis à 0 par un succès de CONTENU (pas par le stock seul).
+  failed_streak       int(11) NOT NULL DEFAULT 0 COMMENT 'Echecs consecutifs du contenu (delai croissant avant retentative), 0 apres un succes de contenu',
 
   -- Réparation batch des déclinaisons (hotfix 2.4.4 2/2, correctifs post-review 3-couches)
-  variant_repair_status tinyint(1) NOT NULL DEFAULT 0 COMMENT '0 = candidat réparation variante, 1 = irréparable permanent (VariantRepairService)',
+  variant_repair_status tinyint(1) NOT NULL DEFAULT 0 COMMENT '0 = candidat réparation variante, 1 = irréparable permanent (VariantRepairService), 2 = enfant délié volontairement dans Dolibarr (posé quand Dolibarr fait foi) : jamais réparé ni exporté, ligne conservée',
 
   -- Traitement produits "hors vente" déjà poussés (Story 58-5, AC6)
   offsale_action_status varchar(20) DEFAULT NULL COMMENT 'left_draft / archived — traitement OffSaleProductsService, NULL = non traité (pas de valeur pour supprimé, la ligne est retirée)',

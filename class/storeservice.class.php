@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       2.3.1
  * @link        https://doli2shop.ptitetete.org
  */
@@ -52,6 +52,9 @@ class StoreService
 
     /** @var int Identifiant entité Dolibarr */
     private $entity;
+
+    /** @var array Rapport du dernier backfillTechnicalTables() (cf. getLastBackfillReport()) */
+    private $lastBackfillReport = array('tables' => array(), 'errors' => 0, 'conflicts' => 0, 'skipped' => 0);
 
     /**
      * Constructeur
@@ -1150,6 +1153,11 @@ class StoreService
      * en les assignant à la boutique par défaut de l'entité.
      *
      * Idempotent : ne touche que les lignes où fk_store = 0 (filtre explicit).
+     *
+     * ⚠️ Transaction : chaque table a SA transaction (begin/commit/rollback). DoliDB::rollback()
+     * ne fait que DÉCRÉMENTER le compteur si une transaction englobante est ouverte
+     * (DoliDB.class.php ~268-274) : rien n'est alors annulé. L'appelant doit donc l'appeler HORS
+     * transaction (cas actuel : modDoli2Shop::init() après _init()).
      * No-op si aucune boutique par défaut n'existe pour l'entité.
      *
      * Tables concernées : llx_doli2shop_products, llx_doli2shop_orders,
@@ -1176,89 +1184,255 @@ class StoreService
 
         $entity = (int) $this->entity;
 
-        $this->db->begin();
+        $this->lastBackfillReport = array('tables' => array(), 'errors' => 0, 'conflicts' => 0, 'skipped' => 0);
 
-        $totalUpdated = 0;
+        $totalChanged = 0;
+        $specs = self::getBackfillTableSpecs();
 
-        // --- products ---
-        $sql = 'UPDATE ' . MAIN_DB_PREFIX . 'doli2shop_products';
-        $sql .= ' SET fk_store = ' . $defaultRowid;
-        $sql .= ' WHERE entity = ' . $entity;
-        $sql .= ' AND fk_store = 0';
-
-        $result = $this->db->query($sql);
-        if (!$result) {
-            $this->db->rollback();
-            $this->log('backfillTechnicalTables() - Erreur UPDATE products: ' . $this->db->lasterror(), LOG_ERR);
-            return -1;
+        // Hotfix 2.6.2 : UNE transaction par table. L'ancienne transaction unique faisait annuler les
+        // quatre premières tables par l'échec de la dernière (payments) — et l'échec se rejouait à
+        // chaque init(). Une table en échec est journalisée et comptée, les autres restent commitées.
+        foreach ($specs as $name => $spec) {
+            $tableReport = $this->backfillOneTable($name, $spec, $entity, $defaultRowid);
+            $this->lastBackfillReport['tables'][$name] = $tableReport;
+            if ($tableReport['error']) {
+                $this->lastBackfillReport['errors']++;
+                continue;
+            }
+            $totalChanged += $tableReport['updated'] + $tableReport['deleted'];
+            $this->lastBackfillReport['conflicts'] += $tableReport['conflicts'];
+            $this->lastBackfillReport['skipped'] += $tableReport['skipped'];
         }
-        $totalUpdated += (int) $this->db->affected_rows($result);
-
-        // --- orders ---
-        $sql = 'UPDATE ' . MAIN_DB_PREFIX . 'doli2shop_orders';
-        $sql .= ' SET fk_store = ' . $defaultRowid;
-        $sql .= ' WHERE entity = ' . $entity;
-        $sql .= ' AND fk_store = 0';
-
-        $result = $this->db->query($sql);
-        if (!$result) {
-            $this->db->rollback();
-            $this->log('backfillTechnicalTables() - Erreur UPDATE orders: ' . $this->db->lasterror(), LOG_ERR);
-            return -1;
-        }
-        $totalUpdated += (int) $this->db->affected_rows($result);
-
-        // --- inventory ---
-        $sql = 'UPDATE ' . MAIN_DB_PREFIX . 'doli2shop_inventory';
-        $sql .= ' SET fk_store = ' . $defaultRowid;
-        $sql .= ' WHERE entity = ' . $entity;
-        $sql .= ' AND fk_store = 0';
-
-        $result = $this->db->query($sql);
-        if (!$result) {
-            $this->db->rollback();
-            $this->log('backfillTechnicalTables() - Erreur UPDATE inventory: ' . $this->db->lasterror(), LOG_ERR);
-            return -1;
-        }
-        $totalUpdated += (int) $this->db->affected_rows($result);
-
-        // --- shipping_rules (Story 48-4 : mappings expédition par boutique) ---
-        $sql = 'UPDATE ' . MAIN_DB_PREFIX . 'doli2shop_shipping_rules';
-        $sql .= ' SET fk_store = ' . $defaultRowid;
-        $sql .= ' WHERE entity = ' . $entity;
-        $sql .= ' AND fk_store = 0';
-
-        $result = $this->db->query($sql);
-        if (!$result) {
-            $this->db->rollback();
-            $this->log('backfillTechnicalTables() - Erreur UPDATE shipping_rules: ' . $this->db->lasterror(), LOG_ERR);
-            return -1;
-        }
-        $totalUpdated += (int) $this->db->affected_rows($result);
-
-        // --- payments (Story 48-4 : mappings paiement par boutique) ---
-        $sql = 'UPDATE ' . MAIN_DB_PREFIX . 'doli2shop_payments';
-        $sql .= ' SET fk_store = ' . $defaultRowid;
-        $sql .= ' WHERE entity = ' . $entity;
-        $sql .= ' AND fk_store = 0';
-
-        $result = $this->db->query($sql);
-        if (!$result) {
-            $this->db->rollback();
-            $this->log('backfillTechnicalTables() - Erreur UPDATE payments: ' . $this->db->lasterror(), LOG_ERR);
-            return -1;
-        }
-        $totalUpdated += (int) $this->db->affected_rows($result);
-
-        $this->db->commit();
 
         $this->log(
             'backfillTechnicalTables() - Backfill terminé entity=' . $entity
             . ' fk_store=' . $defaultRowid
-            . ' lignes mises à jour=' . $totalUpdated,
-            $totalUpdated > 0 ? LOG_INFO : LOG_DEBUG
+            . ' lignes modifiées=' . $totalChanged
+            . ' tables en échec=' . $this->lastBackfillReport['errors']
+            . ' conflits=' . $this->lastBackfillReport['conflicts']
+            . ' ignorées (homologue déjà rattaché)=' . $this->lastBackfillReport['skipped'],
+            ($totalChanged > 0 || $this->lastBackfillReport['errors'] > 0) ? LOG_INFO : LOG_DEBUG
         );
 
-        return $totalUpdated;
+        // -1 seulement si AUCUNE table n'a pu être traitée ; un échec partiel se lit dans le rapport.
+        if ($this->lastBackfillReport['errors'] >= count($specs)) {
+            return -1;
+        }
+
+        return $totalChanged;
+    }
+
+    /**
+     * Rapport du DERNIER backfillTechnicalTables() : par table `updated`, `deleted`, `skipped`,
+     * `conflicts`, `error` ; plus les totaux `errors`, `conflicts`, `skipped`.
+     *
+     * @return array{tables: array<string, array<string, mixed>>, errors: int, conflicts: int, skipped: int}
+     */
+    public function getLastBackfillReport(): array
+    {
+        return $this->lastBackfillReport;
+    }
+
+    /**
+     * Définition des 5 tables rattachées par le backfill : `key` = condition de jointure sur les
+     * colonnes de la clé unique SANS fk_store (a = ligne orpheline fk_store=0, h = homologue déjà
+     * rattaché). Index réels relevés dans sql/ (information_schema.STATISTICS, MySQL ET MariaDB) :
+     * products (fk_product, entity, fk_product_parent[_key], fk_store) ; orders (fk_commande, fk_store)
+     * ET (shopifyOrderId, fk_store) ; inventory (shopify_inventory_item_id, entity, fk_store) ;
+     * shipping_rules (entity, fk_store, rule_type, shopify_pattern) ; payments (shopify_payment_method,
+     * entity, fk_store). `mode` = colonne comparée avant de supprimer une orpheline redondante
+     * (null = jamais de suppression : on ne fait que ne pas la rattacher). `label` = colonnes de clé
+     * lisibles pour le journal.
+     *
+     * @return array<string, array{table: string, key: string, mode: ?string, label: string[]}>
+     */
+    public static function getBackfillTableSpecs(): array
+    {
+        return array(
+            'products' => array(
+                'table' => 'doli2shop_products',
+                // COALESCE : même sémantique que la colonne générée fk_product_parent_key
+                // (NULL = produit simple), sans dépendre de sa présence sur une base ancienne.
+                'key'   => 'h.fk_product = a.fk_product AND h.entity = a.entity'
+                    . ' AND COALESCE(h.fk_product_parent, 0) = COALESCE(a.fk_product_parent, 0)',
+                'mode'  => null,
+                'label' => array('fk_product', 'fk_product_parent'),
+            ),
+            'orders' => array(
+                'table' => 'doli2shop_orders',
+                'key'   => '(h.fk_commande = a.fk_commande OR h.shopifyOrderId = a.shopifyOrderId)',
+                'mode'  => null,
+                'label' => array('fk_commande', 'shopifyOrderId'),
+            ),
+            'inventory' => array(
+                'table' => 'doli2shop_inventory',
+                'key'   => 'h.shopify_inventory_item_id = a.shopify_inventory_item_id AND h.entity = a.entity',
+                'mode'  => null,
+                'label' => array('shopify_inventory_item_id'),
+            ),
+            'shipping_rules' => array(
+                'table' => 'doli2shop_shipping_rules',
+                'key'   => 'h.entity = a.entity AND h.rule_type = a.rule_type AND h.shopify_pattern = a.shopify_pattern',
+                'mode'  => 'dol_shipping_method_id',
+                // Toutes les colonnes de contenu (hors clé, entity, fk_store, rowid, tms) : comparées avec <=>
+                'content' => array('dol_shipping_method_id', 'delivery_days', 'active'),
+                'label' => array('rule_type', 'shopify_pattern'),
+            ),
+            'payments' => array(
+                'table' => 'doli2shop_payments',
+                'key'   => 'h.shopify_payment_method = a.shopify_payment_method AND h.entity = a.entity',
+                'mode'  => 'dolibarr_payment_id',
+                'content' => array('dolibarr_payment_id', 'active'),
+                'label' => array('shopify_payment_method'),
+            ),
+        );
+    }
+
+    /**
+     * Rattache à la boutique par défaut les lignes fk_store=0 d'UNE table, dans SA transaction.
+     *
+     * Pourquoi pas un UPDATE nu : une orpheline (clé, fk_store=0) coexistant avec son homologue
+     * (clé, fk_store=<défaut>) violerait la clé unique (« Duplicate entry 'card-1-1' »). Anti-jointure
+     * (équivalent d'un NOT EXISTS ; MySQL refuse 1093 un NOT EXISTS sur la table mise à jour) :
+     * seules les orphelines SANS homologue sont rattachées. Pour payments / shipping_rules, une
+     * orpheline de MÊME mode que son homologue est supprimée (redondante) ; de mode DIFFÉRENT elle
+     * est conservée (la rattachée gagne) et signalée : rien n'est perdu en silence.
+     * Aucune suppression sur products/orders/inventory (états de synchronisation) : signalées seulement.
+     *
+     * @param  string $name       Clé de getBackfillTableSpecs()
+     * @param  array  $spec       Entrée correspondante
+     * @param  int    $entity     Entité
+     * @param  int    $defaultRowid Boutique par défaut (> 0)
+     * @return array{updated:int, deleted:int, skipped:int, conflicts:int, error:bool}
+     */
+    private function backfillOneTable(string $name, array $spec, int $entity, int $defaultRowid): array
+    {
+        $report = array('updated' => 0, 'deleted' => 0, 'skipped' => 0, 'conflicts' => 0, 'error' => false);
+        $table = MAIN_DB_PREFIX . $spec['table'];
+        $join = ' h ON h.fk_store = ' . $defaultRowid . ' AND ' . $spec['key'];
+
+        $this->db->begin();
+
+        // 1. Orpheline redondante (même mode que son homologue rattaché) : supprimée.
+        if ($spec['mode'] !== null) {
+            $sameContent = '';
+            foreach ($spec['content'] as $contentColumn) {
+                $sameContent .= ' AND h.' . $contentColumn . ' <=> a.' . $contentColumn;
+            }
+            $sql = 'DELETE a FROM ' . $table . ' a JOIN ' . $table . $join
+                . $sameContent
+                . ' WHERE a.entity = ' . $entity . ' AND a.fk_store = 0';
+            $result = $this->db->query($sql);
+            if (!$result) {
+                return $this->failBackfillTable($name, 'DELETE', $report);
+            }
+            $report['deleted'] = (int) $this->db->affected_rows($result);
+        }
+
+        // 2. Rattachement des seules orphelines sans homologue.
+        $sql = 'UPDATE ' . $table . ' a LEFT JOIN ' . $table . $join
+            . ' SET a.fk_store = ' . $defaultRowid
+            . ' WHERE a.entity = ' . $entity . ' AND a.fk_store = 0 AND h.fk_store IS NULL';
+        $result = $this->db->query($sql);
+        if (!$result) {
+            return $this->failBackfillTable($name, 'UPDATE', $report);
+        }
+        $report['updated'] = (int) $this->db->affected_rows($result);
+
+        // 3. Orphelines restantes AVEC homologue (mode différent, ou table sans suppression).
+        $selectLabel = array();
+        foreach ($spec['label'] as $labelColumn) {
+            $selectLabel[] = 'a.' . $labelColumn . ' AS k_' . $labelColumn;
+        }
+        $modeSelect = '';
+        if ($spec['mode'] !== null) {
+            foreach ($spec['content'] as $contentColumn) {
+                $modeSelect .= ', a.' . $contentColumn . ' AS o_' . $contentColumn . ', h.' . $contentColumn . ' AS h_' . $contentColumn;
+            }
+        }
+        $sql = 'SELECT ' . implode(', ', $selectLabel) . $modeSelect
+            . ' FROM ' . $table . ' a JOIN ' . $table . $join
+            . ' WHERE a.entity = ' . $entity . ' AND a.fk_store = 0';
+        $result = $this->db->query($sql);
+        if (!$result) {
+            return $this->failBackfillTable($name, 'SELECT conflits', $report);
+        }
+        $remaining = 0;
+        while (($row = $this->db->fetch_object($result))) {
+            $remaining++;
+            if ($remaining > 20) {
+                continue; // compteur exact, journal borné à 20 lignes
+            }
+            $keyText = array();
+            foreach ($spec['label'] as $labelColumn) {
+                $keyText[] = $labelColumn . '=' . $row->{'k_' . $labelColumn};
+            }
+            $this->log(
+                'backfillTechnicalTables() - ' . $name . ' : ligne fk_store=0 conservée (' . implode(', ', $keyText)
+                . ') car son homologue est déjà rattaché à la boutique ' . $defaultRowid
+                . ($spec['mode'] !== null
+                    ? ' avec une valeur DIFFÉRENTE (' . $this->describeContentDifferences($spec, $row)
+                        . ') — la correspondance rattachée est conservée'
+                    : ' (doublon non fusionné automatiquement)'),
+                LOG_WARNING
+            );
+        }
+        if ($spec['mode'] !== null) {
+            $report['conflicts'] = $remaining;
+        } else {
+            $report['skipped'] = $remaining;
+        }
+
+        $this->db->commit();
+
+        if ($report['updated'] > 0 || $report['deleted'] > 0) {
+            $this->log(
+                'backfillTechnicalTables() - ' . $name . ' : ' . $report['updated'] . ' rattachée(s), '
+                . $report['deleted'] . ' orpheline(s) redondante(s) supprimée(s)',
+                LOG_INFO
+            );
+        }
+
+        return $report;
+    }
+
+    /**
+     * Décrit les colonnes de contenu qui diffèrent entre l'orpheline et son homologue.
+     *
+     * @param array  $spec Spec de la table
+     * @param object $row  Ligne du SELECT de conflits (o_<col> / h_<col>)
+     * @return string
+     */
+    private function describeContentDifferences(array $spec, $row): string
+    {
+        $parts = array();
+        foreach ($spec['content'] as $contentColumn) {
+            $orphanValue = $row->{'o_' . $contentColumn};
+            $attachedValue = $row->{'h_' . $contentColumn};
+            if ($orphanValue !== $attachedValue) {
+                $parts[] = $contentColumn . ' ' . ($orphanValue === null ? 'NULL' : $orphanValue)
+                    . ' contre ' . ($attachedValue === null ? 'NULL' : $attachedValue);
+            }
+        }
+        return implode(', ', $parts);
+    }
+
+    /**
+     * Annule la transaction de la table en cours, journalise l'échec, marque le rapport en erreur.
+     *
+     * @param string $name   Table
+     * ⚠️ Le rollback n'annule réellement que si aucune transaction englobante n'est ouverte :
+     * DoliDB::rollback() ne fait alors que décrémenter le compteur (DoliDB.class.php ~268-274).
+     *
+     * @param string $step   Étape (DELETE/UPDATE/SELECT)
+     * @param array  $report Rapport partiel
+     * @return array Rapport avec error=true
+     */
+    private function failBackfillTable(string $name, string $step, array $report): array
+    {
+        $this->db->rollback();
+        $this->log('backfillTechnicalTables() - Erreur ' . $step . ' ' . $name . ': ' . $this->db->lasterror(), LOG_ERR);
+        $report['error'] = true;
+        return $report;
     }
 }

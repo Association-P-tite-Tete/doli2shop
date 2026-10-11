@@ -8,7 +8,7 @@
  * @package     ShopifyIntegration
  * @subpackage  Class
  * @category cron
- * @version     2.6.1
+ * @version     2.6.2
  * @since 2.0.1
  * @author      P'tite Tête <doli2shop@ptitetete.com>
  * @copyright   2022-2025 Robert Steinbacher<robert.steinbacher@xivtech.de>
@@ -252,8 +252,18 @@ class ImportProductsCron extends CommonObject
                 $globalResult = $this->runSyncForStore($entity, null, $startTime);
             } else {
                 $this->log("[INFO] Found " . count($stores) . " active store(s), iterating per store", LOG_INFO);
-                foreach ($stores as $store) {
+
+                // Hotfix 2.6.2 (S7) : temps ÉQUITABLE entre boutiques et ORDRE tournant. L'échéance de la boutique
+                // de rang i (sur n) est début + 240 × (i+1)/n : la première boutique ne peut plus consommer les 240 s
+                // et affamer les suivantes ; un temps non utilisé par une boutique profite aux suivantes (échéances
+                // absolues). L'ordre tourne d'un cycle à l'autre (compteur persistant par entité) pour que ce ne soit
+                // pas toujours la même boutique qui ait la dernière tranche.
+                $storeCount = count($stores);
+                $stores = self::rotateStores(array_values($stores), $this->advanceStoreRotation($entity, $storeCount));
+
+                foreach ($stores as $storeIndex => $store) {
                     $storeLabel = $store->shop_domain ?? ('store#' . $store->rowid);
+                    $this->currentStoreDeadline = self::computeStoreDeadline($startTime, ImportProducts::CRON_TIME_BUDGET_SECONDS, $storeIndex, $storeCount);
                     try {
                         // AC#10 : boutique sans credentials → warning + continue
                         if (empty($store->access_token) || empty($store->shop_domain)) {
@@ -306,6 +316,8 @@ class ImportProductsCron extends CommonObject
                     }
                 }
             }
+
+            $this->currentStoreDeadline = null;
 
             // FIX #140 v2.1.1: Logging temps d'exécution total
             $executionTime = round(microtime(true) - $startTime, 2);
@@ -371,6 +383,102 @@ class ImportProductsCron extends CommonObject
         return -1;
     }
 }
+
+    /**
+     * Échéance (microtime absolu) de la boutique de rang $storeIndex sur $storeCount (hotfix 2.6.2, S7) :
+     * début + budget × (i + 1) / n. La dernière boutique retombe sur début + budget (240 s, sous les 300 s du cron).
+     * Pure.
+     *
+     * @param float $startTime   Début de l'exécution du cron (microtime)
+     * @param int   $budget      Budget temps total en secondes (ImportProducts::CRON_TIME_BUDGET_SECONDS)
+     * @param int   $storeIndex  Rang de la boutique dans l'ordre d'exécution (0-based)
+     * @param int   $storeCount  Nombre de boutiques
+     * @return float
+     * @since 2.6.2
+     */
+    public static function computeStoreDeadline($startTime, $budget, $storeIndex, $storeCount)
+    {
+        $storeCount = max(1, (int) $storeCount);
+        $storeIndex = min(max(0, (int) $storeIndex), $storeCount - 1);
+
+        return (float) $startTime + ((float) $budget * ($storeIndex + 1) / $storeCount);
+    }
+
+    /**
+     * Fait tourner la liste des boutiques de $rotation positions (hotfix 2.6.2, S7). Pure.
+     *
+     * @param array $stores   Boutiques (liste indexée)
+     * @param int   $rotation Compteur de rotation
+     * @return array
+     * @since 2.6.2
+     */
+    public static function rotateStores(array $stores, $rotation)
+    {
+        $count = count($stores);
+        if ($count < 2) {
+            return $stores;
+        }
+        $offset = ((int) $rotation) % $count;
+
+        return array_merge(array_slice($stores, $offset), array_slice($stores, 0, $offset));
+    }
+
+    /**
+     * Lit le compteur de rotation des boutiques de l'entité et l'avance de 1 (constante module par entité,
+     * hotfix 2.6.2, S7) quand il y a au moins deux boutiques. Jamais bloquant.
+     *
+     * @param int $entity     Entité
+     * @param int $storeCount Nombre de boutiques actives
+     * @return int Valeur LUE (à utiliser pour ce cycle)
+     * @since 2.6.2
+     */
+    protected function advanceStoreRotation($entity, $storeCount)
+    {
+        if ($storeCount < 2) {
+            return 0;
+        }
+        $constName = 'DOLI2SHOP_CRON_STORE_ROTATION';
+        $current = ImportProducts::readRotationCounter($this->db, $constName, $entity);
+        ImportProducts::writeRotationCounter($this->db, $constName, $current + 1, $entity);
+
+        return $current;
+    }
+
+    /**
+     * Échéance (microtime) imposée à l'importeur de la boutique EN COURS (S7), ou null (chemin hors boucle :
+     * début + budget). Propriété plutôt que paramètre de runSyncForStore() : sa signature est surchargée par des
+     * sous-classes de test existantes.
+     *
+     * @var float|null
+     */
+    protected $currentStoreDeadline = null;
+
+    /**
+     * Fabrique de l'API Shopify d'une boutique pour le contrôle de configuration (hotfix 2.6.2, S14).
+     * Visibilité `protected` élargie pour les tests.
+     *
+     * @param int         $entity Entité
+     * @param object|null $store  Boutique
+     * @return ShopifyApi
+     */
+    protected function createShopifyApi(int $entity, $store)
+    {
+        return new ShopifyApi($this->db, $entity, $store);
+    }
+
+    /**
+     * Fabrique de l'importeur de produits d'une boutique (hotfix 2.6.2, S14) : permet à un test d'observer
+     * l'échéance RÉELLEMENT passée à setCronDeadline() par runSyncForStore(). Visibilité `protected` élargie
+     * pour les tests.
+     *
+     * @param int         $entity Entité
+     * @param object|null $store  Boutique
+     * @return ImportProducts
+     */
+    protected function createImporter(int $entity, $store)
+    {
+        return new ImportProducts($this->db, $entity, $store);
+    }
 
     /**
      * Exécute la synchronisation produits pour UNE boutique (ou le chemin entité si $store=null).
@@ -463,7 +571,7 @@ class ImportProductsCron extends CommonObject
         $this->log("[STORE] Starting sync for: " . $storeLabel, LOG_INFO);
 
         // Vérifier la configuration POUR CETTE BOUTIQUE
-        $shopifyApi = new ShopifyApi($this->db, $entity, $store);
+        $shopifyApi = $this->createShopifyApi($entity, $store);
         if (!$shopifyApi->isConfigurationComplete('products')) {
             $this->log("[ERROR] Configuration incomplete for store: " . $storeLabel . " — aborting store sync", LOG_ERR);
             $this->output .= "\n" . '[ERROR] Configuration incomplete for store ' . $storeLabel . ' - sync aborted';
@@ -478,7 +586,13 @@ class ImportProductsCron extends CommonObject
         // journal-de-run-identifiant-et-provenance.
         RunJournal::start($entity, RunJournal::ORIGIN_CRON, 'Synchronisation produits - ' . $storeLabel, self::storeIdOf($store));
 
-        $importer = new ImportProducts($this->db, $entity, $store);
+        $importer = $this->createImporter($entity, $store);
+        // Hotfix 2.6.2 (R5, S7) : échéance de CETTE boutique — début de l'exécution ($startTime, commun à toutes les
+        // boutiques) + 240 × (i+1)/n (computeStoreDeadline()), au plus début + 240 s, sous les 300 s du cron. Sans
+        // elle, chaque boutique repartirait avec ses 240 s.
+        $importer->setCronDeadline($this->currentStoreDeadline !== null
+            ? $this->currentStoreDeadline
+            : $startTime + ImportProducts::CRON_TIME_BUDGET_SECONDS);
         $result = $importer->importProducts();
 
         if ($result < 0) {

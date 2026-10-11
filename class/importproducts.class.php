@@ -12,7 +12,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       1.0.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -38,9 +38,15 @@ require_once dirname(__FILE__) . '/skuvariantmatcher.class.php';
 require_once dirname(__FILE__) . '/inventoryreferenceresolver.class.php';
 require_once dirname(__FILE__) . '/LoggerTrait.php';
 require_once dirname(__FILE__) . '/CronHelperTrait.php';
+require_once dirname(__FILE__) . '/shopifyproductimporter.class.php';
 
 // Include compatibility functions for older Dolibarr versions
 require_once dirname(__FILE__) . '/../lib/compatibility.lib.php';
+
+// Requis pour dolibarr_set_const() — persistance du compteur de rotation des passes du cron (hotfix 2.6.2, S4)
+if (defined('DOL_DOCUMENT_ROOT')) {
+    @include_once DOL_DOCUMENT_ROOT . '/core/lib/admin.lib.php';
+}
 
 
 /**
@@ -80,6 +86,16 @@ class ImportProducts extends CommonObject
 
     /** @var SyncFlowPolicy|null Politique de synchronisation directionnelle (Story 53-5, lazy) */
     private $syncFlowPolicy;
+
+    /**
+     * @var array<string,string> Produits refusés LOCALEMENT avant tout appel productSet (hotfix 2.6.2, options
+     *      homonymes / limite d'options / déclinaison active écartée) : ref => message nominatif. Lu par
+     *      l'écran de synchronisation manuelle (ajax/sync_products_batch.php) pour le rapport.
+     */
+    public $productRefusals = [];
+
+    /** @var array<int,bool> Enfants déliés déjà journalisés dans ce cycle (hotfix 2.6.2) : un WARNING nominatif par produit */
+    private static $unlinkedChildWarned = [];
 
     /** @var DolibarrDirectFileResolver|null Accès direct images produit (Story 57-2, lazy — remplace l'API REST self) */
     private $directFileResolver;
@@ -445,7 +461,8 @@ class ImportProducts extends CommonObject
      * @param  string $flowId Identifiant SyncFlowPolicy::FLOW_*
      * @return bool
      */
-    private function isExportFlowAllowed($flowId)
+    // Hotfix 2.6.2 : visibilité élargie (private -> protected) pour les tests (sous-classe qui substitue ce point d'appel).
+    protected function isExportFlowAllowed($flowId)
     {
         return $this->getSyncFlowPolicy()->isAllowed($flowId, 'dolibarr_to_shopify', (int) $this->shopifyApi->getStoreId());
     }
@@ -513,6 +530,11 @@ class ImportProducts extends CommonObject
     {
         global $conf;
 
+        // Hotfix 2.6.2 (AC3) : horloge de CE cycle — le délai du cron est de 300 s
+        // (importproductscron.class.php), les passes de sélection et la boucle images s'arrêtent
+        // proprement à CRON_TIME_BUDGET_SECONDS.
+        $cronStartedAt = microtime(true);
+
         // Task 2.5 : vider le cache d'images en début de cycle CRON batch
         $this->clearImagesCache();
         // FIX v2.4.1 (hotfix) : réinitialiser le compteur d'échecs stock au début de CE cycle
@@ -550,6 +572,18 @@ class ImportProducts extends CommonObject
         $this->collectionsDetailUnreadableCount = 0;
         $this->collectionsDetailUnreadableIds = [];
 
+        // BH-M1 : prochain compteur de rotation à persister (null = la rotation n'a pas servi) — écrit HORS transaction.
+        $rotationToPersist = null;
+        $rotationConst = $this->getCronPassRotationConstName();
+
+        // Hotfix 2.6.2 (D1) : balayage des enfants déliés AVANT la transaction englobante (UPDATE idempotent,
+        // jamais annulé par le rollback d'un cycle en échec). Ne bloque jamais le cycle.
+        try {
+            $this->markUnlinkedChildren();
+        } catch (\Throwable $e) {
+            $this->log("importProducts - balayage des enfants déliés impossible : " . $e->getMessage(), LOG_ERR);
+        }
+
         $this->db->begin();
 
         try {
@@ -571,231 +605,82 @@ class ImportProducts extends CommonObject
             // entre l'entité de `llx_cronjob` et celle de la configuration/des catégories).
             $this->getProductScopeHelper()->logEmptyScopeDiagnostics((int)$this->config->dolibarr_procate, $this->entity, $categoryIds);
 
-            // 2. Get all simple products of the category (not variants, not parents)
-            // Prioritize products never synchronized or with failed sync status
-            // Story 63-19 (AC2) : filtre p.entity ajouté — absent avant cette story, le CRON
-            // balayait les produits de TOUTES les entités dès que leur catégorie tombait dans
-            // l'arbre. AC3 : PAS de filtre p.tosell ici (volontaire, cf. class/productscopehelper.class.php
-            // en-tête et Dev Notes 63-19) — le garde-fou anti-désarchivage silencieux (Story 58-5)
-            // a besoin de voir les produits déjà mappés même hors vente pour les repasser en DRAFT.
-            //
-            // HIGH 4 (code review) : `p.entity = X` EXCLUT désormais aussi `entity = 0` ("partagé
-            // entre entités", convention Dolibarr standard) — avant cette story, l'ABSENCE totale de
-            // filtre entity incluait de fait ces produits partagés. Décision : garder l'exclusion
-            // stricte, PAR SYMÉTRIE avec les 3 sites écran/AJAX qui filtraient déjà `p.entity =
-            // $conf->entity` sans jamais inclure `entity = 0` avant cette story — ce n'est donc pas
-            // un comportement nouveau introduit ICI, seulement étendu au 4ᵉ site (CRON). Sans
-            // Multicompany actif, `entity = 0` n'existe de toute façon jamais sur `llx_product`/
-            // `llx_categorie` pour ce module. AVEC Multicompany et le partage de produits activé,
-            // ceci reste une HYPOTHÈSE NON MESURÉE sur le parc (aucune installation connue n'utilise
-            // ce partage pour Doli2Shop) — fixée par un test dédié (ProductScopeHelperCategoryTreeSqliteTest)
-            // et vérification ouverte en story dédiée (cf. HIGH 6 / docs/implementation-artifacts).
-            $sql_products = "SELECT p.*, MAX(sync.last_sync_status) as sync_status, MAX(sync.tms) as sync_tms
-                FROM " . MAIN_DB_PREFIX . "product p
-                INNER JOIN " . MAIN_DB_PREFIX . "categorie_product cp ON p.rowid = cp.fk_product
-                LEFT JOIN " . MAIN_DB_PREFIX . "doli2shop_products sync
-                    ON p.rowid = sync.fk_product
-                    AND sync.entity = " . (int)$this->entity . "
-                WHERE cp.fk_categorie IN " . $categoryInClause . "
-                AND p.entity = " . (int)$this->entity . "
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM " . MAIN_DB_PREFIX . "product_attribute_combination pac2
-                    WHERE pac2.fk_product_parent = p.rowid
-                )
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM " . MAIN_DB_PREFIX . "product_attribute_combination pac3
-                    WHERE pac3.fk_product_child = p.rowid
-                )
-                -- v2.3.0: Double cycle — contenu (24h) et stock (15min) indépendants
-                -- Remplace le hack v2.2.2 fenêtre 1h : sélectionne si contenu à re-sync (tms > 24h)
-                -- OU si stock à rattraper (last_stock_sync NULL ou > 15min, ou intervalle élargi
-                -- une fois le plafond de persistance atteint — cf. buildStockCatchupEligibilityClause())
-                -- Re-review 27/09/2026 (CRITICAL) : `last_sync_status != 'success'` n'est PLUS une
-                -- branche indépendante ici — un lot ENTIÈREMENT écarté (produit simple, ou aucune
-                -- déclinaison résolue) écrit 'skipped' à CHAQUE cycle, ce qui resélectionnait le
-                -- produit indéfiniment sans aucun égard pour le plafond. Cette condition est
-                -- désormais gatée par le plafond DANS buildStockCatchupEligibilityClause().
-                -- HIGH (re-review 27/09/2026, point 1b) : OU si les images ont été DIFFÉRÉES
-                -- (budget de polling épuisé, ou lot précédent encore en cours) — sans cette
-                -- clause, un produit dont le contenu ET le stock sont déjà à jour ne serait
-                -- JAMAIS re-sélectionné par ce cycle, même prioritaire, avant l'échéance normale
-                -- de 24h/15min.
-                AND (sync.last_sync_status IS NULL
-                    OR sync.tms < DATE_SUB(NOW(), INTERVAL 24 HOUR)
-                    OR " . $this->buildStockCatchupEligibilityClause() . "
-                    OR sync.images_priority_requeue = 1)
-                GROUP BY p.rowid
-                ORDER BY
-                    CASE
-                        WHEN MAX(sync.images_priority_requeue) = 1 THEN 0
-                        WHEN MAX(sync.last_sync_status) IS NULL THEN 1
-                        WHEN MAX(sync.last_sync_status) = 'failed' THEN 2
-                        ELSE 3
-                    END,
-                    p.rowid";
+            // 2. Sélection des candidats — QUATRE requêtes (produits simples / produits parents × part principale /
+            // part réservée « contenu modifié », S1), construites par des méthodes pures et exécutées TOUTES avant la
+            // moindre synchro (hotfix 2.6.2, C4) : leurs num_rows dimensionnent les réserves de budget.
+            // Échéance : celle posée par le cron pour CETTE boutique (S7 : début + 240 × (i+1)/n), sinon 240 s.
+            $cronDeadline = ($this->cronDeadline !== null) ? $this->cronDeadline : ($cronStartedAt + self::CRON_TIME_BUDGET_SECONDS);
 
-            $result = SqlUtils::executeQuery($this->db, $sql_products, "getting simple products");
+            $sqlSimpleCandidates = $this->buildSimpleProductsCandidatesSql($categoryInClause, $this->entity);
+            $sqlParentCandidates = $this->buildParentProductsCandidatesSql($categoryInClause, $this->entity);
+            $sqlContentSimpleCandidates = $this->buildContentModifiedSimpleProductsCandidatesSql($categoryInClause, $this->entity);
+            $sqlContentParentCandidates = $this->buildContentModifiedParentProductsCandidatesSql($categoryInClause, $this->entity);
 
-            $this->log("Requête produits simples exécutée - recherche produits non synchronisés ou en échec", LOG_INFO);
+            $resultSimple = SqlUtils::executeQuery($this->db, $sqlSimpleCandidates, "getting simple products");
+            $resultParents = SqlUtils::executeQuery($this->db, $sqlParentCandidates, "getting parent products");
+            $resultContentSimple = SqlUtils::executeQuery($this->db, $sqlContentSimpleCandidates, "getting content-modified simple products");
+            $resultContentParents = SqlUtils::executeQuery($this->db, $sqlContentParentCandidates, "getting content-modified parent products");
 
-            $processedProducts = [];
-            $simpleProductsCount = 0;
-            while ($productData = $this->db->fetch_object($result)) {
-                $simpleProductsCount++;
-                if (count($processedProducts) >= $this->config->products_per_cron_update) {
-                    $this->log("Limite CRON atteinte (" . $this->config->products_per_cron_update . " produits), arrêt traitement produits simples. " . $simpleProductsCount . " candidats trouvés.", LOG_INFO);
-                    break;
-                }
-                $this->log("Processing simple product: " . $productData->ref . " (ID: " . $productData->rowid . ", tosell: " . $productData->tosell . ")", LOG_DEBUG);
+            $numSimpleCandidates = $resultSimple ? (int) $this->db->num_rows($resultSimple) : 0;
+            $numParentCandidates = $resultParents ? (int) $this->db->num_rows($resultParents) : 0;
+            $numContentSimpleCandidates = $resultContentSimple ? (int) $this->db->num_rows($resultContentSimple) : 0;
+            $numContentParentCandidates = $resultContentParents ? (int) $this->db->num_rows($resultContentParents) : 0;
 
-                // Toujours utiliser l'objet Product officiel
-                $product = new Product($this->db);
-                $fetchResult = $product->fetch($productData->rowid);
+            $cronBudget = max(0, (int) $this->config->products_per_cron_update);
 
-                if ($fetchResult <= 0) {
-                    $this->log("Failed to fetch product ID: " . $productData->rowid, LOG_ERR);
-                    continue; // Passer au produit suivant
-                }
+            $this->log("Candidats cron - simples: " . $numSimpleCandidates . ", parents: " . $numParentCandidates
+                . " | contenu modifié hors prix - simples: " . $numContentSimpleCandidates . ", parents: " . $numContentParentCandidates
+                . " | budget produits: " . $cronBudget . " | budget temps: " . self::CRON_TIME_BUDGET_SECONDS . " s", LOG_INFO);
 
-                $this->log("Product fetched successfully - ID: " . $product->id . ", status: " . $product->status, LOG_DEBUG);
+            // S4 : compteur de rotation PERSISTANT (par entité et boutique) — jamais l'heure.
+            $rotation = self::readRotationCounter($this->db, $rotationConst, $this->entity);
+            $laneBudgets = $this->computeLaneBudgets($cronBudget, $numSimpleCandidates, $numParentCandidates, $numContentSimpleCandidates, $numContentParentCandidates, $rotation);
 
-                try {
-                    $syncResult = $this->syncProduct($product);
-                    if ($syncResult === true || $syncResult === 'stock_synced') {
-                        // Produit synchronisé (contenu ou stock seul) → compte dans la limite CRON
-                        $processedProducts[] = [
-                            'product' =>  $product,
-                            'variants' =>  []
-                        ];
-                    }
-                    // syncResult === 'skipped' → aucun appel API, ne compte PAS dans la limite
-                } catch (Exception $e) {
-                    $this->log("Error syncing simple product " . $product->ref . ": " . $e->getMessage(), LOG_ERR);
-                    // Auto-cleanup: si Shopify dit que le produit n'existe pas, supprimer l'entrée sync
-                    // pour qu'il soit recréé proprement à la prochaine exécution
-                    if (stripos($e->getMessage(), "Product does not exist") !== false
-                        || stripos($e->getMessage(), "does not exist") !== false) {
-                        $this->log("Auto-cleanup: removing invalid sync entry for product " . $product->ref . " (ID: " . $product->id . ")", LOG_WARNING);
-                        $sqlClean = "DELETE FROM " . MAIN_DB_PREFIX . "doli2shop_products WHERE fk_product = " . (int)$product->id . " AND entity = " . (int)$this->entity;
-                        $this->db->query($sqlClean);
-                    }
-                    // Continue with next product instead of failing entire import
-                }
-            }
-            if ($result) {
-                $this->db->free($result);
+            // BH-M1 (lot 4) : la valeur est MÉMORISÉE ici et écrite APRÈS commit()/rollback() (cf. plus bas), dès que la répartition est calculée : même un cycle qui échoue en cours de passe a servi une famille : un
+            // dolibarr_set_const() dans la transaction englobante serait annulé par son rollback (la rotation d'un
+            // budget de 1 retomberait alors sur la même famille à chaque cycle en échec).
+            if ($laneBudgets['rotationUsed']) {
+                $rotationToPersist = $rotation + 1;
             }
 
-            $this->log("Fin traitement produits simples - " . $simpleProductsCount . " candidats examinés, " . count($processedProducts) . " produits traités", LOG_INFO);
 
-            // 3. Get all parents products of the category
-            // Prioritize products never synchronized or with failed sync status
-            // Story 63-19 (AC2) : même filtre p.entity que la requête produits simples ; AC3 :
-            // pas de filtre p.tosell, mêmes raisons. HIGH 4 : même décision "entity = 0 exclu",
-            // voir le commentaire détaillé sur la requête produits simples ci-dessus.
-            $sql_products = "SELECT p.*, MAX(sync.last_sync_status) as sync_status, MAX(sync.tms) as sync_tms
-                FROM " . MAIN_DB_PREFIX . "product p
-                INNER JOIN " . MAIN_DB_PREFIX . "categorie_product cp ON p.rowid = cp.fk_product
-                LEFT JOIN " . MAIN_DB_PREFIX . "doli2shop_products sync
-                    ON p.rowid = sync.fk_product
-                    AND sync.entity = " . (int)$this->entity . "
-                WHERE cp.fk_categorie IN " . $categoryInClause . "
-                AND p.entity = " . (int)$this->entity . "
-                AND EXISTS (
-                    SELECT 1
-                    FROM " . MAIN_DB_PREFIX . "product_attribute_combination pac2
-                    WHERE pac2.fk_product_parent = p.rowid
-                )
-                -- v2.3.0: Double cycle — contenu (24h) et stock (15min) indépendants
-                -- Remplace le hack v2.2.2 fenêtre 1h : sélectionne si contenu à re-sync (tms > 24h)
-                -- OU si stock à rattraper (last_stock_sync NULL ou > 15min, ou intervalle élargi
-                -- une fois le plafond de persistance atteint — cf. buildStockCatchupEligibilityClause())
-                -- Re-review 27/09/2026 (CRITICAL) : `last_sync_status != 'success'` n'est PLUS une
-                -- branche indépendante ici — un lot ENTIÈREMENT écarté (produit simple, ou aucune
-                -- déclinaison résolue) écrit 'skipped' à CHAQUE cycle, ce qui resélectionnait le
-                -- produit indéfiniment sans aucun égard pour le plafond. Cette condition est
-                -- désormais gatée par le plafond DANS buildStockCatchupEligibilityClause().
-                -- HIGH (re-review 27/09/2026, point 1b) : même clause qu'au-dessus (produits
-                -- simples) — voir son commentaire pour la justification.
-                AND (sync.last_sync_status IS NULL
-                    OR sync.tms < DATE_SUB(NOW(), INTERVAL 24 HOUR)
-                    OR " . $this->buildStockCatchupEligibilityClause() . "
-                    OR sync.images_priority_requeue = 1)
-                GROUP BY p.rowid
-                ORDER BY
-                    CASE
-                        WHEN MAX(sync.images_priority_requeue) = 1 THEN 0
-                        WHEN MAX(sync.last_sync_status) IS NULL THEN 1
-                        WHEN MAX(sync.last_sync_status) = 'failed' THEN 2
-                        ELSE 3
-                    END,
-                    p.rowid";
+            $processedProducts = $this->runCandidateLanes(
+                array('MS' => $resultSimple, 'MP' => $resultParents, 'CS' => $resultContentSimple, 'CP' => $resultContentParents),
+                array('MS' => $numSimpleCandidates, 'MP' => $numParentCandidates, 'CS' => $numContentSimpleCandidates, 'CP' => $numContentParentCandidates),
+                $cronBudget,
+                $cronDeadline,
+                function ($productData) {
+                    return $this->processSimpleCandidate($productData);
+                },
+                function ($productData) {
+                    return $this->processParentCandidate($productData);
+                },
+                $laneBudgets
+            );
 
-            $result = SqlUtils::executeQuery($this->db, $sql_products, "getting parent products");
-
-            $this->log("Requête produits parents exécutée - recherche produits non synchronisés ou en échec", LOG_INFO);
-
-            $parentProductsCount = 0;
-            while ($productData = $this->db->fetch_object($result)) {
-                $parentProductsCount++;
-                if (count($processedProducts) >= $this->config->products_per_cron_update) {
-                    $this->log("Limite CRON atteinte (" . $this->config->products_per_cron_update . " produits), arrêt traitement produits parents. " . $parentProductsCount . " candidats trouvés.", LOG_INFO);
-                    break;
-                }
-                $this->log("Processing parent product: " . $productData->ref . " (ID: " . $productData->rowid . ", tosell: " . $productData->tosell . ")", LOG_DEBUG);
-
-                // Toujours utiliser l'objet Product officiel
-                $product = new Product($this->db);
-                $fetchResult = $product->fetch($productData->rowid);
-
-                if ($fetchResult <= 0) {
-                    $this->log("Failed to fetch parent product ID: " . $productData->rowid, LOG_ERR);
-                    continue; // Passer au produit suivant
-                }
-
-                $this->log("Parent product fetched successfully - ID: " . $product->id . ", status: " . $product->status, LOG_DEBUG);
-
-                try {
-                    // Use factorized method to get variants
-                    $variants = $this->getProductVariants($product->id);
-
-                    $syncResult = $this->syncProduct($product, $variants, '');
-                    if ($syncResult === true || $syncResult === 'stock_synced') {
-                        // Produit synchronisé (contenu ou stock seul) → compte dans la limite CRON
-                        $processedProducts[] = [
-                            'product' => $product,
-                            'variants' => $variants
-                        ];
-                    }
-                    // syncResult === 'skipped' → aucun appel API, ne compte PAS dans la limite
-                } catch (Exception $e) {
-                    $this->log("Error syncing parent product " . $product->ref . ": " . $e->getMessage(), LOG_ERR);
-                    // Auto-cleanup: si Shopify dit que le produit n'existe pas, supprimer l'entrée sync
-                    if (stripos($e->getMessage(), "Product does not exist") !== false
-                        || stripos($e->getMessage(), "does not exist") !== false) {
-                        $this->log("Auto-cleanup: removing invalid sync entry for parent product " . $product->ref . " (ID: " . $product->id . ")", LOG_WARNING);
-                        $sqlClean = "DELETE FROM " . MAIN_DB_PREFIX . "doli2shop_products WHERE fk_product = " . (int)$product->id . " AND entity = " . (int)$this->entity;
-                        $this->db->query($sqlClean);
-                    }
-                    // Continue with next product instead of failing entire import
+            foreach (array($resultSimple, $resultParents, $resultContentSimple, $resultContentParents) as $candidateCursor) {
+                if ($candidateCursor) {
+                    $this->db->free($candidateCursor);
                 }
             }
 
-            if ($result) {
-                $this->db->free($result);
-            }
-
-            $this->log("Fin traitement produits parents - " . $parentProductsCount . " candidats examinés, " . (count($processedProducts) - $simpleProductsCount) . " produits parents traités", LOG_INFO);
-            $this->log("TOTAL SESSION - " . count($processedProducts) . " produits traités (limite CRON: " . $this->config->products_per_cron_update . ")", LOG_INFO);
+            $this->log("TOTAL SESSION - " . count($processedProducts) . " produits traités (limite CRON: " . $cronBudget . ")", LOG_INFO);
 
             // Story 53-5 (site 3b, 1/2) : gate images export via SyncFlowPolicy (remplace la
             // lecture directe de $this->config->sync_product_images) — vérifié UNE fois avant la
             // boucle, pas par produit (policy lazy, jamais d'instanciation en boucle)
             // 4. For each parent product, synchronize its variants then images (if image sync is enabled)
             if ($this->isExportFlowAllowed(SyncFlowPolicy::FLOW_IMAGES)) {
+                $imagesDeferredByTime = 0;
                 foreach ($processedProducts as $parentProduct) {
+                    // Hotfix 2.6.2 (C4) : même budget temps que les passes de sélection. Au-delà, les images
+                    // des produits restants ne sont PAS envoyées ce cycle : elles sont marquées
+                    // images_priority_requeue (mécanisme existant) et passeront en tête au cycle suivant.
+                    if (microtime(true) >= $cronDeadline) {
+                        $this->setImagePriorityRequeue($parentProduct['product']->id, $this->entity, true);
+                        $imagesDeferredByTime++;
+                        continue;
+                    }
                     try {
                         if (!empty($parentProduct['variants'])) {
                             $this->syncProductAllImages($parentProduct['product'], $parentProduct['variants']);
@@ -806,6 +691,10 @@ class ImportProducts extends CommonObject
                         $this->log("Error syncing images for product " . $parentProduct['product']->ref . ": " . $e->getMessage(), LOG_ERR);
                         // Continue with next product instead of failing entire image sync
                     }
+                }
+                if ($imagesDeferredByTime > 0) {
+                    $this->log("Fin de la boucle images - budget temps de " . self::CRON_TIME_BUDGET_SECONDS . " s atteint : "
+                        . $imagesDeferredByTime . " produit(s) sans envoi d'images ce cycle (marqués en priorité pour le suivant)", LOG_WARNING);
                 }
             } else {
                 $this->log("Image synchronization is disabled. Skipping all product images.", LOG_INFO);
@@ -946,11 +835,37 @@ class ImportProducts extends CommonObject
             }
 
             $this->db->commit();
+            $this->persistRotationCounter($rotationConst, $rotationToPersist);
             return true;
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
+            // Review lot 4 (LOW-1) : \Throwable (TypeError/Error PHP 8 compris), sinon une Error laissait la transaction ouverte
+            // et le compteur de rotation non écrit ; l'exception est re-levée telle quelle (comportement extérieur inchangé).
             $this->db->rollback();
+            // BH-M1 : écrit aussi après un rollback — la passe a servi une famille, le cycle suivant doit passer à la suivante.
+            $this->persistRotationCounter($rotationConst, $rotationToPersist);
             $this->log("Import Error: " . $e->getMessage(), LOG_ERR);
             throw $e;
+        }
+    }
+
+    /**
+     * Écrit le compteur de rotation des passes (S4) HORS de toute transaction (BH-M1) : à appeler après commit() ou
+     * rollback() de importProducts(). Jamais bloquant.
+     *
+     * @param string   $rotationConst Nom de la constante
+     * @param int|null $nextValue     Valeur à écrire (null = rien à persister)
+     * @return void
+     * @since 2.6.2
+     */
+    private function persistRotationCounter($rotationConst, $nextValue)
+    {
+        if ($nextValue === null) {
+            return;
+        }
+        try {
+            self::writeRotationCounter($this->db, $rotationConst, (int) $nextValue, $this->entity);
+        } catch (\Throwable $e) {
+            $this->log("persistRotationCounter - " . $e->getMessage(), LOG_WARNING);
         }
     }
 
@@ -1089,6 +1004,10 @@ class ImportProducts extends CommonObject
      * @param int $stock New stock quantity
      * @return bool True if update was successful
      * @since 2.0.33
+     *
+     * Code mort (via syncInventoryOnly(), sans appelant). Non retiré (hotfix 2.6.2) : la ligne envoyée
+     * ne porte ni current_ ni on_hand_shopify_quantity, donc ShopifyApi::inventorySetQuantities() la
+     * refuse proprement (« référence de stock inconnue ») au lieu d'envoyer changeFromQuantity: 0.
      */
     private function updateSingleVariantStock($variant, $stock)
     {
@@ -1246,15 +1165,1116 @@ class ImportProducts extends CommonObject
     private function buildStockCatchupEligibilityClause()
     {
         $cap = $this->getLocationUnresolvedStreakCap();
-        $retryHours = $this->getLocationUnresolvedRetryHours();
 
         return "("
             . "(sync.last_sync_status != 'success' AND COALESCE(sync.location_unresolved_streak, 0) < " . (int) $cap . ")"
-            . " OR (COALESCE(sync.location_unresolved_streak, 0) < " . (int) $cap
+            . " OR " . $this->buildStockCadenceTerms()
+            . ")";
+    }
+
+    /**
+     * Les deux branches de CADENCE de la clause ci-dessus (stock plus ancien que 15 min sous le plafond ;
+     * intervalle élargi au-delà), SANS la branche « statut non success » : texte brut `(a) OR (b)`, partagé par
+     * buildStockCatchupEligibilityClause() et buildStockCadenceClause() (une seule définition de la cadence).
+     *
+     * @return string
+     * @since 2.6.2
+     */
+    private function buildStockCadenceTerms()
+    {
+        $cap = $this->getLocationUnresolvedStreakCap();
+        $retryHours = $this->getLocationUnresolvedRetryHours();
+
+        return "(COALESCE(sync.location_unresolved_streak, 0) < " . (int) $cap
             . " AND (sync.last_stock_sync IS NULL OR sync.last_stock_sync < DATE_SUB(NOW(), INTERVAL 15 MINUTE)))"
             . " OR (COALESCE(sync.location_unresolved_streak, 0) >= " . (int) $cap
-            . " AND sync.last_stock_sync < DATE_SUB(NOW(), INTERVAL " . (int) $retryHours . " HOUR))"
-            . ")";
+            . " AND sync.last_stock_sync < DATE_SUB(NOW(), INTERVAL " . (int) $retryHours . " HOUR))";
+    }
+
+    /**
+     * Cadence du STOCK seule, entre parenthèses (hotfix 2.6.2, S5) : ce qui reste éligible pour une ligne dont
+     * le CONTENU est en attente après un échec (le délai ne bloque jamais le stock).
+     *
+     * @return string
+     * @since 2.6.2
+     */
+    private function buildStockCadenceClause()
+    {
+        return "(" . $this->buildStockCadenceTerms() . ")";
+    }
+
+    /**
+     * Hotfix 2.6.2 (AC3/C4) : budget TEMPS d'un cycle d'export, en secondes. Le délai du cron est de
+     * 300 s (ImportProductsCron) : on s'arrête proprement à 240 s, avec la marge de la boucle images,
+     * des collections et des résumés de fin de cycle.
+     */
+    const CRON_TIME_BUDGET_SECONDS = 240;
+
+    /**
+     * Échéance GLOBALE du cron (microtime(true)), fixée par ImportProductsCron (début + 240 s) et partagée
+     * par toutes les boutiques d'un même passage (R5). null = chemin hors cron (appelant direct) : l'échéance
+     * est alors celle de CE cycle (début + CRON_TIME_BUDGET_SECONDS).
+     *
+     * @var float|null
+     */
+    private $cronDeadline = null;
+
+    /**
+     * Instant de DÉBUT de la synchro de produit en cours (R7), `Y-m-d H:i:s` côté SQL ; null hors synchro.
+     *
+     * @var string|null
+     */
+    private $contentSyncInstant = null;
+
+    /**
+     * Review lot 4 (MEDIUM-1) : true si le dernier syncVariantStocksOnly() a réellement tenté un appel d'envoi de
+     * stock à Shopify (qu'il ait réussi ou non). false = rien n'était à envoyer.
+     *
+     * @var bool
+     */
+    protected $lastStockSyncAttempted = false;
+
+    /**
+     * Fixe l'échéance globale du cron (R5). Sans elle, chaque boutique repartirait avec ses propres 240 s et
+     * N boutiques dépasseraient les 300 s du cron.
+     *
+     * @param float|null $deadline microtime(true) absolu, null pour revenir au budget propre au cycle
+     * @return void
+     * @since 2.6.2
+     */
+    public function setCronDeadline($deadline)
+    {
+        $this->cronDeadline = ($deadline === null) ? null : (float) $deadline;
+    }
+
+    /**
+     * Hotfix 2.6.2 (R4, S5) : délai CROISSANT avant de retenter le CONTENU d'un produit en échec. Sans lui,
+     * dix échecs PERMANENTS (ex. « max 3 options », story séparée) reprendraient chacun une place à chaque
+     * cycle : la famine reviendrait par la porte des `failed`. Délai = min(FAILED_RETRY_MAX_MINUTES,
+     * FAILED_RETRY_BASE_MINUTES × 2^(failed_streak − 1)) : 60, 120, 240, puis 360 minutes (plafond 6 h).
+     * Il ne bloque QUE le contenu : le stock continue de suivre sa cadence normale (15 min).
+     */
+    const FAILED_RETRY_BASE_MINUTES = 60;
+    const FAILED_RETRY_MAX_MINUTES = 360;
+    /** Exposant maximal de la progression (streak ≥ 4 : 60 × 2^3 = 480, ramené au plafond de 360). */
+    const FAILED_RETRY_MAX_STREAK_STEP = 4;
+
+    /**
+     * Part RÉSERVÉE du budget produits aux modifications de contenu hors prix (S1) : ceil(L / 3) par passage.
+     */
+    const CONTENT_RESERVE_DIVISOR = 3;
+
+    /**
+     * Délai (minutes) au-delà duquel un verrou `pending` est considéré comme abandonné (cron tué) : le
+     * même que isSyncLocked() (5 minutes).
+     */
+    const STALE_LOCK_MINUTES = 5;
+
+    /**
+     * Plancher (minutes) avant lequel le délai d'échec n'est JAMAIS levé, même par un prix modifié (ECH-1) : un
+     * produit qui échoue toutes les minutes à cause de ce qu'on vient de corriger ne doit pas boucler.
+     */
+    const FAILED_RETRY_LIFT_FLOOR_MINUTES = 60;
+
+    /**
+     * Délai (minutes) avant de retenter le contenu d'un produit en échec, selon son nombre d'échecs
+     * consécutifs (S5). Miroir PHP exact de buildFailedBackoffDelayMinutesSql() (un test compare les deux).
+     *
+     * @param int $failedStreak Échecs consécutifs de contenu (0 traité comme 1)
+     * @return int Minutes
+     * @since 2.6.2
+     */
+    public static function computeFailedRetryDelayMinutes($failedStreak)
+    {
+        $step = min(max((int) $failedStreak, 1), self::FAILED_RETRY_MAX_STREAK_STEP);
+        return (int) min(self::FAILED_RETRY_MAX_MINUTES, self::FAILED_RETRY_BASE_MINUTES * (1 << ($step - 1)));
+    }
+
+    /**
+     * Expression SQL du délai (en minutes) avant de retenter le contenu d'une ligne `sync` en échec (S5) :
+     * LEAST(plafond, base × 2^(min(max(streak, 1), 4) − 1)). Colonnes de `sync` seulement.
+     *
+     * @return string
+     * @since 2.6.2
+     */
+    private function buildFailedBackoffDelayMinutesSql()
+    {
+        return "LEAST(" . (int) self::FAILED_RETRY_MAX_MINUTES . ", " . (int) self::FAILED_RETRY_BASE_MINUTES
+            . " * (1 << (LEAST(GREATEST(COALESCE(sync.failed_streak, 0), 1), " . (int) self::FAILED_RETRY_MAX_STREAK_STEP . ") - 1)))";
+    }
+
+    /**
+     * Fragment SQL « le CONTENU de cette ligne est en attente avant retentative » (S5) : dernier échec plus
+     * récent que le délai croissant ET prix pas corrigé depuis (S5 c, restreint par ECH-1 : seul un PRIX modifié —
+     * date_price ET tms postérieurs à l'échec, pour le produit ou, pour un parent, une déclinaison — lève le délai, et
+     * jamais avant FAILED_RETRY_LIFT_FLOOR_MINUTES ; une vente, qui bouge `tms`, ne le lève plus). Indépendant du statut : un succès « stock
+     * seul » après un échec de contenu laisse last_failed_at en place (seul un succès de contenu le remet à NULL).
+     *
+     * Toujours NON NULL (COALESCE) : il est utilisé sous NOT, et NOT NULL ne filtrerait jamais.
+     *
+     * @param bool $withChildren true pour la requête des produits parents (jointure `ch` présente)
+     * @return string Fragment déjà entre parenthèses
+     * @since 2.6.2
+     */
+    private function buildInFailureBackoffCondition($withChildren)
+    {
+        // ECH-1 (lot 4) : SEUL un PRIX modifié après l'échec lève le délai — même signal que le rang prix
+        // (buildPriceModifiedSinceContentSyncCondition() : date_price ET tms postérieurs, horloge SQL) — et jamais avant
+        // le plancher de FAILED_RETRY_LIFT_FLOOR_MINUTES. Une vente (tms bougé par un mouvement de stock) ne lève plus rien.
+        $priceFixed = "(pm.max_price_date > sync.last_failed_at AND p.tms > sync.last_failed_at)";
+        if ($withChildren) {
+            $priceFixed .= " OR (ch.max_child_price_date > sync.last_failed_at AND ch.max_child_tms > sync.last_failed_at)";
+        }
+        $lifted = "sync.last_failed_at < DATE_SUB(NOW(), INTERVAL " . (int) self::FAILED_RETRY_LIFT_FLOOR_MINUTES . " MINUTE)"
+            . " AND (" . $priceFixed . ")";
+
+        return "COALESCE((sync.last_failed_at IS NOT NULL"
+            . " AND sync.last_failed_at > DATE_SUB(NOW(), INTERVAL " . $this->buildFailedBackoffDelayMinutesSql() . " MINUTE)"
+            . " AND NOT COALESCE(" . $lifted . ", 0)), 0)";
+    }
+
+    /**
+     * Fragment SQL « ligne de mapping dont le CONTENU peut être comparé à last_content_sync » (R6) :
+     *  - `success` ;
+     *  - `skipped` avec un shopifyProductId valide (boutique sans synchro de stock : toute passe finit en
+     *    `skipped`, y compris pour un produit déjà exporté), hors produits archivés par
+     *    OffSaleProductsService (aucune synchro n'a lieu pour eux) ;
+     *  - `pending` dont le verrou a plus de 5 minutes (cron tué en cours de synchro).
+     * Jamais `failed` (rang propre, cf. R4) ni un verrou vivant.
+     *
+     * @return string Fragment déjà entre parenthèses (colonnes de `sync` seulement)
+     * @since 2.6.2
+     */
+    private function buildContentComparableStatusCondition()
+    {
+        return "(sync.last_sync_status = 'success'"
+            . " OR (sync.last_sync_status = 'skipped'"
+            . " AND sync.shopifyProductId NOT IN ('', '0') AND LEFT(sync.shopifyProductId, 10) <> 'TEMP_LOCK_'"
+            . " AND COALESCE(sync.offsale_action_status, '') <> 'archived')"
+            . " OR (sync.last_sync_status = 'pending' AND sync.sync_lock IS NOT NULL"
+            . " AND sync.sync_lock < DATE_SUB(NOW(), INTERVAL " . (int) self::STALE_LOCK_MINUTES . " MINUTE)))";
+    }
+
+    /**
+     * Fragment SQL « produit modifié dans Dolibarr depuis la dernière synchro de CONTENU », au sens LARGE
+     * (éligibilité) : `llx_product.tms` OU une ligne de prix plus récente que la référence.
+     *
+     * Hotfix 2.6.2. Référence : `sync.last_content_sync` — la MÊME colonne que
+     * checkProductNeedsUpdate() (jamais `sync.tms`, qui est en ON UPDATE CURRENT_TIMESTAMP et que le
+     * verrou 'pending' ramène à NOW()). NULL ne vaut « modifié » que pour une ligne dont le statut est
+     * comparable (buildContentComparableStatusCondition()), jamais pour `failed` ni pour un verrou vivant
+     * (boucle de la re-review du 27/09). Pour un parent, le MAX(tms) et le MAX(date_price) de ses
+     * déclinaisons (table dérivée `ch`, cf. buildCandidatesSql()) comptent aussi. Une ligne dont le contenu est
+     * en attente après un échec (buildInFailureBackoffCondition(), S5) n'est jamais « modifiée ».
+     *
+     * ⚠️ llx_product.tms bouge aussi à chaque MOUVEMENT DE STOCK (MouvementStock::_create() met à jour
+     * pmp et stock : mesuré sur 18/23/24) : ce fragment seul ne doit donc PAS donner la priorité (cf.
+     * buildPriceModifiedSinceContentSyncCondition()) ; ces produits passent par la part réservée « contenu
+     * modifié » (buildContentOnlyModifiedCondition(), S1).
+     *
+     * ⚠️ Doit rester utilisable DANS un agrégat (MAX/MIN) sous ONLY_FULL_GROUP_BY : n'utilise que
+     * des colonnes de `sync`, `p.tms`, `pm.max_price_date` et `ch.*`.
+     *
+     * @param bool $withChildren true pour la requête des produits parents (jointure `ch` présente)
+     * @return string Fragment déjà entre parenthèses
+     * @since 2.6.2
+     */
+    private function buildModifiedSinceContentSyncCondition($withChildren)
+    {
+        $modified = "sync.last_content_sync IS NULL OR p.tms > sync.last_content_sync"
+            . " OR pm.max_price_date > sync.last_content_sync";
+        if ($withChildren) {
+            $modified .= " OR ch.max_child_tms > sync.last_content_sync OR ch.max_child_price_date > sync.last_content_sync";
+        }
+
+        return "(" . $this->buildContentComparableStatusCondition()
+            . " AND NOT " . $this->buildInFailureBackoffCondition($withChildren)
+            . " AND (" . $modified . "))";
+    }
+
+    /**
+     * Fragment SQL « PRIX modifié depuis la dernière synchro de contenu » (R1, S2) : le signal FIABLE de
+     * l'incident du 10/10 (94 déclinaisons dont le prix avait changé), qui donne seul le rang prioritaire.
+     *
+     * Source : `llx_product_price.date_price`. Product::updatePrice() insère une ligne via _log_price()
+     * (product.class.php 18 :2342, 23 :2918, 24 :3011), y compris pour les prix des déclinaisons
+     * (ProductCombination::updateProperties() → $child->updatePrice(), 24 :586/615), sauf en mode
+     * multiprix quand le prix du niveau n'a pas changé (alors rien à propager). Un prix écrit en SQL
+     * direct (import, script) n'y laisse pas de ligne : il reste vu par `p.tms` (part « contenu modifié »).
+     *
+     * S2 (fuseaux) : `date_price` est formatée par PHP (`$db->idate`), `last_content_sync` et `tms` par le
+     * moteur SQL : un écart de fuseau PHP/SQL peut la faire paraître postérieure (ou antérieure) de plusieurs
+     * heures. Le rang prioritaire exige donc AUSSI `p.tms > last_content_sync` (`ch.max_child_tms` pour un prix
+     * de déclinaison) : `updatePrice()` bumpe `tms` à la même horloge que `NOW()`. Un prix « futur » sur un
+     * produit dont `tms` n'a pas bougé ne prend plus le rang prioritaire ; un prix « passé » sur un produit
+     * dont `tms` a bougé est attrapé par la part « contenu modifié ».
+     *
+     * `last_content_sync IS NULL` compte aussi (ligne backfillée « à renvoyer » par la migration).
+     *
+     * @param bool $withChildren true pour la requête des produits parents
+     * @return string Fragment déjà entre parenthèses
+     * @since 2.6.2
+     */
+    private function buildPriceModifiedSinceContentSyncCondition($withChildren)
+    {
+        $modified = "sync.last_content_sync IS NULL"
+            . " OR (pm.max_price_date > sync.last_content_sync AND p.tms > sync.last_content_sync)";
+        if ($withChildren) {
+            $modified .= " OR (ch.max_child_price_date > sync.last_content_sync AND ch.max_child_tms > sync.last_content_sync)";
+        }
+
+        return "(" . $this->buildContentComparableStatusCondition()
+            . " AND NOT " . $this->buildInFailureBackoffCondition($withChildren)
+            . " AND (" . $modified . "))";
+    }
+
+    /**
+     * Fragment SQL « contenu modifié HORS PRIX » (S1) : `llx_product.tms` du produit (ou `MAX(tms)` de ses
+     * déclinaisons, pour un parent) postérieur à une dernière synchro de contenu CONNUE (NULL est du ressort du
+     * rang prix : ligne backfillée). Libellé, description, photo, mouvement de stock (une vente bouge `tms`) :
+     * aucun signal ne les distingue en SQL. Ces produits ne prennent pas le rang prioritaire (une vente ne passe
+     * pas devant un prix) mais disposent d'une PART RÉSERVÉE du budget (ceil(L/3)), servie du contenu le plus
+     * ancien au plus récent : délai borné de propagation d'une modification de libellé.
+     *
+     * @param bool $withChildren true pour la requête des produits parents
+     * @return string Fragment déjà entre parenthèses
+     * @since 2.6.2
+     */
+    private function buildContentOnlyModifiedCondition($withChildren)
+    {
+        $modified = "p.tms > sync.last_content_sync";
+        if ($withChildren) {
+            $modified .= " OR ch.max_child_tms > sync.last_content_sync";
+        }
+
+        return "(" . $this->buildContentComparableStatusCondition()
+            . " AND NOT " . $this->buildInFailureBackoffCondition($withChildren)
+            . " AND sync.last_content_sync IS NOT NULL AND (" . $modified . "))";
+    }
+
+    /**
+     * Niveau de prix à surveiller pour « prix modifié » (S3) : en multiprix (PRODUIT_MULTIPRICES actif et niveau
+     * synchronisé ≥ 1), SEUL le niveau synchronisé compte — un prix modifié sur un autre niveau ne change rien
+     * côté Shopify. 0 = pas de filtre (toutes les lignes de prix). Même règle que prepareProductData().
+     *
+     * @return int 0 ou le niveau de prix synchronisé
+     * @since 2.6.2
+     */
+    private function getSyncedPriceLevelForSelection()
+    {
+        if (!getDolGlobalInt('PRODUIT_MULTIPRICES')) {
+            return 0;
+        }
+        $level = (isset($this->config) && is_object($this->config) && isset($this->config->sync_price_level))
+            ? (int) $this->config->sync_price_level : 1;
+
+        return ($level >= 1) ? $level : 0;
+    }
+
+    /**
+     * Requête des candidats PRODUITS SIMPLES du cron d'export (ni déclinaison, ni parent).
+     * Méthode pure : aucun accès à l'instance hors getters de configuration (plafond du compteur
+     * d'emplacement, niveau de prix) — testée contre un vrai moteur SQL par
+     * test/integration/CronExportCandidatesSelectionIntegrationTest.php.
+     *
+     * @param string $categoryInClause Clause `(1,2,3)` du périmètre catégorie (ProductScopeHelper)
+     * @param int    $entity           Entité courante
+     * @return string
+     * @since 2.6.2
+     */
+    private function buildSimpleProductsCandidatesSql($categoryInClause, $entity)
+    {
+        return $this->buildCandidatesSql($categoryInClause, $entity, false);
+    }
+
+    /**
+     * Requête des candidats PRODUITS PARENTS (à déclinaisons) du cron d'export. Cf.
+     * buildSimpleProductsCandidatesSql().
+     *
+     * @param string $categoryInClause Clause `(1,2,3)` du périmètre catégorie (ProductScopeHelper)
+     * @param int    $entity           Entité courante
+     * @return string
+     * @since 2.6.2
+     */
+    private function buildParentProductsCandidatesSql($categoryInClause, $entity)
+    {
+        return $this->buildCandidatesSql($categoryInClause, $entity, true);
+    }
+
+    /**
+     * Part RÉSERVÉE « contenu modifié » (S1), produits simples : mêmes jointures et même éligibilité que la
+     * requête principale, restreinte aux produits de rang 4 dont le seul signal est un `tms` postérieur à la
+     * dernière synchro de contenu, du contenu synchronisé le plus ancien au plus récent.
+     *
+     * @param string $categoryInClause Clause `(1,2,3)` du périmètre catégorie
+     * @param int    $entity           Entité courante
+     * @return string
+     * @since 2.6.2
+     */
+    private function buildContentModifiedSimpleProductsCandidatesSql($categoryInClause, $entity)
+    {
+        return $this->buildCandidatesSql($categoryInClause, $entity, false, true);
+    }
+
+    /**
+     * Part RÉSERVÉE « contenu modifié » (S1), produits parents. Cf. buildContentModifiedSimpleProductsCandidatesSql().
+     *
+     * @param string $categoryInClause Clause `(1,2,3)` du périmètre catégorie
+     * @param int    $entity           Entité courante
+     * @return string
+     * @since 2.6.2
+     */
+    private function buildContentModifiedParentProductsCandidatesSql($categoryInClause, $entity)
+    {
+        return $this->buildCandidatesSql($categoryInClause, $entity, true, true);
+    }
+
+    /**
+     * Expression SQL du RANG d'un produit candidat (agrégats seulement) :
+     * 0 images prioritaires · 1 jamais synchronisé · 2 PRIX modifié (R1) et non en échec · 3 `failed` retentable
+     * · 4 tout le reste (stock seul, « tms seul », `failed` en attente avant retentative) ·
+     * 5 jamais synchronisé ET hors vente alors que l'option « ne créer que les produits en vente » est active
+     * (S6 : aucune ligne de mapping ne les fait sortir de la tête de file ; ils passent en DERNIER).
+     *
+     * @param bool $withChildren true pour la requête des produits parents
+     * @return string
+     * @since 2.6.2
+     */
+    private function buildCandidateRankExpression($withChildren)
+    {
+        $priceModified = $this->buildPriceModifiedSinceContentSyncCondition($withChildren);
+        $inBackoff = $this->buildInFailureBackoffCondition($withChildren);
+        $onlyActive = (isset($this->config) && is_object($this->config)
+            && !empty($this->config->sync_products_only_active) && $this->config->sync_products_only_active == 1);
+        $neverSyncedInactive = $onlyActive
+            ? "WHEN MAX(sync.last_sync_status) IS NULL AND p.tosell = 0 THEN 5"
+            : "";
+
+        return "CASE
+                    WHEN MAX(sync.images_priority_requeue) = 1 THEN 0
+                    " . $neverSyncedInactive . "
+                    WHEN MAX(sync.last_sync_status) IS NULL THEN 1
+                    WHEN MAX(CASE WHEN sync.last_sync_status = 'failed' AND NOT " . $inBackoff . " THEN 1 ELSE 0 END) = 1 THEN 3
+                    WHEN MAX(CASE WHEN " . $priceModified . " THEN 1 ELSE 0 END) = 1 THEN 2
+                    ELSE 4
+                END";
+    }
+
+    /**
+     * Exclusion des enfants DÉLIÉS de la branche « produits simples » (hotfix 2.6.2, story
+     * declinaisons-reliees-a-tort-et-enfants-delies, AC2).
+     *
+     * Un enfant dont la déclinaison a été supprimée dans Dolibarr garde sa ligne de mapping
+     * (`fk_product_parent > 0`, `shopifyProductId` = produit Shopify de son ANCIEN parent) mais n'a plus
+     * de `product_attribute_combination` : il entrait donc dans la requête des produits simples, et
+     * syncProduct() l'aurait traité comme un produit simple mappé sur le produit Shopify du parent
+     * (`productSet` à une seule variante, brouillon/archivage du produit entier du parent). Cette
+     * clause l'écarte — l'absence de combinaison est déjà garantie par le NOT EXISTS pac3 voisin ;
+     * la clause ne regarde donc que le mapping. Les parents ne sont jamais concernés (branche simples
+     * seulement). Le constructeur partagé la fait aussi hériter à la part réservée « contenu ».
+     * Filtre entité systématique ; pas de filtre fk_store : la sélection du cron n'est pas bornée à une boutique
+     * (même jointure `sync` par entité), et un enfant délié dans UNE boutique ne doit être exporté dans aucune.
+     *
+     * @param int $entity Entité courante
+     * @return string Clause `AND NOT EXISTS (...)`
+     * @since 2.6.2
+     */
+    private function buildUnlinkedChildExclusionClause($entity)
+    {
+        return "AND NOT EXISTS (
+                    SELECT 1
+                    FROM " . MAIN_DB_PREFIX . "doli2shop_products dm
+                    WHERE dm.fk_product = p.rowid
+                    AND dm.entity = " . (int) $entity . "
+                    AND dm.fk_product_parent > 0
+                )";
+    }
+
+    /**
+     * Construit la requête de sélection des candidats du cron (hotfix 2.6.2, C3) — UNE seule
+     * construction pour les quatre requêtes (simples / parents × principale / part « contenu modifié »),
+     * jamais des copies qui divergeraient.
+     *
+     * v2.3.0: Double cycle — contenu (24h) et stock (15min) indépendants (remplace le hack v2.2.2 à
+     * fenêtre de 1 h). Hotfix 2.6.2 : le cycle « contenu » se lit désormais sur last_content_sync.
+     *
+     * Éligibilité (OU) : jamais synchronisé · MODIFIÉ depuis la dernière synchro de contenu (tms, prix ;
+     * pas soumis au plafond `location_unresolved_streak`) · contenu de plus de 24 h (sur
+     * last_content_sync) · stock à rattraper (buildStockCatchupEligibilityClause(), gaté par le plafond) ·
+     * images à re-traiter en priorité. S5 : le CONTENU d'une ligne en attente après un échec
+     * (buildInFailureBackoffCondition()) n'est plus éligible — ni « modifié », ni la règle des 24 h, ni la
+     * branche « statut non success » du stock — mais le STOCK reste éligible à sa cadence normale (15 min) :
+     * `(NOT backoff AND stockCatchup) OR cadence seule`. Un échec permanent ne reprend donc pas une place à
+     * chaque cycle, sans geler son stock.
+     *
+     * Ordre — rangs (buildCandidateRankExpression()) : 0 images prioritaires · 1 jamais synchronisé · 2 PRIX
+     * modifié (R1, S2) et non failed · 3 `failed` retentable · 4 tout le reste : stock seul ET « tms seul » (une
+     * vente fait bouger llx_product.tms : elle ne doit pas passer devant une vraie modification de prix ;
+     * checkProductNeedsUpdate() décide ensuite du renvoi) · 5 jamais synchronisé hors vente (S6). Un produit
+     * modifié dont la synchro est `failed` retentable reste au rang 3 : sinon dix échecs permanents recréeraient
+     * la famine. Dans le rang 2 : dernier contenu synchronisé le plus ancien d'abord (NULL en tête) ; dans le
+     * rang 4 : dernier stock synchronisé le plus ancien d'abord (NULL en tête) — rotation équitable ; puis p.rowid.
+     *
+     * $contentLane (S1) : variante « part réservée » — mêmes WHERE/GROUP BY, restreinte (HAVING) aux produits de
+     * rang 4 dont un `tms` est postérieur à la dernière synchro de contenu, triés par `MIN(last_content_sync)`
+     * croissant. Ces produits restent AUSSI dans la requête principale (rotation du stock) : le traitement
+     * déduplique par identifiant.
+     *
+     * Multi-boutiques : plusieurs lignes `sync` par produit possibles (jointure par entité seulement)
+     * → agrégats qui ne masquent jamais la boutique la plus en retard (MAX pour « modifié »/« failed »,
+     * MIN pour l'ancienneté). `failed` s'écrit `MAX(sync.last_sync_status = 'failed')` et NON
+     * `MAX(sync.last_sync_status) = 'failed'` : le MAX d'une chaîne masquerait un `failed` derrière un
+     * `success`.
+     *
+     * Valide sous ONLY_FULL_GROUP_BY sur MySQL ET MariaDB : le SELECT ne porte que ce que les boucles
+     * lisent (rowid, ref, tosell), tous dans le GROUP BY ; toute colonne de `sync`, `pm`, `ch` ou p.tms des
+     * ORDER BY est agrégée. (L'ancien `SELECT p.* ... GROUP BY p.rowid` n'était accepté que par MySQL,
+     * via la dépendance fonctionnelle sur la clé primaire.)
+     *
+     * Filtre `p.entity` (Story 63-19) : `entity = 0` (« partagé entre entités ») est exclu, par symétrie
+     * avec les écrans/AJAX de sélection de produits ; pas de filtre `p.tosell` (le garde-fou
+     * anti-désarchivage de la Story 58-5 doit voir les produits déjà mappés hors vente).
+     *
+     * @param string $categoryInClause Clause `(1,2,3)` du périmètre catégorie
+     * @param int    $entity           Entité courante
+     * @param bool   $forParents       true = produits parents ; false = produits simples
+     * @param bool   $contentLane      true = part réservée « contenu modifié » (S1)
+     * @return string
+     * @since 2.6.2
+     */
+    private function buildCandidatesSql($categoryInClause, $entity, $forParents, $contentLane = false)
+    {
+        $entity = (int) $entity;
+        $prefix = MAIN_DB_PREFIX;
+
+        $modified = $this->buildModifiedSinceContentSyncCondition($forParents);
+        $priceModified = $this->buildPriceModifiedSinceContentSyncCondition($forParents);
+        $contentOnly = $this->buildContentOnlyModifiedCondition($forParents);
+        $inBackoff = $this->buildInFailureBackoffCondition($forParents);
+        $stockCatchup = $this->buildStockCatchupEligibilityClause();
+        $stockCadenceOnly = $this->buildStockCadenceClause();
+        $rank = $this->buildCandidateRankExpression($forParents);
+        // NULL se range en tête d'un tri croissant : « le plus ancien d'abord, NULL en tête » est donc exprimé
+        // par une date plancher explicite (epoch), et un groupe SANS ligne « modifiée » reçoit une date plafond
+        // (pour qu'il passe APRÈS ceux qui en ont une, de façon déterministe, dans le rang failed).
+        $epoch = "'1000-01-01 00:00:00'";
+        $farFuture = "'9999-12-31 23:59:59'";
+
+        // S3 : en multiprix, seul le niveau de prix synchronisé est surveillé.
+        $priceLevel = $this->getSyncedPriceLevelForSelection();
+        $priceWhere = ($priceLevel > 0) ? "WHERE price_level = " . $priceLevel : "";
+        $childPriceOn = ($priceLevel > 0) ? " AND cpr.price_level = " . $priceLevel : "";
+
+        // Dernier prix enregistré par produit, UNE fois (table dérivée), jamais une sous-requête par candidat.
+        $priceJoin = "LEFT JOIN (
+                    SELECT fk_product AS pid, MAX(date_price) AS max_price_date
+                    FROM " . $prefix . "product_price
+                    " . $priceWhere . "
+                    GROUP BY fk_product
+                ) pm ON pm.pid = p.rowid";
+
+        if ($forParents) {
+            // Déclinaisons PRÉ-AGRÉGÉES : MAX(tms) et MAX(date_price) par parent, une seule fois.
+            $childJoin = "LEFT JOIN (
+                    SELECT pac.fk_product_parent AS pid, MAX(c.tms) AS max_child_tms, MAX(cpr.date_price) AS max_child_price_date
+                    FROM " . $prefix . "product_attribute_combination pac
+                    INNER JOIN " . $prefix . "product c ON c.rowid = pac.fk_product_child
+                    LEFT JOIN " . $prefix . "product_price cpr ON cpr.fk_product = c.rowid" . $childPriceOn . "
+                    GROUP BY pac.fk_product_parent
+                ) ch ON ch.pid = p.rowid";
+            $typeFilter = "AND EXISTS (
+                    SELECT 1
+                    FROM " . $prefix . "product_attribute_combination pac2
+                    WHERE pac2.fk_product_parent = p.rowid
+                )";
+        } else {
+            $childJoin = "";
+            $typeFilter = "AND NOT EXISTS (
+                    SELECT 1
+                    FROM " . $prefix . "product_attribute_combination pac2
+                    WHERE pac2.fk_product_parent = p.rowid
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM " . $prefix . "product_attribute_combination pac3
+                    WHERE pac3.fk_product_child = p.rowid
+                )
+                " . $this->buildUnlinkedChildExclusionClause($entity);
+        }
+
+        if ($contentLane) {
+            $having = "HAVING (" . $rank . ") = 4 AND MAX(CASE WHEN " . $contentOnly . " THEN 1 ELSE 0 END) = 1";
+            $orderBy = "ORDER BY
+                COALESCE(MIN(CASE WHEN " . $contentOnly . " THEN sync.last_content_sync END), " . $farFuture . "),
+                p.rowid";
+        } else {
+            $having = "";
+            $orderBy = "ORDER BY
+                " . $rank . ",
+                COALESCE(MIN(CASE WHEN " . $priceModified . " THEN COALESCE(sync.last_content_sync, " . $epoch . ") END), " . $farFuture . "),
+                MIN(COALESCE(sync.last_stock_sync, " . $epoch . ")),
+                p.rowid";
+        }
+
+        return "SELECT p.rowid, p.ref, p.tosell
+            FROM " . $prefix . "product p
+            INNER JOIN " . $prefix . "categorie_product cp ON p.rowid = cp.fk_product
+            LEFT JOIN " . $prefix . "doli2shop_products sync
+                ON p.rowid = sync.fk_product
+                AND sync.entity = " . $entity . "
+            " . $priceJoin . "
+            " . $childJoin . "
+            WHERE cp.fk_categorie IN " . $categoryInClause . "
+            AND p.entity = " . $entity . "
+            " . $typeFilter . "
+            AND (sync.last_sync_status IS NULL
+                OR " . $modified . "
+                OR (NOT " . $inBackoff . " AND sync.last_content_sync < DATE_SUB(NOW(), INTERVAL 24 HOUR))
+                OR (NOT " . $inBackoff . " AND " . $stockCatchup . ")
+                OR " . $stockCadenceOnly . "
+                OR sync.images_priority_requeue = 1)
+            GROUP BY p.rowid, p.ref, p.tosell
+            " . $having . "
+            " . $orderBy;
+    }
+
+    /**
+     * Répartition du budget d'UNE passe entre produits simples et produits parents (hotfix 2.6.2,
+     * AC3/C4/R3/S4). Pure.
+     *
+     * Les parents se voient RÉSERVER jusqu'à la moitié du budget (`floor(L/2)`), plafonnée au nombre de
+     * parents réellement candidats : avec peu de parents, les simples gardent le reste. Le reliquat non
+     * consommé par les parents est repris par les simples (cf. runCandidatePasses()). Sans cette réserve,
+     * la passe simples, exécutée en premier, consommait tout le budget dès qu'il y avait L produits
+     * simples éligibles : aucun parent n'était jamais traité.
+     *
+     * Budget de 1 créneau (R3, S4) : `floor(1/2)` = 0 réserverait toujours les simples, donc affamerait les
+     * parents (l'inverse de l'incident). Le créneau unique ALTERNE de façon déterministe selon la PARITÉ du
+     * COMPTEUR de rotation persistant ($rotation, S4 : constante par entité/boutique, incrémentée à chaque cycle
+     * où l'alternance sert — jamais l'heure, qui figerait l'alternance sur un cron de période paire) :
+     * rotation impaire → le parent est servi d'abord (budget initial des simples = 0, repris au reliquat) ;
+     * rotation paire → les simples d'abord, les parents n'ayant que le reliquat.
+     *
+     * @param int $budget     Budget produits de la passe
+     * @param int $numParents Nombre de parents candidats (num_rows de la requête parents)
+     * @param int $rotation   Compteur de rotation persistant (parité utilisée pour un budget de 1)
+     * @return array{reserve:int, simple:int}
+     * @since 2.6.2
+     */
+    private function computeCandidatePassBudgets($budget, $numParents, $rotation = 0)
+    {
+        $budget = max(0, (int) $budget);
+        $numParents = max(0, (int) $numParents);
+
+        if ($budget === 1) {
+            $reserve = ($numParents > 0 && (((int) $rotation) % 2) === 1) ? 1 : 0;
+        } else {
+            $reserve = min((int) floor($budget / 2), $numParents);
+        }
+
+        return array('reserve' => $reserve, 'simple' => $budget - $reserve);
+    }
+
+    /**
+     * Répartition du budget produits du CYCLE entre la part PRINCIPALE (rangs prioritaires puis stock, simples
+     * et parents) et la part RÉSERVÉE « contenu modifié hors prix » (S1). Pure. ALGORITHME :
+     *
+     *  L = budget produits du cycle (products_per_cron_update) ; nMS / nMP = candidats des requêtes principales
+     *  (simples / parents) ; nCS / nCP = candidats des requêtes « contenu modifié » (simples / parents) ;
+     *  r = compteur de rotation persistant (S4).
+     *
+     *  1. L = 0 : rien.
+     *  2. L = 1 : un seul créneau, trois familles en concurrence. La liste ordonnée des familles qui ONT des
+     *     candidats est [S si nMS > 0, P si nMP > 0, CS si nCS > 0, CP si nCP > 0] ; le créneau va à la famille
+     *     d'indice `r mod (nombre de familles)` (S : passe principale, simples ; P : principale, parents ;
+     *     CS / CP : part « contenu modifié »). Aucune famille ne monopolise le créneau : chacune l'obtient une
+     *     fois par tour. La rotation sert dès qu'il y a au moins deux familles.
+     *  3. L ≥ 2 : part contenu = min(ceil(L / 3), nCS + nCP) (S1 ; jamais plus que ce qu'il y a à servir, le
+     *     reste revient à la part principale) ; part principale = L − part contenu. Chaque part se subdivise
+     *     ensuite simples / parents par computeCandidatePassBudgets() (R3 : réserve parents = min(floor(b / 2),
+     *     nb parents) ; b = 1 → alternance sur la parité de r). La rotation sert si une part vaut 1 avec des
+     *     candidats simples ET parents.
+     *  4. Le reliquat non consommé (candidats ignorés, listes épuisées, échéance) est repris sur les curseurs
+     *     par runCandidateLanes() (phase C), dans l'ordre principal simples, principal parents, contenu simples,
+     *     contenu parents : la réserve est un PLANCHER pour le contenu modifié (ceil(L/3)) et pour les parents
+     *     (floor(L/2) de la part principale), jamais un plafond.
+     *
+     * Cohabitation avec l'échéance (R5/S7) : voir runCandidateLanes() — la part principale n'a que les 2/3 du
+     * temps restant tant que la part contenu a des candidats ; l'échéance elle-même est celle de la boutique
+     * (début du cron + 240 × (i+1)/n, S7).
+     *
+     * @param int $budget             L
+     * @param int $numMainSimple      nMS
+     * @param int $numMainParents     nMP
+     * @param int $numContentSimple   nCS
+     * @param int $numContentParents  nCP
+     * @param int $rotation           r
+     * @return array{main:int, content:int, mainRotation:int, contentRotation:int, rotationUsed:bool}
+     * @since 2.6.2
+     */
+    private function computeLaneBudgets($budget, $numMainSimple, $numMainParents, $numContentSimple, $numContentParents, $rotation = 0)
+    {
+        $budget = max(0, (int) $budget);
+        $numMainSimple = max(0, (int) $numMainSimple);
+        $numMainParents = max(0, (int) $numMainParents);
+        $numContentSimple = max(0, (int) $numContentSimple);
+        $numContentParents = max(0, (int) $numContentParents);
+        $rotation = max(0, (int) $rotation);
+
+        $lanes = array('main' => 0, 'content' => 0, 'mainRotation' => $rotation, 'contentRotation' => $rotation, 'rotationUsed' => false);
+        if ($budget === 0) {
+            return $lanes;
+        }
+
+        if ($budget === 1) {
+            $families = array();
+            if ($numMainSimple > 0) {
+                $families[] = 'S';
+            }
+            if ($numMainParents > 0) {
+                $families[] = 'P';
+            }
+            if ($numContentSimple > 0) {
+                $families[] = 'CS';
+            }
+            if ($numContentParents > 0) {
+                $families[] = 'CP';
+            }
+            if (empty($families)) {
+                $lanes['main'] = 1;
+                return $lanes;
+            }
+            $owner = $families[$rotation % count($families)];
+            $lanes['rotationUsed'] = count($families) > 1;
+            if ($owner === 'S' || $owner === 'P') {
+                $lanes['main'] = 1;
+                $lanes['mainRotation'] = ($owner === 'P') ? 1 : 0;
+            } else {
+                $lanes['content'] = 1;
+                $lanes['contentRotation'] = ($owner === 'CP') ? 1 : 0;
+            }
+            return $lanes;
+        }
+
+        $contentShare = min((int) ceil($budget / self::CONTENT_RESERVE_DIVISOR), $numContentSimple + $numContentParents);
+        $lanes['content'] = $contentShare;
+        $lanes['main'] = $budget - $contentShare;
+        $lanes['rotationUsed'] = ($lanes['main'] === 1 && $numMainSimple > 0 && $numMainParents > 0)
+            || ($lanes['content'] === 1 && $numContentSimple > 0 && $numContentParents > 0);
+
+        return $lanes;
+    }
+
+    /**
+     * Nom de la constante module qui porte le compteur de rotation des passes (S4) : une par entité (la valeur
+     * est écrite pour `$this->entity`) ET par boutique (sinon deux boutiques à budget de 1 se partageraient un
+     * compteur et chacune retomberait toujours sur la même famille).
+     *
+     * @return string
+     * @since 2.6.2
+     */
+    private function getCronPassRotationConstName()
+    {
+        $storeId = (isset($this->shopifyApi) && is_object($this->shopifyApi)) ? (int) $this->shopifyApi->getStoreId() : 0;
+        return 'DOLI2SHOP_CRON_PASS_ROTATION' . ($storeId > 0 ? '_' . $storeId : '');
+    }
+
+    /**
+     * Lit un compteur de rotation persistant (constante module de l'entité). Lecture SQL directe : `$conf->global`
+     * ne porte que l'entité de la requête et n'est pas rafraîchi entre deux boutiques d'un même passage. Jamais
+     * bloquant : 0 si la lecture échoue.
+     *
+     * @param object $db       Base
+     * @param string $constName Nom de la constante
+     * @param int    $entity   Entité
+     * @return int
+     * @since 2.6.2
+     */
+    public static function readRotationCounter($db, $constName, $entity)
+    {
+        try {
+            $resql = $db->query("SELECT value FROM " . MAIN_DB_PREFIX . "const WHERE name = '" . $db->escape($constName) . "' AND entity = " . (int) $entity);
+            if ($resql) {
+                $row = $db->fetch_object($resql);
+                if (is_object($row) && isset($row->value) && is_numeric($row->value)) {
+                    return max(0, (int) $row->value);
+                }
+            }
+        } catch (\Throwable $e) {
+            // Jamais bloquant : la rotation repart de 0.
+        }
+        return 0;
+    }
+
+    /**
+     * Écrit un compteur de rotation persistant (dolibarr_set_const, entité donnée). Jamais bloquant.
+     *
+     * @param object $db        Base
+     * @param string $constName Nom de la constante
+     * @param int    $value     Valeur (ramenée dans [0, 1 000 000[)
+     * @param int    $entity    Entité
+     * @return void
+     * @since 2.6.2
+     */
+    public static function writeRotationCounter($db, $constName, $value, $entity)
+    {
+        try {
+            if (function_exists('dolibarr_set_const')) {
+                dolibarr_set_const($db, $constName, (string) (((int) $value) % 1000000), 'chaine', 0, '', (int) $entity);
+            }
+        } catch (\Throwable $e) {
+            // Jamais bloquant : au pire la rotation rejoue la même famille un cycle de plus.
+        }
+    }
+
+    /**
+     * Enchaîne les passes de synchronisation d'UNE part (principale ou « contenu modifié ») du cron (hotfix
+     * 2.6.2, AC3/C4) :
+     *  (1) les deux curseurs sont DÉJÀ ouverts (num_rows connus) ;
+     *  (2) réserve des parents = min(floor(b/2), nombre de parents candidats) (b = 1 : alternance, R3/S4) ;
+     *  (3) passe produits simples jusqu'à `b - réserve` ;
+     *  (4) passe produits parents avec TOUT le budget restant ;
+     *  (5) reliquat non consommé par les parents : reprise du MÊME curseur de produits simples.
+     * Les deux passes s'arrêtent au budget temps ($deadline). R5 : tant qu'il reste des candidats parents,
+     * la passe simples s'arrête à 50 % du temps RESTANT (les parents gardent l'autre moitié) ; la reprise du
+     * reliquat, elle, va jusqu'à l'échéance.
+     *
+     * @param mixed    $resultSimple     Curseur des candidats simples
+     * @param int      $numSimple        Nombre de lignes du curseur simples
+     * @param mixed    $resultParents    Curseur des candidats parents
+     * @param int      $numParents       Nombre de lignes du curseur parents
+     * @param int      $cronBudget       Budget produits de la part (b)
+     * @param float    $deadline         Échéance absolue (microtime(true))
+     * @param callable $simpleProcessor  Traitement d'un candidat simple (cf. processCandidates())
+     * @param callable $parentProcessor  Traitement d'un candidat parent
+     * @param int      $rotation         Compteur de rotation (parité) pour b = 1 (R3/S4)
+     * @param string   $laneLabel        Libellé de la part, pour le journal
+     * @return array Entrées ['product' => ..., 'variants' => ...] des produits comptés dans le budget
+     * @since 2.6.2
+     */
+    private function runCandidatePasses($resultSimple, $numSimple, $resultParents, $numParents, $cronBudget, $deadline, $simpleProcessor, $parentProcessor, $rotation = 0, $laneLabel = '')
+    {
+        $cronBudget = max(0, (int) $cronBudget);
+        $budgets = $this->computeCandidatePassBudgets($cronBudget, $numParents, $rotation);
+        $suffix = ($laneLabel !== '') ? " [" . $laneLabel . "]" : "";
+        $this->log("Budgets des passes" . $suffix . " - réserve produits à déclinaisons: " . $budgets['reserve']
+            . ", budget initial des simples: " . $budgets['simple'], LOG_INFO);
+
+        $processedProducts = array();
+
+        $simpleDeadline = $deadline;
+        if ((int) $numParents > 0) {
+            $now = microtime(true);
+            $simpleDeadline = $now + max(0.0, ($deadline - $now) / 2);
+        }
+        $simplePass = $this->processCandidates($resultSimple, $budgets['simple'], $numSimple, $simpleProcessor, $simpleDeadline);
+        foreach ($simplePass['entries'] as $entry) {
+            $processedProducts[] = $entry;
+        }
+        $this->logCandidatePass('simples' . $suffix, $numSimple, $simplePass, $budgets['simple']);
+
+        $parentBudget = $cronBudget - count($processedProducts);
+        $parentPass = $this->processCandidates($resultParents, $parentBudget, $numParents, $parentProcessor, $deadline);
+        foreach ($parentPass['entries'] as $entry) {
+            $processedProducts[] = $entry;
+        }
+        $this->logCandidatePass('parents' . $suffix, $numParents, $parentPass, $parentBudget);
+
+        if (in_array($simplePass['stopReason'], array('budget', 'time'), true)
+            && count($processedProducts) < $cronBudget && microtime(true) < $deadline) {
+            $resumeBudget = $cronBudget - count($processedProducts);
+            $resumeRemaining = $numSimple - $simplePass['examined'];
+            $simpleResume = $this->processCandidates($resultSimple, $resumeBudget, $resumeRemaining, $simpleProcessor, $deadline);
+            foreach ($simpleResume['entries'] as $entry) {
+                $processedProducts[] = $entry;
+            }
+            $this->logCandidatePass('simples (reprise du reliquat)' . $suffix, $resumeRemaining, $simpleResume, $resumeBudget);
+        }
+
+        return $processedProducts;
+    }
+
+    /**
+     * Exécute le cycle complet de sélection (S1) sur QUATRE curseurs — principal simples / parents et part
+     * « contenu modifié » simples / parents — avec les budgets de computeLaneBudgets() :
+     *  phase A : part principale (budget L − part contenu), avec les 2/3 du temps restant tant que la part
+     *            contenu a de quoi consommer sa réserve (la part contenu ne doit pas être affamée par le temps) ;
+     *  phase B : part « contenu modifié » (budget = part contenu), jusqu'à l'échéance ;
+     *  phase C : reliquat éventuel repris sur les quatre curseurs (cf. computeLaneBudgets(), point 4).
+     * Un produit n'est traité qu'UNE fois par cycle : le même identifiant peut figurer dans la requête
+     * principale (rotation du stock) ET dans la part contenu ; la seconde apparition est ignorée sans consommer
+     * de budget (outcome 'duplicate').
+     *
+     * @param array    $cursors        Curseurs ['MS' => ..., 'MP' => ..., 'CS' => ..., 'CP' => ...]
+     * @param array    $counts         Nombre de lignes de chaque curseur (mêmes clés)
+     * @param int      $cronBudget     L
+     * @param float    $deadline       Échéance absolue (microtime(true)) de CETTE boutique
+     * @param callable $simpleProcessor Traitement d'un candidat simple
+     * @param callable $parentProcessor Traitement d'un candidat parent
+     * @param array    $laneBudgets    Retour de computeLaneBudgets()
+     * @return array Entrées ['product' => ..., 'variants' => ...] des produits comptés dans le budget
+     * @since 2.6.2
+     */
+    private function runCandidateLanes(array $cursors, array $counts, $cronBudget, $deadline, $simpleProcessor, $parentProcessor, array $laneBudgets)
+    {
+        $cronBudget = max(0, (int) $cronBudget);
+        $seen = array();
+        $examined = array('MS' => 0, 'MP' => 0, 'CS' => 0, 'CP' => 0);
+        $wrap = function ($name, $processor) use (&$seen, &$examined) {
+            return function ($productData) use ($name, $processor, &$seen, &$examined) {
+                $examined[$name]++;
+                $key = (($name === 'MS' || $name === 'CS') ? 's' : 'p') . (int) $productData->rowid;
+                if (isset($seen[$key])) {
+                    return array('outcome' => 'duplicate', 'entry' => null);
+                }
+                $seen[$key] = true;
+                return $processor($productData);
+            };
+        };
+
+        $this->log("Budgets du cycle - part principale: " . $laneBudgets['main'] . ", part réservée aux modifications de contenu hors prix: "
+            . $laneBudgets['content'] . " (rotation " . ($laneBudgets['rotationUsed'] ? 'utilisée' : 'inutilisée') . ")", LOG_INFO);
+
+        $processed = array();
+
+        // Phase A — part principale. Les 2/3 du temps restant seulement si la part contenu doit aussi servir.
+        $mainDeadline = $deadline;
+        if ($laneBudgets['content'] > 0) {
+            $now = microtime(true);
+            $mainDeadline = $now + max(0.0, ($deadline - $now) * (self::CONTENT_RESERVE_DIVISOR - 1) / self::CONTENT_RESERVE_DIVISOR);
+        }
+        foreach ($this->runCandidatePasses(
+            $cursors['MS'], $counts['MS'], $cursors['MP'], $counts['MP'], $laneBudgets['main'], $mainDeadline,
+            $wrap('MS', $simpleProcessor), $wrap('MP', $parentProcessor), $laneBudgets['mainRotation'], 'principale'
+        ) as $entry) {
+            $processed[] = $entry;
+        }
+
+        // Phase B — part réservée « contenu modifié ».
+        if ($laneBudgets['content'] > 0) {
+            foreach ($this->runCandidatePasses(
+                $cursors['CS'], $counts['CS'], $cursors['CP'], $counts['CP'], $laneBudgets['content'], $deadline,
+                $wrap('CS', $simpleProcessor), $wrap('CP', $parentProcessor), $laneBudgets['contentRotation'], 'contenu modifié'
+            ) as $entry) {
+                $processed[] = $entry;
+            }
+        }
+
+        // Phase C — reliquat repris sur les quatre curseurs (ordre : principal simples/parents, contenu simples/parents).
+        $order = array('MS' => $simpleProcessor, 'MP' => $parentProcessor, 'CS' => $simpleProcessor, 'CP' => $parentProcessor);
+        foreach ($order as $name => $processor) {
+            $left = $cronBudget - count($processed);
+            if ($left <= 0 || microtime(true) >= $deadline) {
+                break;
+            }
+            $remaining = $counts[$name] - $examined[$name];
+            if ($remaining <= 0) {
+                continue;
+            }
+            $resume = $this->processCandidates($cursors[$name], $left, $remaining, $wrap($name, $processor), $deadline);
+            foreach ($resume['entries'] as $entry) {
+                $processed[] = $entry;
+            }
+            $this->logCandidatePass('reprise du reliquat [' . $name . ']', $remaining, $resume, $left);
+        }
+
+        return $processed;
+    }
+
+    /**
+     * Parcourt un curseur de candidats, REPRENABLE (chaque appel continue où le précédent s'est
+     * arrêté), jusqu'au budget de produits, au budget temps ou à la fin de la liste (hotfix 2.6.2).
+     *
+     * Le budget est vérifié AVANT de lire la ligne suivante : un candidat n'est jamais lu puis perdu à
+     * l'arrêt, ce qui rend la reprise sans trou. Seuls les produits réellement synchronisés (contenu ou
+     * stock seul) comptent dans le budget ; 'skipped' (aucun appel API) et les échecs n'en consomment pas.
+     *
+     * @param mixed    $result        Curseur SQL de la passe
+     * @param int      $budget        Nombre max de produits COMPTÉS pour CET appel
+     * @param int      $remainingRows Lignes restantes dans le curseur (distingue « budget » de « fin »)
+     * @param callable $processOne    function (object $productData): array{outcome:string, entry:?array}
+     *                                outcome ∈ content | stock | skipped | failed | fetch_failed
+     * @param float    $deadline      Échéance absolue (microtime(true)) du budget temps
+     * @return array{entries:array, examined:int, outcomes:array, stopReason:string}
+     *         stopReason ∈ budget | time | end
+     * @since 2.6.2
+     */
+    private function processCandidates($result, $budget, $remainingRows, $processOne, $deadline)
+    {
+        $entries = array();
+        $examined = 0;
+        $outcomes = array('content' => 0, 'stock' => 0, 'skipped' => 0, 'failed' => 0, 'fetch_failed' => 0);
+        $stopReason = 'end';
+
+        while (true) {
+            if (count($entries) >= $budget) {
+                $stopReason = ($remainingRows - $examined) > 0 ? 'budget' : 'end';
+                break;
+            }
+            if (microtime(true) >= $deadline) {
+                $stopReason = ($remainingRows - $examined) > 0 ? 'time' : 'end';
+                break;
+            }
+            $productData = $this->db->fetch_object($result);
+            if (!$productData) {
+                $stopReason = 'end';
+                break;
+            }
+            $examined++;
+
+            $processed = $processOne($productData);
+            $outcome = isset($processed['outcome']) ? $processed['outcome'] : 'failed';
+            if (!isset($outcomes[$outcome])) {
+                $outcomes[$outcome] = 0;
+            }
+            $outcomes[$outcome]++;
+            if (!empty($processed['entry'])) {
+                $entries[] = $processed['entry'];
+            }
+        }
+
+        return array('entries' => $entries, 'examined' => $examined, 'outcomes' => $outcomes, 'stopReason' => $stopReason);
+    }
+
+    /**
+     * Journal exact d'une passe de sélection (hotfix 2.6.2, AC5) : total RÉEL des candidats de la
+     * passe, nombre examiné, ventilation du résultat (contenu envoyé / stock seul / ignorés / échecs),
+     * et RAISON d'arrêt. Remplace les anciens messages dont le « candidats trouvés » s'arrêtait au
+     * premier candidat refusé et dont le total des parents était calculé en négatif.
+     *
+     * @param string $label           Libellé de la passe
+     * @param int    $totalCandidates Lignes du curseur au début de la passe
+     * @param array  $pass            Retour de processCandidates()
+     * @param int    $budget          Budget produits de la passe
+     * @return void
+     * @since 2.6.2
+     */
+    private function logCandidatePass($label, $totalCandidates, array $pass, $budget)
+    {
+        $reasons = array(
+            'budget' => "budget produits atteint (" . (int) $budget . ")",
+            'time' => "budget temps atteint (" . self::CRON_TIME_BUDGET_SECONDS . " s)",
+            'end' => "fin de liste",
+        );
+        $reason = isset($reasons[$pass['stopReason']]) ? $reasons[$pass['stopReason']] : $pass['stopReason'];
+
+        $this->log("Fin traitement produits " . $label . " - " . (int) $totalCandidates . " candidats au total, "
+            . (int) $pass['examined'] . " examinés, " . count($pass['entries']) . " comptés dans le budget"
+            . " (contenu: " . $pass['outcomes']['content'] . ", stock seul: " . $pass['outcomes']['stock'] . ")"
+            . ", ignorés: " . $pass['outcomes']['skipped'] . ", échecs: " . ($pass['outcomes']['failed'] + $pass['outcomes']['fetch_failed'])
+            . " - arrêt: " . $reason, LOG_INFO);
+    }
+
+    /**
+     * Traite UN candidat produit simple du cron : charge le produit Dolibarr, le synchronise, nettoie
+     * le mapping si Shopify dit que le produit n'existe plus. Corps de l'ancienne boucle de
+     * importProducts(), inchangé, extrait pour processCandidates().
+     *
+     * @param object $productData Ligne de la requête de candidats (rowid, ref, tosell)
+     * @return array{outcome:string, entry:?array}
+     * @since 2.6.2
+     */
+    // Hotfix 2.6.2 : visibilité élargie (private -> protected) pour les tests (sous-classe qui substitue ce point d'appel).
+    protected function processSimpleCandidate($productData)
+    {
+        $this->log("Processing simple product: " . $productData->ref . " (ID: " . $productData->rowid . ", tosell: " . $productData->tosell . ")", LOG_DEBUG);
+
+        // Toujours utiliser l'objet Product officiel
+        $product = new Product($this->db);
+        $fetchResult = $product->fetch($productData->rowid);
+
+        if ($fetchResult <= 0) {
+            $this->log("Failed to fetch product ID: " . $productData->rowid, LOG_ERR);
+            return array('outcome' => 'fetch_failed', 'entry' => null);
+        }
+
+        $this->log("Product fetched successfully - ID: " . $product->id . ", status: " . $product->status, LOG_DEBUG);
+
+        try {
+            $syncResult = $this->syncProduct($product);
+            return $this->classifyCandidateSyncResult($syncResult, $product, array());
+        } catch (Exception $e) {
+            $this->log("Error syncing simple product " . $product->ref . ": " . $e->getMessage(), LOG_ERR);
+            // Auto-cleanup: si Shopify dit que le produit n'existe pas, supprimer l'entrée sync
+            // pour qu'il soit recréé proprement à la prochaine exécution
+            if (stripos($e->getMessage(), "Product does not exist") !== false
+                || stripos($e->getMessage(), "does not exist") !== false) {
+                $this->log("Auto-cleanup: removing invalid sync entry for product " . $product->ref . " (ID: " . $product->id . ")", LOG_WARNING);
+                $sqlClean = "DELETE FROM " . MAIN_DB_PREFIX . "doli2shop_products WHERE fk_product = " . (int)$product->id . " AND entity = " . (int)$this->entity;
+                $this->db->query($sqlClean);
+            }
+            // Continue with next product instead of failing entire import
+            return array('outcome' => 'failed', 'entry' => null);
+        }
+    }
+
+    /**
+     * Traite UN candidat produit parent (à déclinaisons) du cron. Cf. processSimpleCandidate().
+     *
+     * @param object $productData Ligne de la requête de candidats (rowid, ref, tosell)
+     * @return array{outcome:string, entry:?array}
+     * @since 2.6.2
+     */
+    // Hotfix 2.6.2 : visibilité élargie (private -> protected) pour les tests (sous-classe qui substitue ce point d'appel).
+    protected function processParentCandidate($productData)
+    {
+        $this->log("Processing parent product: " . $productData->ref . " (ID: " . $productData->rowid . ", tosell: " . $productData->tosell . ")", LOG_DEBUG);
+
+        // Toujours utiliser l'objet Product officiel
+        $product = new Product($this->db);
+        $fetchResult = $product->fetch($productData->rowid);
+
+        if ($fetchResult <= 0) {
+            $this->log("Failed to fetch parent product ID: " . $productData->rowid, LOG_ERR);
+            return array('outcome' => 'fetch_failed', 'entry' => null);
+        }
+
+        $this->log("Parent product fetched successfully - ID: " . $product->id . ", status: " . $product->status, LOG_DEBUG);
+
+        try {
+            // Use factorized method to get variants
+            $variants = $this->getProductVariants($product->id);
+
+            $syncResult = $this->syncProduct($product, $variants, '');
+            return $this->classifyCandidateSyncResult($syncResult, $product, $variants);
+        } catch (Exception $e) {
+            $this->log("Error syncing parent product " . $product->ref . ": " . $e->getMessage(), LOG_ERR);
+            // Auto-cleanup: si Shopify dit que le produit n'existe pas, supprimer l'entrée sync
+            if (stripos($e->getMessage(), "Product does not exist") !== false
+                || stripos($e->getMessage(), "does not exist") !== false) {
+                $this->log("Auto-cleanup: removing invalid sync entry for parent product " . $product->ref . " (ID: " . $product->id . ")", LOG_WARNING);
+                $sqlClean = "DELETE FROM " . MAIN_DB_PREFIX . "doli2shop_products WHERE fk_product = " . (int)$product->id . " AND entity = " . (int)$this->entity;
+                $this->db->query($sqlClean);
+            }
+            // Continue with next product instead of failing entire import
+            return array('outcome' => 'failed', 'entry' => null);
+        }
+    }
+
+    /**
+     * Traduit le retour de syncProduct() pour processCandidates() : `true` (contenu synchronisé) et
+     * 'stock_synced' (stock seul) COMPTENT dans le budget CRON ; 'skipped' (aucun appel API) n'y compte
+     * pas ; `false` (échec, verrou tenu par un autre, produit déjà traité dans la session) non plus.
+     *
+     * @param mixed  $syncResult Retour de syncProduct()
+     * @param object $product    Produit Dolibarr
+     * @param array  $variants   Déclinaisons (vide pour un produit simple)
+     * @return array{outcome:string, entry:?array}
+     * @since 2.6.2
+     */
+    private function classifyCandidateSyncResult($syncResult, $product, array $variants)
+    {
+        if ($syncResult === true || $syncResult === 'stock_synced') {
+            return array(
+                'outcome' => ($syncResult === true) ? 'content' : 'stock',
+                'entry' => array('product' => $product, 'variants' => $variants),
+            );
+        }
+        if ($syncResult === 'skipped') {
+            return array('outcome' => 'skipped', 'entry' => null);
+        }
+
+        return array('outcome' => 'failed', 'entry' => null);
     }
 
     /**
@@ -1396,8 +2416,12 @@ class ImportProducts extends CommonObject
      * @return bool True si au moins un stock a été envoyé
      * @since 2.2.0
      */
-    private function syncVariantStocksOnly($dolProduct, $shopifyProductId, $variants = [])
+    // Hotfix 2.6.2 : visibilité élargie (private -> protected) pour les tests (sous-classe qui substitue ce point d'appel).
+    protected function syncVariantStocksOnly($dolProduct, $shopifyProductId, $variants = [])
     {
+        // Hotfix 2.6.2 (review lot 4, MEDIUM-1) : remis à false à l'entrée, posé à true seulement juste avant l'appel
+        // d'envoi à Shopify — « rien à envoyer » (retour false) n'est alors pas confondu avec « envoi tenté puis échoué ».
+        $this->lastStockSyncAttempted = false;
         try {
             // Validation shopify_location_id AVANT tout traitement
             if (empty($this->config->shopify_location_id)) {
@@ -1524,6 +2548,7 @@ class ImportProducts extends CommonObject
 
             if (!empty($inventoryQuantities)) {
                 $this->log("syncVariantStocksOnly - Sending " . count($inventoryQuantities) . " stock updates for skipped product " . $dolProduct->ref, LOG_INFO);
+                $this->lastStockSyncAttempted = true;
                 $stockResult = $this->updateInventoryQuantities($inventoryQuantities);
 
                 if (!$stockResult) {
@@ -1657,6 +2682,19 @@ class ImportProducts extends CommonObject
             return false;
         }
 
+        // Hotfix 2.6.2 (R7) : l'instant de DÉBUT de synchro est capturé ICI, avant le verrou et avant toute
+        // lecture/envoi, côté SQL (même horloge et même fuseau que llx_product.tms), et c'est lui — pas le
+        // NOW() de fin de synchro — qui sera écrit comme last_content_sync. Une modification Dolibarr
+        // survenue PENDANT la synchro (qui dure de quelques secondes à plusieurs minutes avec les images)
+        // porte alors un tms postérieur à la référence : elle est revue au cycle suivant au lieu d'être
+        // absorbée par un NOW() de fin.
+        $syncStartedAt = $this->readDatabaseNow();
+
+        // S5 (d) : un verrou `pending` PÉRIMÉ (cron tué en cours de synchro) est une synchro interrompue = un échec.
+        // Enregistré AVANT que le nouveau verrou ne l'écrase, sinon la ligne serait retentée à chaque cycle sans jamais
+        // entrer dans le délai croissant (elle ne passe jamais par `failed`).
+        $this->recordInterruptedSyncAsFailure($productId);
+
         // Set sync lock to prevent concurrent synchronizations by setting status to pending
         if (!$this->manageProductMapping($productId, null, null, null, 'pending', null, false)) {
             $this->log("Failed to set sync lock for product: " . $dolProduct->ref, LOG_ERR);
@@ -1667,6 +2705,10 @@ class ImportProducts extends CommonObject
 
         // Mark product as processed in current session
         self::$sessionProcessedProducts[$productId] = time();
+
+        // R7 : instant lu par manageProductMapping() pour tout succès de CONTENU de cette synchro
+        // (parent, déclinaisons, cascade). Remis à null dans le `finally` de ce try.
+        $this->contentSyncInstant = $syncStartedAt;
 
         $this->db->begin();
 
@@ -1700,8 +2742,10 @@ class ImportProducts extends CommonObject
             $syncOptions = $this->getSyncOptions();
 
             // Check if the product exists in our mapping table
-            $sql = "SELECT * FROM " . MAIN_DB_PREFIX . $this->table_element . "
-                   WHERE fk_product = ? AND entity = " . (int)$this->entity;
+            // Hotfix 2.6.2 (R8) : last_content_sync ET llx_product.tms sont lus en epoch PAR LE MOTEUR, dans la
+            // même requête (même session SQL, même fuseau) — plus de strtotime() PHP sur une chaîne datetime,
+            // faux dès que le fuseau de PHP diffère de celui de MySQL.
+            $sql = $this->buildProductMappingSelectSql();
             $result = SqlUtils::executeQuery($this->db, $sql, "checking product mapping", true, [(int)$productId]);
             $shopifyProductId = null;
             $isUpdate = false;
@@ -1711,7 +2755,20 @@ class ImportProducts extends CommonObject
             if ($result && $this->db->num_rows($result) > 0) {
                 $savedProduct = $this->db->fetch_object($result);
                 $shopifyProductId = $savedProduct->shopifyProductId;
-                
+
+                // Hotfix 2.6.2 (AC2) : un enfant DÉLIÉ (mapping avec parent, plus de combinaison) ne doit JAMAIS
+                // atteindre prepareProductData()/productSet() : son shopifyProductId est celui de son ANCIEN
+                // parent, un productSet « produit simple » y remplacerait toutes les variantes du parent par
+                // une seule et le passerait en brouillon. Garde universel (cron, synchro manuelle, AJAX, stock
+                // seul) : verrou libéré, ligne conservée (shopifyVariantId utile au rapprochement des commandes
+                // passées), aucun appel Shopify.
+                if ($this->isUnlinkedChildMapping($productId, $savedProduct)) {
+                    $this->db->rollback();
+                    $this->handleUnlinkedChild($dolProduct, $savedProduct);
+                    $this->manageProductMapping($productId, null, null, null, 'skipped', null, true, false, false);
+                    return 'skipped';
+                }
+
                 // Check if this is a valid Shopify ID (not a temporary lock)
                 if (strpos($shopifyProductId, 'TEMP_LOCK_') !== 0) {
                     $foundValidMapping = true;
@@ -1753,9 +2810,15 @@ class ImportProducts extends CommonObject
                         }
                     }
 
+                    // S5 : le CONTENU d'un produit en attente après un échec n'est pas retenté avant la fin de son délai
+                    // croissant ; le stock, lui, suit sa cadence normale (même chemin que « produit inchangé »).
+                    $contentRetryBlocked = $this->isContentRetryBlocked($dolProduct, $savedProduct, $isManualSync);
+
                     // Check if we need to update this product (only for real updates)
-                    if (!$this->checkProductNeedsUpdate($dolProduct, $savedProduct, $isManualSync)) {
-                        $this->log("Product does not need update: " . $dolProduct->ref, LOG_INFO);
+                    if ($contentRetryBlocked || !$this->checkProductNeedsUpdate($dolProduct, $savedProduct, $isManualSync)) {
+                        $this->log($contentRetryBlocked
+                            ? "Product content retry delayed after a previous failure, stock only: " . $dolProduct->ref
+                            : "Product does not need update: " . $dolProduct->ref, LOG_INFO);
                         $this->db->rollback();
 
                         // FIX v2.2.0: Assigner les collections même si le produit n'a pas changé
@@ -1772,11 +2835,27 @@ class ImportProducts extends CommonObject
 
                         // FIX v2.2.0: Marquer 'success' si stock synchro OK (évite re-traitement à chaque CRON)
                         // Marquer 'skipped' seulement si aucun stock n'a été envoyé
-                        // FIX v2.4.1 (hotfix) : $contentSynced=false — ce succès est stock-only, tms
-                        // (référence "dernier contenu synchronisé") ne doit PAS être rafraîchi, sinon
-                        // le garde-fou 24h et checkProductNeedsUpdate() ne voient plus jamais le contenu vieillir
-                        $syncStatus = $stockSynced ? 'success' : 'skipped';
-                        $this->manageProductMapping($productId, null, null, null, $syncStatus, null, true, false, false);
+                        // $contentSynced=false — ce succès est stock-only : last_content_sync (la vraie
+                        // référence « dernier contenu synchronisé », hotfix 2.6.2) ne doit PAS être
+                        // rafraîchie, sinon le garde-fou 24h et checkProductNeedsUpdate() ne voient plus
+                        // jamais le contenu vieillir. ⚠️ Ce n'est PAS tms qui est protégé ici (erreur du
+                        // commentaire FIX v2.4.1 d'origine) : tms est en ON UPDATE CURRENT_TIMESTAMP sur
+                        // toute base migrée et bouge à chaque UPDATE de la ligne, verrou 'pending' compris.
+                        // BH-M2 / ECH-3 : last_stock_sync n'est estampillé (par manageProductMapping) QUE si aucun envoi de stock
+                        // n'a été tenté (stock désactivé, ou pas d'identifiant Shopify) ; un envoi tenté puis échoué reste dû.
+                        // Review lot 4 (MEDIUM-1) : « tenté » = un appel d'envoi a réellement eu lieu ET a échoué ; « rien à
+                        // envoyer » (aucune variante Shopify, aucune correspondance SKU, tout écarté, localisation vide) est estampillé.
+                        $stockAttempted = !empty($this->config->sync_product_stocks) && $this->config->sync_product_stocks == 1 && !empty($shopifyProductId)
+                            && $this->lastStockSyncAttempted && !$stockSynced;
+                        if ($contentRetryBlocked) {
+                            // S5 : le contenu reste en échec — statut `failed` rétabli (le verrou l'avait passé à
+                            // 'pending'), état d'échec (last_failed_at, failed_streak, message) INTACT : seul le stock
+                            // vient d'être traité.
+                            $this->manageProductMapping($productId, null, null, null, 'failed', null, true, false, false, true, !$stockAttempted);
+                        } else {
+                            $syncStatus = $stockSynced ? 'success' : 'skipped';
+                            $this->manageProductMapping($productId, null, null, null, $syncStatus, null, true, false, false, false, !$stockAttempted);
+                        }
 
                         // Si stock envoyé → compter dans la limite CRON (appel API effectué)
                         // Si rien envoyé → ne pas compter (aucun appel API)
@@ -1853,6 +2932,10 @@ class ImportProducts extends CommonObject
                             if (!$deleteResult) {
                                 $this->log("TYPE MISMATCH: Failed to delete Shopify simple product "
                                     . $shopifyProductId . " — skipping to prevent duplicates", LOG_ERR);
+                                // S6 : toute sortie `skipped` libère le verrou et estampille last_stock_sync (sortie de la
+                                // tête de la rotation) ; la transaction ouverte plus haut est annulée.
+                                $this->db->rollback();
+                                $this->manageProductMapping($productId, null, null, null, 'skipped', null, true, false, false);
                                 return 'skipped';
                             }
                             // Nettoyer le mapping orphelin vers le produit supprimé
@@ -1897,6 +2980,10 @@ class ImportProducts extends CommonObject
             // Prepare product data for productSet mutation
             $productData = $this->prepareProductData($dolProduct, $variants, $tags, $shopifyProductId, $syncOptions);
 
+            // Hotfix 2.6.2 (AC5) : productSet est déclaratif — les variantes Shopify absentes du payload sont SUPPRIMÉES
+            // (Dolibarr fait foi, comportement inchangé). Aucune lecture GraphQL supplémentaire n'est faite ici
+            // pour les lister : pas d'appel API en plus par mise à jour.
+
             // Execute productSet mutation with improved retry logic
             $maxRetries = 3;
             $retryCount = 0;
@@ -1927,7 +3014,9 @@ class ImportProducts extends CommonObject
                 "resource does not exist",
                 "does not exist",
                 "Product does not exist",
-                "exceeded plan limit"
+                "exceeded plan limit",
+                // Hotfix 2.6.2 : limite d'options par produit dépassée — la même charge utile sera toujours refusée
+                "Can only specify a maximum"
             ];
 
             while ($retryCount < $maxRetries && !$syncSuccess && !$permanentError) {
@@ -2051,8 +3140,12 @@ class ImportProducts extends CommonObject
                         $publicUrl = 'https://' . $this->config->shopify_store_hostname . '/products/' . $shopifyProduct->handle;
 
                         // Use a more efficient update with less locking
+                        // Hotfix 2.6.2 : `tms = tms` — llx_product.tms est en ON UPDATE CURRENT_TIMESTAMP ; sans cette
+                        // affectation explicite, l'écriture de l'URL par le module ferait passer le produit pour
+                        // « modifié dans Dolibarr » (tms postérieur à last_content_sync, écrite à l'instant de DÉBUT
+                        // de synchro, R7) et provoquerait un renvoi de contenu inutile au cycle suivant.
                         $sql = "UPDATE " . MAIN_DB_PREFIX . "product
-                                SET url = ?
+                                SET url = ?, tms = tms
                                 WHERE rowid = ? AND (url IS NULL OR url != ?)";
 
                         // Only update if URL has changed
@@ -2176,7 +3269,289 @@ class ImportProducts extends CommonObject
                 $this->manageProductMapping($productId, null, null, null, 'failed', $e->getMessage(), true, false);
             }
             return false;
+        } finally {
+            // R7 : l'instant de début de synchro ne survit jamais à la synchro (un succès de contenu écrit
+            // hors syncProduct() reprendrait NOW()).
+            $this->contentSyncInstant = null;
         }
+    }
+
+    /**
+     * Expression SQL (0/1) « un PRIX a été modifié APRÈS le dernier échec de contenu de cette ligne » (ECH-1) : miroir de
+     * la levée du délai de buildInFailureBackoffCondition() (même signal que le rang prix : `llx_product_price.date_price`
+     * ET `llx_product.tms` postérieurs à `last_failed_at`, produit ou déclinaisons ; niveau de prix synchronisé seulement
+     * en multiprix, S3), évaluée par le moteur sur la ligne de `llx_doli2shop_products` interrogée. Le plancher d'1 h est
+     * appliqué par isContentRetryBlocked().
+     *
+     * @return string Expression SQL (colonnes qualifiées par la table du mapping)
+     * @since 2.6.2
+     */
+    private function buildPriceModifiedSinceFailureSelect()
+    {
+        $prefix = MAIN_DB_PREFIX;
+        $map = $prefix . $this->table_element;
+        $level = $this->getSyncedPriceLevelForSelection();
+        $own = ($level > 0) ? " AND pp.price_level = " . $level : "";
+        $child = ($level > 0) ? " AND cpp.price_level = " . $level : "";
+
+        return "COALESCE(("
+            . "(EXISTS (SELECT 1 FROM " . $prefix . "product_price pp WHERE pp.fk_product = " . $map . ".fk_product AND pp.date_price > " . $map . ".last_failed_at" . $own . ")"
+            . " AND EXISTS (SELECT 1 FROM " . $prefix . "product po WHERE po.rowid = " . $map . ".fk_product AND po.tms > " . $map . ".last_failed_at))"
+            . " OR (EXISTS (SELECT 1 FROM " . $prefix . "product_attribute_combination pac1"
+            . " INNER JOIN " . $prefix . "product_price cpp ON cpp.fk_product = pac1.fk_product_child"
+            . " WHERE pac1.fk_product_parent = " . $map . ".fk_product AND cpp.date_price > " . $map . ".last_failed_at" . $child . ")"
+            . " AND EXISTS (SELECT 1 FROM " . $prefix . "product_attribute_combination pac2"
+            . " INNER JOIN " . $prefix . "product cc ON cc.rowid = pac2.fk_product_child"
+            . " WHERE pac2.fk_product_parent = " . $map . ".fk_product AND cc.tms > " . $map . ".last_failed_at))"
+            . "), 0)";
+    }
+
+    /**
+     * Le mapping lu désigne-t-il un enfant DÉLIÉ ? (hotfix 2.6.2, AC2) : `fk_product_parent > 0` ET aucune
+     * `product_attribute_combination` n'a ce produit pour enfant. Lecture seule, filtre entité ; la
+     * combinaison est cherchée sur le produit (une déclinaison n'a qu'un parent), sans notion de boutique.
+     *
+     * @param int         $dolibarrProductId Produit Dolibarr
+     * @param object|null $savedProduct      Ligne de mapping (SELECT de syncProduct())
+     * @return bool
+     * @since 2.6.2
+     */
+    private function isUnlinkedChildMapping($dolibarrProductId, $savedProduct)
+    {
+        if (!is_object($savedProduct) || empty($savedProduct->fk_product_parent) || (int) $savedProduct->fk_product_parent <= 0) {
+            return false;
+        }
+        $sql = "SELECT 1 FROM " . MAIN_DB_PREFIX . "product_attribute_combination"
+            . " WHERE fk_product_child = " . (int) $dolibarrProductId . " LIMIT 1";
+        $resql = $this->db->query($sql);
+        if (!$resql) {
+            // Lecture impossible : ne pas conclure « délié » (un faux positif ferait taire un vrai produit) ;
+            // les autres garde-fous (clause de sélection) restent en place.
+            $this->log("isUnlinkedChildMapping - lecture des combinaisons impossible pour le produit #" . (int) $dolibarrProductId . " : " . $this->db->lasterror(), LOG_ERR);
+            return false;
+        }
+        $hasCombination = ($this->db->num_rows($resql) > 0);
+        $this->db->free($resql);
+        return !$hasCombination;
+    }
+
+    /**
+     * Balayage de cycle (hotfix 2.6.2, D1) : la clause d'exclusion du cron écarte les enfants déliés AVANT
+     * syncProduct() — handleUnlinkedChild() n'est donc jamais atteint par le cron. Ce balayage pose le
+     * marqueur `variant_repair_status = 2` sur toutes les lignes « parent > 0 sans combinaison » de
+     * l'entité (fk_store conditionnel §14) quand Dolibarr fait foi pour les produits (flux produit
+     * `dolibarr_to_shopify` exclusif pour la boutique courante), et journalise en LOG_WARNING, UNE fois par
+     * cycle, leur nombre et leurs refs (bornées). En `both` / `shopify_to_dolibarr` : journal seul, aucun
+     * marqueur (vrai enfant jamais lié, réparable). Anti-jointure (LEFT JOIN) : MySQL refuse une sous-requête
+     * sur la table mise à jour (erreur 1093). Aucune suppression, `fk_product_parent` et `shopifyVariantId`
+     * conservés.
+     *
+     * @return int Nombre d'enfants déliés trouvés (0 si aucun ou erreur)
+     * @since 2.6.2
+     */
+    private function markUnlinkedChildren()
+    {
+        $storeId = (int) $this->shopifyApi->getStoreId();
+        $table = MAIN_DB_PREFIX . $this->table_element;
+        $where = " WHERE p.entity = " . (int) $this->entity . " AND p.fk_product_parent > 0 AND pac.rowid IS NULL";
+        if ($storeId > 0) {
+            $where .= " AND p.fk_store = " . $storeId;
+        }
+        $join = " LEFT JOIN " . MAIN_DB_PREFIX . "product_attribute_combination pac ON pac.fk_product_child = p.fk_product";
+
+        // Re-liaison (L2) : une ligne marquée 2 dont le produit a de nouveau une combinaison n'est plus
+        // « déliée » — marqueur remis à 0 (idempotent ; jointure interne, pas de sous-requête sur la table
+        // mise à jour : MySQL erreur 1093 ; entity + fk_store conditionnel §14).
+        $reset = "UPDATE " . $table . " p INNER JOIN " . MAIN_DB_PREFIX . "product_attribute_combination pac2"
+            . " ON pac2.fk_product_child = p.fk_product SET p.variant_repair_status = 0"
+            . " WHERE p.entity = " . (int) $this->entity . " AND p.variant_repair_status = 2";
+        if ($storeId > 0) {
+            $reset .= " AND p.fk_store = " . $storeId;
+        }
+        if (!$this->db->query($reset)) {
+            $this->log("markUnlinkedChildren - remise à 0 des enfants re-liés impossible : " . $this->db->lasterror(), LOG_ERR);
+        }
+
+        $sql = "SELECT p.fk_product, pr.ref FROM " . $table . " p" . $join
+            . " LEFT JOIN " . MAIN_DB_PREFIX . "product pr ON pr.rowid = p.fk_product" . $where
+            . " ORDER BY p.fk_product";
+        $resql = $this->db->query($sql);
+        if (!$resql) {
+            $this->log("markUnlinkedChildren - lecture impossible : " . $this->db->lasterror(), LOG_ERR);
+            return 0;
+        }
+        $count = (int) $this->db->num_rows($resql);
+        $refs = array();
+        while (count($refs) < 10 && ($obj = $this->db->fetch_object($resql))) {
+            $refs[] = ($obj->ref !== null && $obj->ref !== '') ? $obj->ref : ('#' . (int) $obj->fk_product);
+        }
+        $this->db->free($resql);
+        if ($count === 0) {
+            return 0;
+        }
+
+        try {
+            $direction = $this->getSyncFlowPolicy()->getDirection(SyncFlowPolicy::FLOW_PRODUCT_UPDATE, $storeId);
+        } catch (\Throwable $e) {
+            $direction = '';
+        }
+        $marked = ($direction === 'dolibarr_to_shopify');
+        if ($marked) {
+            $update = "UPDATE " . $table . " p" . $join . " SET p.variant_repair_status = 2" . $where
+                . " AND (p.variant_repair_status IS NULL OR p.variant_repair_status <> 2)";
+            if (!$this->db->query($update)) {
+                $this->log("markUnlinkedChildren - marquage variant_repair_status = 2 impossible : " . $this->db->lasterror(), LOG_ERR);
+                $marked = false;
+            }
+        }
+
+        $this->log("importProducts - " . $count . " enfant(s) DÉLIÉ(S) de leur ancien parent (plus de déclinaison Dolibarr) écarté(s) de l'export"
+            . ($marked ? " et marqué(s) variant_repair_status = 2" : " (aucun marqueur : Dolibarr n'est pas maître des produits)")
+            . " : " . implode(', ', $refs) . ($count > count($refs) ? ' …' : ''), LOG_WARNING);
+
+        return $count;
+    }
+
+    /**
+     * Journal nominatif (une fois par cycle) et marqueur durable d'un enfant délié (hotfix 2.6.2, AC2).
+     *
+     * Le marqueur `variant_repair_status = 2` n'est posé QUE si Dolibarr fait foi pour les produits (flux
+     * `dolibarr_to_shopify` exclusif pour cette boutique) : l'absence de combinaison y signifie « délié
+     * volontairement ». En `both` / `shopify_to_dolibarr`, c'est aussi la signature d'un vrai enfant jamais
+     * encore rattaché (cas d'origine de l'outil de réparation) : pas de marqueur, il reste réparable.
+     * La ligne de mapping n'est NI supprimée NI vidée de son parent (la suppression le rendrait « non
+     * mappé » : TYPE MISMATCH puis création d'un produit Shopify en doublon). Écriture idempotente.
+     *
+     * @param object $dolProduct  Produit Dolibarr
+     * @param object $savedProduct Ligne de mapping
+     * @return void
+     * @since 2.6.2
+     */
+    private function handleUnlinkedChild($dolProduct, $savedProduct)
+    {
+        $productId = (int) $dolProduct->id;
+        $storeId = (int) $this->shopifyApi->getStoreId();
+
+        if (!isset(self::$unlinkedChildWarned[$productId])) {
+            self::$unlinkedChildWarned[$productId] = true;
+            $this->log("syncProduct - produit #" . $productId . " (" . $dolProduct->ref . ") : enfant DÉLIÉ de l'ancien parent #" . (int) $savedProduct->fk_product_parent
+                . " (plus de déclinaison Dolibarr) — aucune synchro vers Shopify, le produit Shopify de l'ancien parent n'est pas touché", LOG_WARNING);
+        }
+
+        try {
+            $direction = $this->getSyncFlowPolicy()->getDirection(SyncFlowPolicy::FLOW_PRODUCT_UPDATE, $storeId);
+        } catch (\Throwable $e) {
+            $direction = '';
+        }
+        if ($direction !== 'dolibarr_to_shopify') {
+            return;
+        }
+
+        $sql = "UPDATE " . MAIN_DB_PREFIX . $this->table_element
+            . " SET variant_repair_status = 2"
+            . " WHERE fk_product = " . $productId
+            . " AND entity = " . (int) $this->entity
+            . " AND fk_product_parent > 0"
+            . " AND (variant_repair_status IS NULL OR variant_repair_status <> 2)";
+        if ($storeId > 0) {
+            $sql .= " AND fk_store = " . $storeId;
+        }
+        if (!$this->db->query($sql)) {
+            $this->log("handleUnlinkedChild - marquage variant_repair_status = 2 impossible pour le produit #" . $productId . " : " . $this->db->lasterror(), LOG_ERR);
+        }
+    }
+
+    /**
+     * SELECT du mapping lu par syncProduct() APRÈS le verrou 'pending' (un paramètre `?` : fk_product).
+     * Extrait pour que le test d'intégration (R11) exécute EXACTEMENT cette requête contre un vrai moteur.
+     *
+     * R8 : `last_content_sync` et `llx_product.tms` sont lus en epoch PAR LE MOTEUR, dans la même requête
+     * (même session SQL, même fuseau) — plus de strtotime() PHP sur une chaîne datetime, faux dès que le
+     * fuseau de PHP diffère de celui de MySQL. S5 : `last_failed_at_unix` et `db_now_unix` (UNIX_TIMESTAMP(),
+     * l'horloge du moteur) permettent de juger le délai de retentative sur la même horloge. (`SELECT *` conservé : les autres colonnes sont lues telles
+     * quelles ; la sous-requête porte sur la clé primaire de llx_product.)
+     *
+     * @return string
+     * @since 2.6.2
+     */
+    private function buildProductMappingSelectSql()
+    {
+        return "SELECT *, UNIX_TIMESTAMP(last_content_sync) AS last_content_sync_unix,
+                      UNIX_TIMESTAMP(last_failed_at) AS last_failed_at_unix,
+                      UNIX_TIMESTAMP() AS db_now_unix,
+                      " . $this->buildPriceModifiedSinceFailureSelect() . " AS price_modified_since_failure,
+                      (SELECT UNIX_TIMESTAMP(prod.tms) FROM " . MAIN_DB_PREFIX . "product prod
+                       WHERE prod.rowid = " . MAIN_DB_PREFIX . $this->table_element . ".fk_product) AS product_tms_unix
+               FROM " . MAIN_DB_PREFIX . $this->table_element . "
+               WHERE fk_product = ? AND entity = " . (int)$this->entity;
+    }
+
+    /**
+     * S5 (d) : enregistre comme ÉCHEC une synchro interrompue — ligne `pending` dont le verrou a plus de
+     * STALE_LOCK_MINUTES (cron tué ou plafonné par le délai du cron). last_failed_at = NOW(), failed_streak + 1,
+     * message explicite ; le statut sera réécrit par le nouveau verrou, puis restauré en `failed` par
+     * syncProduct() (le contenu n'est pas retenté dans le même cycle). N'affecte aucune ligne qui n'est pas dans
+     * cet état (une seule requête, filtrée entity + fk_store conditionnel §14). Jamais bloquant.
+     *
+     * @param int $dolibarrProductId Produit Dolibarr
+     * @return void
+     * @since 2.6.2
+     */
+    private function recordInterruptedSyncAsFailure($dolibarrProductId)
+    {
+        try {
+            $fkStore = (int) $this->shopifyApi->getStoreId();
+            $sql = "UPDATE " . MAIN_DB_PREFIX . $this->table_element
+                . " SET last_failed_at = NOW(), failed_streak = failed_streak + 1,"
+                . " last_sync_error = 'Synchronisation precedente interrompue (verrou perime)'"
+                . " WHERE fk_product = " . (int) $dolibarrProductId . " AND entity = " . (int) $this->entity
+                . ($fkStore > 0 ? " AND fk_store = " . $fkStore : "")
+                . " AND last_sync_status = 'pending' AND sync_lock IS NOT NULL"
+                . " AND sync_lock < DATE_SUB(NOW(), INTERVAL " . (int) self::STALE_LOCK_MINUTES . " MINUTE)";
+            $this->db->query($sql);
+        } catch (\Throwable $e) {
+            $this->log("recordInterruptedSyncAsFailure - " . $e->getMessage(), LOG_WARNING);
+        }
+    }
+
+    /**
+     * Instant courant du moteur SQL (`SELECT NOW()`), au format `Y-m-d H:i:s`, ou null s'il est illisible
+     * (le repli est alors NOW() au moment de l'écriture — comportement antérieur, jamais un échec).
+     *
+     * @return string|null
+     * @since 2.6.2
+     */
+    private function readDatabaseNow()
+    {
+        try {
+            $resql = $this->db->query("SELECT NOW() AS db_now");
+            if ($resql) {
+                $row = $this->db->fetch_object($resql);
+                if (is_object($row) && isset($row->db_now) && is_string($row->db_now)
+                    && preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $row->db_now)) {
+                    return $row->db_now;
+                }
+            }
+        } catch (Exception $e) {
+            // Jamais bloquant : repli sur NOW() à l'écriture.
+        }
+        return null;
+    }
+
+    /**
+     * Expression SQL de l'instant à écrire dans last_content_sync : l'instant de DÉBUT de la synchro en
+     * cours (R7) s'il a été capturé, sinon NOW(). Littéral validé par expression régulière : jamais une
+     * valeur externe non contrôlée dans le SQL.
+     *
+     * @return string
+     * @since 2.6.2
+     */
+    private function contentSyncStampSql()
+    {
+        if (is_string($this->contentSyncInstant) && preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $this->contentSyncInstant)) {
+            return "'" . $this->contentSyncInstant . "'";
+        }
+        return "NOW()";
     }
 
     /**
@@ -2265,6 +3640,80 @@ class ImportProducts extends CommonObject
     }
 
     /**
+     * `MAX(llx_product.tms)` des déclinaisons d'un produit parent, en epoch calculé PAR LE MOTEUR (R8 : même
+     * horloge que last_content_sync_unix). 0 s'il n'a aucune déclinaison. Extrait de checkProductNeedsUpdate()
+     * (le délai de retentative après échec, S5, lit aussi cette valeur) : la requête reste UNE seule, testée
+     * contre un vrai moteur par CronExportCandidatesSelectionIntegrationTest (S10).
+     *
+     * @param int $dolibarrProductId Produit parent
+     * @return int Epoch (0 = aucune déclinaison)
+     * @since 2.6.2
+     */
+    private function readMaxChildTimestamp($dolibarrProductId)
+    {
+        $sqlMaxChildModif = "SELECT MAX(p.tms) as max_child_tms, UNIX_TIMESTAMP(MAX(p.tms)) as max_child_tms_unix
+                FROM " . MAIN_DB_PREFIX . "product p
+                INNER JOIN " . MAIN_DB_PREFIX . "product_attribute_combination pac ON p.rowid = pac.fk_product_child
+                WHERE pac.fk_product_parent = ?";
+        $resultMaxChild = SqlUtils::executeQuery($this->db, $sqlMaxChildModif, "checking max child modification date for product " . $dolibarrProductId, true, [(int)$dolibarrProductId]);
+        $maxChildTimestamp = 0;
+        if ($resultMaxChild && $this->db->num_rows($resultMaxChild) > 0) {
+            $rowMaxChild = $this->db->fetch_object($resultMaxChild);
+            if (!empty($rowMaxChild->max_child_tms_unix)) {
+                // R8 : epoch calculé par le moteur, même horloge que last_content_sync_unix.
+                $maxChildTimestamp = (int) $rowMaxChild->max_child_tms_unix;
+            } elseif (!empty($rowMaxChild->max_child_tms)) {
+                $maxChildTimestamp = strtotime($rowMaxChild->max_child_tms);
+            }
+        }
+        return $maxChildTimestamp;
+    }
+
+    /**
+     * Le CONTENU de ce produit est-il en attente avant retentative après un échec (hotfix 2.6.2, S5) ?
+     *
+     * Délai croissant min(6 h, 1 h × 2^(failed_streak − 1)) depuis `last_failed_at`, levé si un PRIX du produit (ou
+     * d'une de ses déclinaisons) a été modifié APRÈS l'échec (ECH-1 : une vente ne lève rien) et pas avant 1 h. Jugé sur
+     * l'horloge du moteur (`db_now_unix`, `last_failed_at_unix`, `price_modified_since_failure` lus dans la même requête). Ne s'applique pas à une
+     * synchro manuelle, qui force. Objet sans ces propriétés (mapping lu avant migration, stub ancien) : jamais en
+     * attente (comportement antérieur). Ne bloque QUE le contenu : syncProduct() envoie quand même le stock.
+     *
+     * @param object $dolProduct    Produit Dolibarr
+     * @param object $savedProduct  Mapping lu par buildProductMappingSelectSql()
+     * @param bool   $isManualSync  true = synchronisation manuelle
+     * @return bool
+     * @since 2.6.2
+     */
+    private function isContentRetryBlocked($dolProduct, $savedProduct, $isManualSync = false)
+    {
+        if ($isManualSync || !property_exists($savedProduct, 'last_failed_at_unix')
+            || $savedProduct->last_failed_at_unix === null || $savedProduct->last_failed_at_unix === '') {
+            return false;
+        }
+
+        $lastFailed = (int) $savedProduct->last_failed_at_unix;
+        $now = (property_exists($savedProduct, 'db_now_unix') && $savedProduct->db_now_unix !== null && $savedProduct->db_now_unix !== '')
+            ? (int) $savedProduct->db_now_unix : time();
+        $streak = property_exists($savedProduct, 'failed_streak') ? (int) $savedProduct->failed_streak : 0;
+        $delaySeconds = self::computeFailedRetryDelayMinutes($streak) * 60;
+
+        if (($now - $lastFailed) >= $delaySeconds) {
+            return false;
+        }
+
+        // ECH-1 : levé SEULEMENT par un PRIX modifié après l'échec (signal calculé par le moteur, buildPriceModifiedSinceFailureSelect()),
+        // et jamais avant le plancher. Une vente (tms bougé par un mouvement de stock) ne lève rien.
+        if (($now - $lastFailed) >= self::FAILED_RETRY_LIFT_FLOOR_MINUTES * 60
+            && property_exists($savedProduct, 'price_modified_since_failure') && (int) $savedProduct->price_modified_since_failure === 1) {
+            return false;
+        }
+
+        $this->log("Product content retry delayed after failure (streak " . $streak . ", delay " . ($delaySeconds / 60) . " min): "
+            . (isset($dolProduct->ref) ? $dolProduct->ref : $dolProduct->id), LOG_DEBUG);
+        return true;
+    }
+
+    /**
      * Check if a product needs to be updated
      *
      * @param object $dolProduct Dolibarr product
@@ -2277,7 +3726,43 @@ class ImportProducts extends CommonObject
         // CORRECTION CRITIQUE : Utiliser date_modification au lieu de tms inexistant
         // L'objet Product de Dolibarr utilise date_modification (timestamp Unix)
         $dolTimestamp = !empty($dolProduct->date_modification) ? (int)$dolProduct->date_modification : 0;
-        $shopifyTimestamp = strtotime($savedProduct->tms);
+        // R8 : quand le mapping a été lu avec `product_tms_unix` (UNIX_TIMESTAMP(llx_product.tms), moteur SQL),
+        // la modification du produit se lit sur la MÊME horloge que last_content_sync_unix.
+        if (property_exists($savedProduct, 'product_tms_unix') && $savedProduct->product_tms_unix !== null && $savedProduct->product_tms_unix !== '') {
+            $dolTimestamp = (int) $savedProduct->product_tms_unix;
+        }
+
+        // Hotfix 2.6.2 : la référence « dernier contenu synchronisé » est `last_content_sync`, PAS `tms`.
+        // Le mapping lu ici l'a été APRÈS le verrou 'pending' de syncProduct() ; or tms est en
+        // `ON UPDATE CURRENT_TIMESTAMP` sur toute base migrée : ce verrou l'avait déjà ramené à NOW()
+        // (écart de 0 s constaté 70 fois sur 70 dans le journal de production du 10/10/2026), si bien
+        // que `date_modification > tms`, `MAX(tms enfants) > tms` et la règle des 24 h étaient
+        // toujours fausses. Colonne absente de l'objet (mapping lu avant la migration, ou stub de
+        // test ancien) : repli sur tms, comportement historique. Colonne présente mais NULL : aucune
+        // synchro de contenu n'a jamais été enregistrée (ligne backfillée « modifiée depuis », ou
+        // jamais synchronisée en contenu) → le produit DOIT être resynchronisé ; sans cela, une ligne
+        // sélectionnée par le cron comme « modifiée » ne le serait jamais pour de bon (le verrou a déjà
+        // effacé son statut 'success') et resterait en tête de file indéfiniment.
+        // R8 : epoch lu PAR LE MOTEUR (`last_content_sync_unix`) de préférence à strtotime() PHP, qui
+        // interprète la chaîne dans le fuseau de PHP, pas celui de la session SQL qui a écrit la valeur.
+        $contentNeverSynced = false;
+        if (property_exists($savedProduct, 'last_content_sync_unix')) {
+            if ($savedProduct->last_content_sync_unix === null || $savedProduct->last_content_sync_unix === '') {
+                $contentNeverSynced = true;
+                $shopifyTimestamp = 0;
+            } else {
+                $shopifyTimestamp = (int) $savedProduct->last_content_sync_unix;
+            }
+        } elseif (property_exists($savedProduct, 'last_content_sync')) {
+            if ($savedProduct->last_content_sync === null || $savedProduct->last_content_sync === '') {
+                $contentNeverSynced = true;
+                $shopifyTimestamp = 0;
+            } else {
+                $shopifyTimestamp = strtotime($savedProduct->last_content_sync);
+            }
+        } else {
+            $shopifyTimestamp = strtotime($savedProduct->tms);
+        }
 
         // Get current timestamp
         $currentTimestamp = time();
@@ -2288,24 +3773,18 @@ class ImportProducts extends CommonObject
             return true;  // Force la synchronisation en mode manuel
         }
 
-        // FIX v2.4.1 (hotfix prod) : une déclinaison (enfant) modifiée après le dernier tms
+        if ($contentNeverSynced) {
+            $this->log("Automatic sync mode: no content sync recorded (last_content_sync NULL) for product " . $dolProduct->id . " — content sync required", LOG_DEBUG);
+            return true;
+        }
+
+        // FIX v2.4.1 (hotfix prod) : une déclinaison (enfant) modifiée après la dernière synchro de contenu
         // — désactivation tosell=0, renommage, prix — est un changement de CONTENU du produit
         // parent qui doit déclencher une resync complète. Seule une resync de contenu (productSet)
         // retire les variantes tosell=0 côté Shopify (cf. l.1979-1985). Sans ce check, on ne
         // comparait QUE la date de modification du parent : une déclinaison désactivée seule
         // (parent inchangé) n'était donc jamais retirée de Shopify.
-        $sqlMaxChildModif = "SELECT MAX(p.tms) as max_child_tms
-                FROM " . MAIN_DB_PREFIX . "product p
-                INNER JOIN " . MAIN_DB_PREFIX . "product_attribute_combination pac ON p.rowid = pac.fk_product_child
-                WHERE pac.fk_product_parent = ?";
-        $resultMaxChild = SqlUtils::executeQuery($this->db, $sqlMaxChildModif, "checking max child modification date for product " . $dolProduct->id, true, [(int)$dolProduct->id]);
-        $maxChildTimestamp = 0;
-        if ($resultMaxChild && $this->db->num_rows($resultMaxChild) > 0) {
-            $rowMaxChild = $this->db->fetch_object($resultMaxChild);
-            if (!empty($rowMaxChild->max_child_tms)) {
-                $maxChildTimestamp = strtotime($rowMaxChild->max_child_tms);
-            }
-        }
+        $maxChildTimestamp = $this->readMaxChildTimestamp($dolProduct->id);
         $childNeedsUpdate = $maxChildTimestamp > $shopifyTimestamp;
 
         // Check if last Shopify update was more than 24 hours ago (automatic mode only)
@@ -2325,18 +3804,21 @@ class ImportProducts extends CommonObject
      */
     private function isSyncLocked($productId)
     {
-        $sql = "SELECT sync_lock FROM " . MAIN_DB_PREFIX . $this->table_element . "
+        // BH-M3 (lot 4) : l'âge du verrou est calculé PAR LE MOTEUR (même horloge et même fuseau que celui qui a écrit
+        // `sync_lock = NOW()`), jamais par strtotime()/time() en PHP : un fuseau PHP différent de celui de la session SQL
+        // décalerait l'âge de plusieurs heures (verrou vivant jugé expiré -> synchro concurrente ; ou l'inverse).
+        $sql = "SELECT sync_lock, (UNIX_TIMESTAMP() - UNIX_TIMESTAMP(sync_lock)) AS sync_lock_age_seconds FROM " . MAIN_DB_PREFIX . $this->table_element . "
                 WHERE fk_product = ? AND entity = " . (int)$this->entity;
         $result = SqlUtils::executeQuery($this->db, $sql, "checking sync lock", true, [(int)$productId]);
 
         if ($result && $this->db->num_rows($result) > 0) {
             $obj = $this->db->fetch_object($result);
             if ($obj->sync_lock) {
-                $lockTime = strtotime($obj->sync_lock);
-                $currentTime = time();
-                $lockExpireTime = 5 * 60; // 5 minutes lock
+                $lockExpireTime = self::STALE_LOCK_MINUTES * 60; // 5 minutes lock
+                $lockAgeSeconds = (isset($obj->sync_lock_age_seconds) && $obj->sync_lock_age_seconds !== null && $obj->sync_lock_age_seconds !== '')
+                    ? (int) $obj->sync_lock_age_seconds : $lockExpireTime; // âge illisible : traité comme expiré (comportement antérieur : jamais de verrou éternel)
 
-                if (($currentTime - $lockTime) < $lockExpireTime) {
+                if ($lockAgeSeconds < $lockExpireTime) {
                     $this->log("Product " . $productId . " is locked for sync (locked at: " . $obj->sync_lock . ")", LOG_WARNING);
                     return true;
                 }
@@ -2361,16 +3843,31 @@ class ImportProducts extends CommonObject
      * @param string|null $errorMessage Error message (only for 'failed' status)
      * @param bool $releaseLock Whether to release the sync lock
      * @param bool $isParentWithVariants Whether this is a parent product with variants (triggers cascade update)
-     * @param bool $contentSynced FIX v2.4.1 (hotfix) : true = ce succès provient d'une synchro de CONTENU
-     *             réelle (productSet exécuté) → tms (référence "dernier contenu synchronisé" utilisée par
-     *             checkProductNeedsUpdate() et le garde-fou 24h) est rafraîchi. false = succès stock-only
-     *             (cycle stock 15min) → tms N'EST PAS touché (last_stock_sync l'est, séparément).
-     *             Sans cette distinction, le cycle stock (toutes les 15min) écrasait tms en continu,
-     *             rendant le contenu Shopify jamais réévalué (garde-fou 24h neutralisé de facto).
+     * @param bool $contentSynced true = ce succès provient d'une synchro de CONTENU réelle (productSet
+     *             exécuté) → `last_content_sync` (référence « dernier contenu synchronisé », lue par
+     *             checkProductNeedsUpdate(), la règle des 24 h et les requêtes de sélection du cron) est
+     *             rafraîchie, ainsi que tms. false = succès stock-only → ni l'une ni l'autre.
+     *             ⚠️ Hotfix 2.6.2 : `tms` N'EST PAS une référence fiable. Sur toute base migrée c'est un
+     *             `TIMESTAMP ... ON UPDATE CURRENT_TIMESTAMP` (update_2.1.5_2.1.6.sql) : n'importe quel
+     *             UPDATE de la ligne — dont le verrou 'pending' posé par syncProduct() AVANT la décision —
+     *             le ramène à NOW(). Le commentaire d'origine (FIX v2.4.1), qui affirmait que `$contentSynced
+     *             = false` protégeait tms, était FAUX : seule `last_content_sync` (sans ON UPDATE) est stable.
+     * @param bool $keepFailureState true = rétablissement du statut `failed` après une passe « stock seul » d'une
+     *             ligne dont le CONTENU est en attente avant retentative (S5) : ni last_failed_at, ni failed_streak,
+     *             ni le message d'erreur ne sont touchés (le verrou 'pending' n'a changé que le statut).
+     *             Hotfix 2.6.2 (S12) — état d'échec : écrit (last_failed_at = NOW(), failed_streak + 1) à CHAQUE
+     *             passage en `failed` hors rétablissement ; remis à NULL / 0 UNIQUEMENT par un succès de CONTENU
+     *             (`success` avec $contentSynced = true) : un succès « stock seul » ne répare pas un échec de contenu
+     *             et le laisse en place, sinon le délai de retentative serait annulé par le premier envoi de stock.
+     *             Statut `skipped` (S6) : last_stock_sync = NOW() est estampillé pour que la ligne quitte la tête
+     *             de la rotation du stock (une ligne ignorée mais jamais estampillée y resterait indéfiniment).
+     *             BH-M2 : le rétablissement `failed` ($keepFailureState) l'estampille aussi.
+     * @param bool $stampStockSync false = un envoi de stock a été TENTÉ (et a échoué) : ni `skipped` ni le
+     *             rétablissement `failed` n'estampillent alors last_stock_sync (ECH-3). Défaut true.
      * @return bool Success/failure
      */
     private function manageProductMapping($dolibarrId, $shopifyId = null, $shopifyVariantId = null,
-                                        $dolibarrParentId = null, $status = null, $errorMessage = null, $releaseLock = false, $isParentWithVariants = false, $contentSynced = true)
+                                        $dolibarrParentId = null, $status = null, $errorMessage = null, $releaseLock = false, $isParentWithVariants = false, $contentSynced = true, $keepFailureState = false, $stampStockSync = true)
     {
         try {
             $updateClauses = [];
@@ -2425,12 +3922,37 @@ class ImportProducts extends CommonObject
 
                 // CRITICAL: Only update tms on 'success' status AND when it's a real content sync
                 // (FIX v2.4.1 hotfix : un succès stock-only ne doit PAS rafraîchir tms)
+                // Hotfix 2.6.2 : last_content_sync (SANS ON UPDATE) est la vraie référence « dernier
+                // contenu synchronisé » — écrite sous exactement la même condition, et uniquement ici
+                // (jamais par le verrou 'pending', le stock seul, skipped, failed).
                 if ($status === 'success' && $contentSynced) {
                     $updateClauses[] = "tms = NOW()";
+                    // R7 : instant de DÉBUT de synchro (contentSyncStampSql()), pas NOW() de fin.
+                    $updateClauses[] = "last_content_sync = " . $this->contentSyncStampSql();
+                }
+
+                // R4/S5/S12 : état d'échec du CONTENU. Écrit à chaque passage en `failed` (horodatage + compteur
+                // d'échecs consécutifs, qui pilote le délai croissant avant retentative), remis à zéro UNIQUEMENT
+                // par un succès de CONTENU. Un succès stock seul le laisse en place ; un rétablissement de statut
+                // ($keepFailureState) n'y touche pas.
+                if ($status === 'failed' && !$keepFailureState) {
+                    $updateClauses[] = "last_failed_at = NOW()";
+                    $updateClauses[] = "failed_streak = failed_streak + 1";
+                } elseif ($status === 'success' && $contentSynced) {
+                    $updateClauses[] = "last_failed_at = NULL";
+                    $updateClauses[] = "failed_streak = 0";
+                }
+
+                // S6 : une sortie `skipped` estampille last_stock_sync (sortie de la tête de la rotation du stock).
+                // BH-M2 : idem pour le rétablissement `failed` ($keepFailureState) d'une retentative de contenu bloquée.
+                // ECH-3 : SEULEMENT si aucun envoi de stock n'a été tenté ($stampStockSync = false sinon) : un envoi tenté
+                // puis échoué n'est pas « traité », il doit rester dû à la cadence normale.
+                if ($stampStockSync && ($status === 'skipped' || ($status === 'failed' && $keepFailureState))) {
+                    $updateClauses[] = "last_stock_sync = NOW()";
                 }
 
                 // Handle error message
-                if ($status === 'failed' && $errorMessage !== null) {
+                if ($status === 'failed' && $errorMessage !== null && !$keepFailureState) {
                     $updateClauses[] = "last_sync_error = ?";
                     $params[] = $errorMessage;
                 } elseif ($status === 'success') {
@@ -2552,10 +4074,17 @@ class ImportProducts extends CommonObject
                     // For INSERT, always use default tms (CURRENT_TIMESTAMP) unless status is 'success'
                     // Story 47-3 : inclure fk_store dans l'INSERT
                     // FIX v2.4.1 : idem UPDATE, tms=NOW() explicite réservé au succès de contenu
+                    // Hotfix 2.6.2 : idem pour last_content_sync (écrite avec tms, sous la même condition).
                     if ($status === 'success' && $contentSynced) {
                         $insertSql = "INSERT INTO " . MAIN_DB_PREFIX . $this->table_element .
-                                   " (fk_product, entity, fk_store, shopifyProductId, shopifyVariantId, fk_product_parent, last_sync_status, tms) " .
-                                   "VALUES (?, ?, ?, ?, ?, ?, ?, NOW())";
+                                   " (fk_product, entity, fk_store, shopifyProductId, shopifyVariantId, fk_product_parent, last_sync_status, tms, last_content_sync) " .
+                                   "VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), " . $this->contentSyncStampSql() . ")";
+                    } elseif ($status === 'failed' && !$keepFailureState) {
+                        // S12 : une ligne CRÉÉE directement en échec porte aussi l'état d'échec (premier échec),
+                        // sinon le délai de retentative ne s'appliquerait pas à elle.
+                        $insertSql = "INSERT INTO " . MAIN_DB_PREFIX . $this->table_element .
+                                   " (fk_product, entity, fk_store, shopifyProductId, shopifyVariantId, fk_product_parent, last_sync_status, last_failed_at, failed_streak) " .
+                                   "VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), 1)";
                     } else {
                         // Let tms use the default CURRENT_TIMESTAMP from table definition
                         $insertSql = "INSERT INTO " . MAIN_DB_PREFIX . $this->table_element .
@@ -2636,10 +4165,20 @@ class ImportProducts extends CommonObject
                     // Only update TMS on 'success' status (FIX v2.4.1 : idem parent, pas en stock-only)
                     if ($status === 'success' && $contentSynced) {
                         $variantUpdateClauses[] = "tms = NOW()";
+                        $variantUpdateClauses[] = "last_content_sync = " . $this->contentSyncStampSql();
+                    }
+
+                    // R4/S5/S12 : idem parent.
+                    if ($status === 'failed' && !$keepFailureState) {
+                        $variantUpdateClauses[] = "last_failed_at = NOW()";
+                        $variantUpdateClauses[] = "failed_streak = failed_streak + 1";
+                    } elseif ($status === 'success' && $contentSynced) {
+                        $variantUpdateClauses[] = "last_failed_at = NULL";
+                        $variantUpdateClauses[] = "failed_streak = 0";
                     }
 
                     // Handle error message
-                    if ($status === 'failed' && $errorMessage !== null) {
+                    if ($status === 'failed' && $errorMessage !== null && !$keepFailureState) {
                         $variantUpdateClauses[] = "last_sync_error = ?";
                         $variantParams[] = $errorMessage;
                     } elseif ($status === 'success') {
@@ -2805,6 +4344,53 @@ class ImportProducts extends CommonObject
     }
 
     /**
+     * Texte d'un refus local, traduit (5 langues, clés `doli2shop.lang`) avec repli français si la traduction
+     * est indisponible (CRON sans $langs, clé absente). Les arguments sont des `%s` positionnels.
+     *
+     * @param string $key      Clé de langue
+     * @param string $fallback Repli (format sprintf)
+     * @param mixed  ...$args  Arguments
+     * @return string
+     * @since 2.6.2
+     */
+    private function localRefusalText($key, $fallback, ...$args)
+    {
+        global $langs;
+        if (is_object($langs) && method_exists($langs, 'transnoentitiesnoconv')) {
+            try {
+                if (method_exists($langs, 'load')) {
+                    $langs->load('doli2shop');
+                }
+                $translated = $langs->transnoentitiesnoconv($key, ...$args);
+                if (is_string($translated) && $translated !== '' && $translated !== $key && strpos($translated, $key) === false) {
+                    return $translated;
+                }
+            } catch (\Throwable $e) {
+                // repli
+            }
+        }
+        return vsprintf($fallback, $args);
+    }
+
+    /**
+     * Refus LOCAL d'un produit (hotfix 2.6.2) : consigné pour le rapport de synchronisation manuelle, journalisé
+     * en LOG_ERR, puis exception — syncProduct() la rattrape et passe par manageProductMapping(..., 'failed', message)
+     * (délai d'échec de la story famine : last_failed_at / failed_streak, sans consommer d'appel Shopify).
+     *
+     * @param object $dolProduct Produit Dolibarr
+     * @param string $message    Message nominatif
+     * @return void
+     * @throws Exception Toujours
+     * @since 2.6.2
+     */
+    private function refuseProductLocally($dolProduct, $message)
+    {
+        $this->productRefusals[(string) $dolProduct->ref] = $message;
+        $this->log("prepareProductData - " . $message, LOG_ERR);
+        throw new Exception($message);
+    }
+
+    /**
     * Prepare product data for productSet mutation
     *
     * @param Product $dolProduct Dolibarr product object
@@ -2898,6 +4484,27 @@ class ImportProducts extends CommonObject
             $productOptions = [];
             $dolibarrOptions = $this->getProductOptions($dolProduct);
 
+            // Hotfix 2.6.2 (AC2) : contrôle LOCAL de la limite d'options AVANT tout appel productSet. La limite de
+            // la boutique (Shop.resourceLimits.maxProductOptions, cache 24 h par boutique, repli 3) n'est lue que
+            // si le produit dépasse déjà le plancher historique de 3 (aucun appel supplémentaire sinon). Refus =
+            // exception => statut `failed` + message nominatif via le chemin d'échec de syncProduct() (délai
+            // croissant de la story famine), jamais 3 tentatives sur une erreur non transitoire.
+            if (count($dolibarrOptions) > ShopifyApi::DEFAULT_MAX_PRODUCT_OPTIONS) {
+                $maxProductOptions = (int) $this->shopifyApi->getMaxProductOptions();
+                if (count($dolibarrOptions) > $maxProductOptions) {
+                    $optionDescriptions = [];
+                    foreach ($dolibarrOptions as $dolibarrOption) {
+                        $optionDescriptions[] = '« ' . $dolibarrOption['name'] . ' » (attribut' . (count($dolibarrOption['attributeIds']) > 1 ? 's' : '')
+                            . ' Dolibarr #' . implode(', #', $dolibarrOption['attributeIds']) . ')';
+                    }
+                    $this->refuseProductLocally($dolProduct, $this->localRefusalText(
+                        'ProductOptionsLimitRefusal',
+                        "Produit %s refusé avant envoi : %s options après fusion des attributs de même libellé, Shopify en accepte %s au maximum. Options : %s. Retirez ou regroupez un attribut dans Dolibarr.",
+                        $dolProduct->ref, count($dolibarrOptions), $maxProductOptions, implode(' ; ', $optionDescriptions)
+                    ));
+                }
+            }
+
             // If it's an update, retrieve existing option IDs
             $optionsIds = [];
             if ($shopifyProductId) {
@@ -2979,15 +4586,12 @@ class ImportProducts extends CommonObject
         if (!empty($variants)) {
             $this->log("Preparing data for " . count($variants) . " variants", LOG_DEBUG);
 
-            // Create a mapping of options for validation
-            $optionNameMap = [];
-            foreach ($input['productOptions'] as $option) {
-                $optionValues = [];
-                foreach ($option['values'] as $valueObj) {
-                    $optionValues[] = $valueObj['name'];
-                }
-                $optionNameMap[$option['name']] = $optionValues;
-            }
+            // Hotfix 2.6.2 (AC1) : les valeurs de chaque déclinaison sont résolues contre les options FUSIONNÉES par
+            // libellé (resolveVariantOptions()) — l'ancienne table `$optionNameMap[nom]`, écrasée par le dernier
+            // homonyme, faisait écarter les valeurs du premier (11 déclinaisons sur 13 perdues sur BASE_SLIM_E27_12).
+            $optionDefs = !empty($dolibarrOptions) ? $dolibarrOptions : $input['productOptions'];
+            $refusedVariants = [];
+            $combinationOwners = [];
 
             foreach ($variants as $variant) {
                 // Get the sell status from the appropriate property (status or tosell)
@@ -3031,26 +4635,19 @@ class ImportProducts extends CommonObject
                     $this->log("Option: " . ($option['optionName'] ?? 'N/A') . " = " . ($option['name'] ?? 'N/A'), LOG_DEBUG);
                 }
 
-                // Créer un tableau associatif des options de variante par nom d'option
+                // Rattache chaque valeur à l'option fusionnée de même libellé (règle partagée avec l'import)
+                $resolved = self::resolveVariantOptions($options, $optionDefs);
                 $variantOptionsByName = [];
-                foreach ($options as $option) {
-                    if (!empty($option['optionName']) && !empty($option['name'])) {
-                        // Check that the option and its value are valid according to the product options
-                        if (
-                            isset($optionNameMap[$option['optionName']]) &&
-                            in_array($option['name'], $optionNameMap[$option['optionName']])
-                        ) {
-                            $variantOptionsByName[$option['optionName']] = [
-                                'optionName' => $option['optionName'],
-                                'name' => $option['name']
-                            ];
-                        } else {
-                            $this->log("Warning: Option " . $option['optionName'] . " with value " . $option['name'] .
-                                " does not match defined product options for variant " . $variant->ref, LOG_WARNING);
-                            $this->log("Available values for " . $option['optionName'] . ": " .
-                                implode(', ', $optionNameMap[$option['optionName']] ?? []), LOG_DEBUG);
-                        }
-                    }
+                foreach ($resolved['byName'] as $optionName => $resolvedOption) {
+                    $variantOptionsByName[$optionName] = ['optionName' => $optionName, 'name' => $resolvedOption['name']];
+                }
+                foreach ($resolved['unmatched'] as $unmatchedOption) {
+                    $this->log("Warning: Option " . $unmatchedOption['optionName'] . " with value " . $unmatchedOption['name'] .
+                        " does not match defined product options for variant " . $variant->ref, LOG_WARNING);
+                }
+                foreach ($resolved['conflicts'] as $conflictOption => $conflict) {
+                    $this->log("Warning: variant " . $variant->ref . " porte une valeur pour plusieurs attributs homonymes « " . $conflictOption
+                        . " » : « " . $conflict['kept'] . " » retenue (attribut au plus petit rowid), « " . $conflict['ignored'] . " » ignorée", LOG_WARNING);
                 }
 
                 // Vérifier que la variante a une valeur pour chaque option du produit
@@ -3062,12 +4659,28 @@ class ImportProducts extends CommonObject
                     }
                 }
 
-                // Si des options sont manquantes, journaliser et sauter cette variante
+                // Hotfix 2.6.2 (AC3/AC5) : une déclinaison ACTIVE sans valeur pour toutes les options n'est plus écartée
+                // en silence — productSet étant déclaratif, une variante absente du payload est SUPPRIMÉE côté Shopify.
+                // Elle est consignée (ref + options manquantes) et le produit entier sera refusé après la boucle.
                 if (!empty($missingOptions)) {
                     $this->log("Warning: Variant " . $variant->ref . " is missing values for options: " .
-                        implode(', ', $missingOptions) . ". This variant will be skipped.", LOG_WARNING);
+                        implode(', ', $missingOptions) . ". Le produit sera refusé (aucun envoi partiel).", LOG_WARNING);
+                    $refusedVariants[] = $variant->ref . ' (options manquantes : ' . implode(', ', $missingOptions) . ')';
                     continue;
                 }
+
+                // Deux déclinaisons de même combinaison de valeurs (après fusion) : Shopify refuse les doublons.
+                $combinationKey = [];
+                foreach ($input['productOptions'] as $productOption) {
+                    $combinationKey[] = mb_strtolower((string) $variantOptionsByName[$productOption['name']]['name'], 'UTF-8');
+                }
+                $combinationKey = implode("\x1f", $combinationKey);
+                if (isset($combinationOwners[$combinationKey])) {
+                    $this->log("Warning: variants " . $combinationOwners[$combinationKey] . " et " . $variant->ref . " ont la même combinaison d'options après fusion", LOG_WARNING);
+                    $refusedVariants[] = $variant->ref . ' (même combinaison d\'options que ' . $combinationOwners[$combinationKey] . ')';
+                    continue;
+                }
+                $combinationOwners[$combinationKey] = $variant->ref;
 
                 // Si toutes les options sont présentes, ajouter les à variantOptions
                 foreach ($variantOptionsByName as $option) {
@@ -3077,6 +4690,7 @@ class ImportProducts extends CommonObject
                 // Skip to the next if no options found
                 if (empty($variantOptions)) {
                     $this->log("Warning: No valid options found for variant " . $variant->ref, LOG_WARNING);
+                    $refusedVariants[] = $variant->ref . ' (aucune option valide)';
                     continue;
                 }
 
@@ -3246,6 +4860,15 @@ class ImportProducts extends CommonObject
                 }
 
                 $variantsData[] = $variantData;
+            }
+
+            // Hotfix 2.6.2 (AC5) : aucune déclinaison active écartée = refus LOCAL du produit entier, jamais d'envoi partiel.
+            if (!empty($refusedVariants)) {
+                $this->refuseProductLocally($dolProduct, $this->localRefusalText(
+                    'ProductVariantsDroppedRefusal',
+                    "Produit %s refusé avant envoi : %s déclinaison(s) active(s) ne peuvent pas être envoyées (%s). Shopify supprimerait les déclinaisons absentes de l'envoi ; complétez ou corrigez ces déclinaisons dans Dolibarr.",
+                    $dolProduct->ref, count($refusedVariants), implode(' ; ', $refusedVariants)
+                ));
             }
         } else {
             // For a simple product, add a default option value
@@ -3452,6 +5075,19 @@ class ImportProducts extends CommonObject
             $filteredCount = count($variantsData) - count($validatedVariants);
             if ($filteredCount > 0) {
                 $this->log("WARNING: " . $filteredCount . " variants were filtered out due to validation errors", LOG_WARNING);
+                // Hotfix 2.6.2 (AC5) : même règle que ci-dessus — une variante filtrée serait supprimée côté Shopify.
+                $keptSkus = array_column($validatedVariants, 'sku');
+                $droppedSkus = [];
+                foreach ($variantsData as $candidateVariant) {
+                    if (!in_array($candidateVariant['sku'], $keptSkus, true)) {
+                        $droppedSkus[] = $candidateVariant['sku'];
+                    }
+                }
+                $this->refuseProductLocally($dolProduct, $this->localRefusalText(
+                    'ProductVariantsDroppedRefusal',
+                    "Produit %s refusé avant envoi : %s déclinaison(s) active(s) ne peuvent pas être envoyées (%s). Shopify supprimerait les déclinaisons absentes de l'envoi ; complétez ou corrigez ces déclinaisons dans Dolibarr.",
+                    $dolProduct->ref, $filteredCount, implode(', ', $droppedSkus) . ' : valeurs d\'option invalides'
+                ));
             }
         } else {
             $this->log("WARNING: No variants data generated!", LOG_WARNING);
@@ -4082,6 +5718,9 @@ class ImportProducts extends CommonObject
             "INVALID_ARGUMENT",
             "provided invalid value"
         ];
+        // Hotfix 2.6.2 : refus synthétiques (drapeau `refused`) cumulés sur toutes les tentatives
+        $refusedTotal = 0;
+        $lastAttemptRefused = 0;
 
         while ($retryCount < $maxRetries && !$successStatus && !$permanentError) {
             if ($retryCount > 0) {
@@ -4132,6 +5771,7 @@ class ImportProducts extends CommonObject
                         if (!empty($response->retryableQuantities)) {
                             $quantities = $response->retryableQuantities;
                             $lastFailedCount = count($quantities);
+                            $lastAttemptRefused = 0;
                             $skusInBatch = array_values(array_filter(array_map(static function ($qty) {
                                 return $qty['sku'] ?? null;
                             }, $quantities)));
@@ -4163,8 +5803,20 @@ class ImportProducts extends CommonObject
                         . "): " . $errorDetails, LOG_ERR);
                     $lastErrorMessage = $errorDetails;
 
+                    // Hotfix 2.6.2 : les refus synthétiques (ligne sans référence de stock) sont définitifs
+                    // pour LEUR ligne seulement ; ils ne rendent pas le lot permanent s'il reste des
+                    // erreurs Shopify d'un autre sous-lot (potentiellement transitoires).
+                    $refusedErrors = array_filter($userErrors, static function ($err) {
+                        return is_object($err) && !empty($err->refused);
+                    });
+                    $otherErrors = array_values(array_filter($userErrors, static function ($err) {
+                        return !(is_object($err) && !empty($err->refused));
+                    }));
+                    $lastAttemptRefused = count($refusedErrors);
+                    $refusedTotal += $lastAttemptRefused;
+
                     // Check if this is a permanent user error
-                    if ($this->isPermanentError($userErrors, $permanentErrorPatterns)) {
+                    if (empty($otherErrors) || $this->isPermanentError($otherErrors, $permanentErrorPatterns)) {
                         $this->log("Detected permanent user error - stopping inventory retry attempts", LOG_ERR);
                         $permanentError = true;
                     } else {
@@ -4189,6 +5841,7 @@ class ImportProducts extends CommonObject
                     // Success - but let's log what exactly was successful
                     $successStatus = true;
                     $lastFailedCount = 0;
+                    $lastAttemptRefused = 0;
 
                     // v2.0.36: Log detailed success information
                     // FIX v2.4.1 : la réponse agrégée peut contenir les 2 chemins (delta ET
@@ -4257,6 +5910,9 @@ class ImportProducts extends CommonObject
             // incrémenté une seule fois (pas à chaque tentative de retry) avec le compte de la
             // dernière tentative connue
             $failedItemsThisBatch = $lastFailedCount > 0 ? $lastFailedCount : count($quantities);
+            // Refus déjà inclus dans le compte de la dernière tentative : on les retire puis on
+            // ajoute le cumul de toutes les tentatives (un refus n'est jamais rejoué).
+            $failedItemsThisBatch = max($failedItemsThisBatch - $lastAttemptRefused, 0) + $refusedTotal;
             $this->stockSyncFailedCount += $failedItemsThisBatch;
 
             if ($permanentError) {
@@ -4271,16 +5927,28 @@ class ImportProducts extends CommonObject
             return false;
         }
 
+        if ($refusedTotal > 0) {
+            // Le retry des autres sous-lots a réussi, mais des lignes ont été refusées : jamais un succès.
+            $this->stockSyncFailedCount += $refusedTotal;
+            $this->log("Inventory update partial: " . $refusedTotal . " item(s) refused (référence de stock inconnue)", LOG_ERR);
+            return false;
+        }
+
         return true;
     }
 
     /**
      * Get product options from Dolibarr
      *
+     * Hotfix 2.6.2 : les attributs de MÊME libellé (règle partagée avec l'import, cf.
+     * ShopifyProductImporter::optionLabelKey()) sont fusionnés en UNE option (valeurs unies) — Shopify
+     * refuse les options homonymes et en limite le nombre (3). Chaque option porte `attributeIds`
+     * (rowid Dolibarr fusionnés, croissants) et `labels` (libellés d'origine distincts).
+     *
      * @param object $dolProduct Dolibarr product
      * @return array Array of product options
      */
-    private function getProductOptions($dolProduct)
+    protected function getProductOptions($dolProduct)
     {
         // On travaille uniquement avec des objets Product
         $productId = $dolProduct->id;
@@ -4293,11 +5961,11 @@ class ImportProducts extends CommonObject
                 INNER JOIN " . MAIN_DB_PREFIX . "product_attribute_combination2val pac2v ON pac2v.fk_prod_attr_val = pav.rowid
                 INNER JOIN " . MAIN_DB_PREFIX . "product_attribute_combination pac ON pac2v.fk_prod_combination = pac.rowid
                 WHERE pac.fk_product_parent = ?
-                ORDER BY pa.label";
+                ORDER BY pa.label, pa.rowid";
 
         $result = SqlUtils::executeQuery($this->db, $sql, "getting product options", true, [(int)$productId]);
 
-        $options = [];
+        $attributes = [];
         while ($obj = $this->db->fetch_object($result)) {
             // Get all possible values for this attribute
             $sql_values = "SELECT DISTINCT pav.value
@@ -4323,15 +5991,41 @@ class ImportProducts extends CommonObject
             }
 
             if (!empty($values)) {
-                $options[] = [
-                    'name' =>  $obj->label,
-                    'values' =>  $values
+                $attributes[] = [
+                    'rowid' => (int) $obj->rowid,
+                    'label' => $obj->label,
+                    'values' => $values,
                 ];
             }
         }
 
         if ($result) {
             $this->db->free($result);
+        }
+
+        // Jeux d'attributs portés par chaque déclinaison : deux attributs homonymes portés ENSEMBLE par une même
+        // déclinaison ne sont pas fusionnés (le produit sain garde ses deux options distinctes).
+        $sqlCombinations = "SELECT pac.rowid AS combination_id, pav.fk_product_attribute AS attribute_id
+                FROM " . MAIN_DB_PREFIX . "product_attribute_combination pac
+                INNER JOIN " . MAIN_DB_PREFIX . "product_attribute_combination2val pac2v ON pac2v.fk_prod_combination = pac.rowid
+                INNER JOIN " . MAIN_DB_PREFIX . "product_attribute_value pav ON pav.rowid = pac2v.fk_prod_attr_val
+                WHERE pac.fk_product_parent = ?";
+        $resultCombinations = SqlUtils::executeQuery($this->db, $sqlCombinations, "getting variant attribute sets", true, [(int)$productId]);
+        $variantAttributeSets = [];
+        while ($combination = $this->db->fetch_object($resultCombinations)) {
+            $variantAttributeSets[(int) $combination->combination_id][] = (int) $combination->attribute_id;
+        }
+        if ($resultCombinations) {
+            $this->db->free($resultCombinations);
+        }
+
+        $options = self::mergeOptionsByLabel($attributes, array_values($variantAttributeSets));
+        foreach ($options as $mergedOption) {
+            if (count($mergedOption['attributeIds']) > 1) {
+                $this->log("getProductOptions - produit " . $dolProduct->ref . " : attributs Dolibarr #" . implode(', #', $mergedOption['attributeIds'])
+                    . " de même libellé fusionnés en une seule option Shopify « " . $mergedOption['name'] . " » ("
+                    . count($mergedOption['values']) . " valeurs)", LOG_WARNING);
+            }
         }
 
         // If no options found but we have variants, create a default option
@@ -4343,7 +6037,9 @@ class ImportProducts extends CommonObject
                 $this->log("No options found but product has variants . Creating default option .", LOG_WARNING);
                 $options[] = [
                     'name' =>  'Variant',
-                    'values' =>  ['Default']
+                    'values' =>  ['Default'],
+                    'attributeIds' => [],
+                    'labels' => ['Variant'],
                 ];
             }
             if ($result) {
@@ -4353,6 +6049,135 @@ class ImportProducts extends CommonObject
 
         $this->log("Product options: " . print_r($options, true), LOG_DEBUG);
         return $options;
+    }
+
+    /**
+     * Fusion PURE des attributs Dolibarr de même libellé en options Shopify (hotfix 2.6.2, AC1).
+     *
+     * Entrée : liste d'attributs `['rowid' => int, 'label' => string, 'values' => string[]]`, DANS L'ORDRE
+     * (libellé, rowid) de la requête. Sortie : une option par clé de libellé (ShopifyProductImporter::
+     * optionLabelKey()), dans l'ordre de première apparition ; nom = libellé du premier membre ; valeurs unies
+     * (ordre de première apparition, dédoublonnées à l'identique) ; `attributeIds` croissants ; `labels` =
+     * libellés d'origine distincts. Aucun effet de bord.
+     *
+     * Deux attributs homonymes ne sont fusionnés que si AUCUNE déclinaison ne porte les deux
+     * (`$variantAttributeSets`, une liste de rowid d'attributs par déclinaison) : sinon ils restent deux options
+     * distinctes, comme avant le hotfix. Sans `$variantAttributeSets` (null), la fusion est inconditionnelle.
+     *
+     * @param array      $attributes           Attributs
+     * @param array|null $variantAttributeSets Rowid d'attributs portés par chaque déclinaison
+     * @return array<int,array{name:string,values:array,attributeIds:array,labels:array}>
+     * @since 2.6.2
+     */
+    public static function mergeOptionsByLabel(array $attributes, ?array $variantAttributeSets = null)
+    {
+        $groups = [];
+        foreach ($attributes as $attribute) {
+            $label = (string) $attribute['label'];
+            $attributeId = (int) $attribute['rowid'];
+            $key = ShopifyProductImporter::optionLabelKey($label);
+
+            // Premier groupe de même clé dont aucun membre n'est porté avec cet attribut par une même déclinaison.
+            $target = null;
+            foreach ($groups as $index => $group) {
+                if ($group['key'] !== $key) {
+                    continue;
+                }
+                $together = false;
+                foreach ((array) $variantAttributeSets as $variantAttributes) {
+                    $variantAttributes = array_map('intval', (array) $variantAttributes);
+                    if (in_array($attributeId, $variantAttributes, true) && array_intersect($group['attributeIds'], $variantAttributes)) {
+                        $together = true;
+                        break;
+                    }
+                }
+                if (!$together) {
+                    $target = $index;
+                    break;
+                }
+            }
+            if ($target === null) {
+                $groups[] = ['key' => $key, 'name' => $label, 'values' => [], 'attributeIds' => [], 'labels' => []];
+                $target = count($groups) - 1;
+            }
+
+            foreach ((array) $attribute['values'] as $value) {
+                if (!in_array($value, $groups[$target]['values'], true)) {
+                    $groups[$target]['values'][] = $value;
+                }
+            }
+            $groups[$target]['attributeIds'][] = $attributeId;
+            if (!in_array($label, $groups[$target]['labels'], true)) {
+                $groups[$target]['labels'][] = $label;
+            }
+        }
+        foreach ($groups as &$group) {
+            sort($group['attributeIds']);
+            unset($group['key']);
+        }
+        unset($group);
+        return array_values($groups);
+    }
+
+    /**
+     * Résolution PURE des valeurs d'une déclinaison contre les options (fusionnées) du produit (hotfix 2.6.2,
+     * AC1) : chaque valeur brute (`optionName` = libellé d'attribut, `name` = valeur, `attributeId` facultatif)
+     * est rattachée à l'option de même clé de libellé ; une valeur absente des valeurs de l'option est
+     * « non appariée ». Si une déclinaison porte une valeur pour DEUX attributs homonymes, celle de
+     * l'attribut au plus petit rowid est retenue (`conflicts` en garde la trace).
+     *
+     * @param array $rawOptions     Options brutes de la déclinaison
+     * @param array $productOptions Sortie de getProductOptions()
+     * @return array{byName:array,unmatched:array,conflicts:array}
+     * @since 2.6.2
+     */
+    public static function resolveVariantOptions(array $rawOptions, array $productOptions)
+    {
+        $nameByKey = [];
+        $nameByAttributeId = [];
+        $valuesByName = [];
+        foreach ($productOptions as $productOption) {
+            foreach ((array) ($productOption['attributeIds'] ?? []) as $optionAttributeId) {
+                $nameByAttributeId[(int) $optionAttributeId] = $productOption['name'];
+            }
+            $valuesByName[$productOption['name']] = array_map(function ($value) {
+                return is_array($value) ? ($value['name'] ?? '') : $value;
+            }, (array) $productOption['values']);
+            $nameByKey[ShopifyProductImporter::optionLabelKey($productOption['name'])] = $productOption['name'];
+            foreach ((array) ($productOption['labels'] ?? []) as $label) {
+                $nameByKey[ShopifyProductImporter::optionLabelKey($label)] = $productOption['name'];
+            }
+        }
+
+        $byName = [];
+        $unmatched = [];
+        $conflicts = [];
+        foreach ($rawOptions as $raw) {
+            // « 0 » est une valeur valide : on écarte seulement l'absence (null) et la chaîne vide.
+            if (!isset($raw['optionName'], $raw['name']) || (string) $raw['optionName'] === '' || (string) $raw['name'] === '') {
+                continue;
+            }
+            $attributeId = isset($raw['attributeId']) ? (int) $raw['attributeId'] : 0;
+            $key = ShopifyProductImporter::optionLabelKey($raw['optionName']);
+            // L'identifiant d'attribut prime (deux options homonymes non fusionnées gardent chacune leurs valeurs).
+            $canonical = ($attributeId > 0 && isset($nameByAttributeId[$attributeId])) ? $nameByAttributeId[$attributeId] : ($nameByKey[$key] ?? null);
+            if ($canonical === null || !in_array((string) $raw['name'], array_map('strval', $valuesByName[$canonical]), true)) {
+                $unmatched[] = ['optionName' => $raw['optionName'], 'name' => $raw['name']];
+                continue;
+            }
+            if (isset($byName[$canonical])) {
+                $kept = $byName[$canonical];
+                if ($attributeId > 0 && ($kept['attributeId'] === 0 || $attributeId < $kept['attributeId'])) {
+                    $conflicts[$canonical] = ['kept' => $raw['name'], 'ignored' => $kept['name']];
+                    $byName[$canonical] = ['optionName' => $canonical, 'name' => $raw['name'], 'attributeId' => $attributeId];
+                } else {
+                    $conflicts[$canonical] = ['kept' => $kept['name'], 'ignored' => $raw['name']];
+                }
+                continue;
+            }
+            $byName[$canonical] = ['optionName' => $canonical, 'name' => $raw['name'], 'attributeId' => $attributeId];
+        }
+        return ['byName' => $byName, 'unmatched' => $unmatched, 'conflicts' => $conflicts];
     }
 
     /**
@@ -4366,7 +6191,7 @@ class ImportProducts extends CommonObject
         $options = [];
 
         // Get the variant attributes from the combination table
-        $sql = "SELECT pa.ref as attribute_ref, pa.label as attribute_label,
+        $sql = "SELECT pa.rowid as attribute_id, pa.ref as attribute_ref, pa.label as attribute_label,
                 pav.ref as value_ref, pav.value
                 FROM " . MAIN_DB_PREFIX . "product_attribute_combination pac
                 LEFT JOIN " . MAIN_DB_PREFIX . "product_attribute_combination2val pac2v ON pac2v.fk_prod_combination = pac.rowid
@@ -4377,10 +6202,12 @@ class ImportProducts extends CommonObject
         $result = SqlUtils::executeQuery($this->db, $sql, "getting variant options", true, [(int)$dolProductVariant->id]);
 
         while ($option = $this->db->fetch_object($result)) {
-            if (!empty($option->attribute_label) && !empty($option->value)) {
+            // « 0 » est une valeur valide (empty('0') est vrai en PHP) : on écarte seulement NULL et la chaîne vide.
+            if ($option->attribute_label !== null && $option->attribute_label !== '' && $option->value !== null && $option->value !== '') {
                 $options[] = [
                     'name' =>  $option->value,
-                    'optionName' =>  $option->attribute_label
+                    'optionName' =>  $option->attribute_label,
+                    'attributeId' => isset($option->attribute_id) ? (int) $option->attribute_id : 0
                 ];
             }
         }
@@ -4596,7 +6423,7 @@ class ImportProducts extends CommonObject
                 }
 
                 // Validation spéciale pour tous les types d'options avec prise en compte des métachamps
-                if (!empty($optionValue['optionName']) && !empty($optionValue['name'])) {
+                if (!empty($optionValue['optionName']) && isset($optionValue['name']) && (string) $optionValue['name'] !== '') {
                     // Récupérer éventuellement l'ID Shopify du produit parent si disponible
                     $shopifyProductId = null;
                     if (!empty($variant['shopifyProductId'])) {
@@ -4741,7 +6568,7 @@ class ImportProducts extends CommonObject
 
         // Si pas de produit Shopify ou pas de métachamp associé, ne pas faire de validation stricte
         // Les options sans metafields peuvent avoir n'importe quelle valeur valide non vide
-        if (empty(trim($optionValue))) {
+        if (trim((string) $optionValue) === '') {
             $this->log("Warning: Empty value for option '{$optionName}'", LOG_WARNING);
             $result['status'] = false;
         } else {
@@ -5338,7 +7165,7 @@ class ImportProducts extends CommonObject
      *                                   (Story 57-7) — conservé pour rétro-compatibilité de signature
      * @param object|null $product Dolibarr product — requis pour la branche 'product' (Story 57-2)
      * @return array|null Image data with content, mime_type, size, filename
-     * @version     2.6.1
+     * @version     2.6.2
      * @since 2.0.33
      */
     protected function getImageContent($image, $modulepart = 'product', $originalFile = null, $product = null)
@@ -5588,7 +7415,7 @@ class ImportProducts extends CommonObject
      *                                  fournit l'entité à utiliser pour résoudre
      *                                  `multidir_output`, à la place de l'entité contextuelle
      * @return array|null Image data with content, mime_type, size, filename or null on failure
-     * @version     2.6.1
+     * @version     2.6.2
      * @since 2.1.6
      */
     private function getImageContentFromDisk($image, $modulepart = 'product', $originalFile = null, $product = null)
@@ -6086,7 +7913,8 @@ class ImportProducts extends CommonObject
      * @param bool $flag
      * @return void
      */
-    private function setImagePriorityRequeue($dolibarrProductId, $entity, bool $flag)
+    // Hotfix 2.6.2 : visibilité élargie (private -> protected) pour les tests (sous-classe qui substitue ce point d'appel).
+    protected function setImagePriorityRequeue($dolibarrProductId, $entity, bool $flag)
     {
         // Re-review 28/09/2026 (Round 5) : filtre fk_store CONDITIONNEL (invariant §14
         // CLAUDE.dolibarr.md, même idiome que clearOffsaleActionStatus() ci-dessus) — jamais de
@@ -6275,7 +8103,8 @@ class ImportProducts extends CommonObject
     * @param array $dolVariants Dolibarr variants (optional)
     * @return bool Success status
     */
-    private function syncProductAllImages($dolParentProduct, $dolVariants = [])
+    // Hotfix 2.6.2 : visibilité élargie (private -> protected) pour les tests (sous-classe qui substitue ce point d'appel).
+    protected function syncProductAllImages($dolParentProduct, $dolVariants = [])
     {
         // FIX #127 v2.0.36: Protection critique contre suppression accidentelle des images
         // Vérifier que la synchronisation des images est activée AVANT toute opération
@@ -7667,6 +9496,7 @@ class ImportProducts extends CommonObject
     public function importProductsManual($productIds = [])
     {
         $this->log("Starting manual product import using unified logic with transactions", LOG_INFO);
+        $this->productRefusals = [];
         // Task 2.5 : vider le cache d'images en début de cycle batch
         // (évite contamination inter-produits si la même instance est réutilisée)
         $this->clearImagesCache();
@@ -7848,6 +9678,9 @@ class ImportProducts extends CommonObject
      */
     private function updateVariantMapping($dolibarrProductId, $shopifyProductId, $shopifyVariantId)
     {
+        // last-content-sync-exempt (garde-fou test/unit/LastContentSyncWritersGuardTest.php) : méthode
+        // privée SANS appelant (code mort) — elle n'enregistre aucune synchro de contenu.
+
         $sql = "INSERT INTO " . MAIN_DB_PREFIX . $this->table_element;
         $sql .= " (fk_product, shopifyProductId, shopifyVariantId, entity, datec, tms)";
         $sql .= " VALUES (?, ?, ?, ?, NOW(), NOW())";
@@ -8389,7 +10222,8 @@ class ImportProducts extends CommonObject
      * @return bool Success status
      * @since 2.0.26
      */
-    private function collectProductForCollections($dolProduct, $shopifyProductId)
+    // Hotfix 2.6.2 : visibilité élargie (private -> protected) pour les tests (sous-classe qui substitue ce point d'appel).
+    protected function collectProductForCollections($dolProduct, $shopifyProductId)
     {
         // Story 53-5 (site 3c, 2/3) : gate collections export via SyncFlowPolicy (la dérivation
         // encapsule DÉJÀ le gate SYNC_PRODUCT_COLLECTIONS + le mapping direction)
@@ -8792,7 +10626,7 @@ class ImportProducts extends CommonObject
      *                  Shopify (renvoi force) ; true/null = inconnu ou presente (on se fie a la memoire)
      * @return bool Success status
      * @since 2.0.33
-     * @version     2.6.1
+     * @version     2.6.2
      */
     private function uploadCategoryImageToCollection($collectionId, $categoryId, $categoryLabel, $shopifyCollectionHasImage = null)
     {

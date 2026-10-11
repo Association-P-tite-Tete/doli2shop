@@ -13,7 +13,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       2.2.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -389,6 +389,27 @@ if ($action == 'sync_batch') {
 					$response['processed'] = count($productIds);
 					if (!empty($importProducts->error)) {
 						$response['errorDetails'][] = $importProducts->error;
+					}
+				}
+
+				// Hotfix 2.6.2 (produit-declinaisons-options-homonymes-refuse-par-shopify, AC3) : un produit refusé
+				// LOCALEMENT (options homonymes / limite d'options / déclinaison active écartée) n'était ni compté ni
+				// expliqué — il apparaissait « ignoré ». Le message nominatif (attributs, déclinaisons, options
+				// manquantes) rejoint le rapport, comme dans last_sync_error.
+				$productRefusals = is_array($importProducts->productRefusals) ? $importProducts->productRefusals : array();
+				if (!empty($productRefusals)) {
+					$refusedCount = count($productRefusals);
+					// $result < 0 : tout le lot est DÉJÀ compté en erreurs / traités ci-dessus — ne pas recompter les refus.
+					if ($result >= 0) {
+						$response['errors'] += $refusedCount;
+						if ($result == 0) {
+							$response['skipped'] = max(0, $response['skipped'] - $refusedCount);
+						} else {
+							$response['processed'] += $refusedCount;
+						}
+					}
+					foreach ($productRefusals as $refusalMessage) {
+						$response['errorDetails'][] = $refusalMessage;
 					}
 				}
 

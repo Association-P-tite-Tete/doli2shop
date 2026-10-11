@@ -297,7 +297,7 @@ OrderBankAccountHelp=Compte bancaire pour les paiements des commandes Shopify
 
 # Cron configuration
 MaxOrdersPerSyncHelp=Nombre de commandes récupérées par lot lors de la pagination. La synchronisation continue automatiquement avec les lots suivants. Valeur recommandée : 10-50.
-ProductsPerCronUpdateHelp=Nombre maximum de produits mis à jour lors d'une exécution de la tâche planifiée. Utile pour les catalogues volumineux.
+ProductsPerCronUpdateHelp=Nombre maximum de produits mis à jour lors d'une exécution de la tâche planifiée. Utile pour les catalogues volumineux. Les produits dont le prix a changé dans Dolibarr passent en premier ; le tiers de ce nombre (au plus) est réservé aux autres modifications de contenu (libellé, description, photos), les plus anciennes d'abord, et la moitié du reste (au plus) aux produits à déclinaisons, pour qu'ils ne soient pas bloqués par les produits simples.
 
 RequiredFields=Les champs marqués d'un astérisque (*) sont obligatoires
 
@@ -1778,6 +1778,7 @@ StockRecalageErrorDetail=Détail des erreurs
 VariantRepairTitle=Réparation des déclinaisons (imports existants)
 VariantRepairIntro=Rattache a posteriori les produits déjà importés comme fiches séparées à leur parent, via une vraie déclinaison Dolibarr — utile pour réparer un catalogue importé avant la version 2.4.4 (variantes invisibles dans l'UI Dolibarr).
 VariantRepairDisabledWarning=Le module Variants de Dolibarr n'est pas activé ; la réparation ne peut pas être lancée.
+VariantRepairBlockedFlow=L'outil est indisponible : Dolibarr fait foi pour les produits (la synchronisation de Shopify vers Dolibarr n'est pas autorisée pour cette boutique). Il recréerait des déclinaisons que vous avez supprimées volontairement dans Dolibarr.
 VariantRepairCountLabel=%s produit(s) à réparer
 VariantRepairLastRunLabel=Dernière réparation :
 VariantRepairLastRunSummary=%s — %s produit(s) réparé(s), %s erreur(s)
@@ -2274,3 +2275,6 @@ ShopifyOrderNoCustomerIdentity=La commande %s n'a aucune identité client (ni e-
 SyncReportCollectionsAutomaticSkipped=%s collection(s) gérée(s) par des conditions dans Shopify : le module n'y ajoute pas de produits — passez la collection en manuelle pour qu'il la remplisse
 SyncReportCollectionsAutomaticRefused=%s collection(s) refusée(s) par Shopify (message évoquant une collection automatique) : aucun produit n'a pu y être rattaché — ajoutez une condition ou passez la collection en manuelle dans Shopify
 SyncReportCollectionsDetailUnreadable=%s collection(s) ignorée(s) par prudence : Shopify refuse la lecture de leurs conditions, le module ne peut pas savoir si elles sont gérées par des conditions et n'y ajoute pas de produits
+Doli2ShopBackfillConflictsWarning=%s correspondance(s) de réglages en conflit lors du rattachement à la boutique par défaut : une même clé existait déjà, rattachée à la boutique, avec une valeur différente. La correspondance rattachée est conservée, l'autre est laissée telle quelle (détail dans le journal du module).
+ProductOptionsLimitRefusal=Produit %s refusé avant envoi : %s options après fusion des attributs de même libellé, Shopify en accepte %s au maximum. Options : %s. Retirez ou regroupez un attribut dans Dolibarr.
+ProductVariantsDroppedRefusal=Produit %s refusé avant envoi : %s déclinaison(s) active(s) ne peuvent pas être envoyées (%s). Shopify supprimerait les déclinaisons absentes de l'envoi ; complétez ou corrigez ces déclinaisons dans Dolibarr.

@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       2.0.23
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -257,6 +257,11 @@ class ShopifyIdRecovery
             }
             
             if (!$dryRun) {
+                // last-content-sync-exempt (garde-fou test/unit/LastContentSyncWritersGuardTest.php)
+                // Hotfix 2.6.2 : cet UPDATE de récupération d'identifiants Shopify écrit tms (ON UPDATE) mais
+                // N'ÉCRIT VOLONTAIREMENT PAS last_content_sync : il rétablit un lien shopifyProductId, il
+                // ne synchronise aucun contenu. Le laisser intact garde le produit « à renvoyer » si
+                // Dolibarr a changé depuis la dernière vraie synchro de contenu.
                 // Story 61-8 (AC1) : cet UPDATE utilisait des placeholders `?` avec un tableau passé
                 // en 2e argument de `DoliDB::query()`. Or ce 2e argument est `$usesavepoint` (un
                 // booléen) : les paramètres n'étaient JAMAIS liés, et MySQL rejetait la requête.

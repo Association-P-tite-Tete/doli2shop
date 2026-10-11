@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       2.1.6
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -1412,6 +1412,177 @@ class ShopifyProductImporter
     }
 
     /**
+     * Clé de comparaison « libellé normalisé » (hotfix 2.6.2) : minuscules, sans accents, et SEULS les
+     * lettres/chiffres Unicode (`\p{L}\p{N}`) sont conservés — espaces, `_`, `-`, parenthèses et toute
+     * ponctuation disparaissent. « Finition (Effet) », `FINITION_(EFFET)` et `FINITION-EFFET` donnent
+     * la même clé ; les écritures non latines (« 颜色 ») restent des clés valides (jamais effacées).
+     * Chaîne vide si rien n'est exploitable : l'appelant ne doit alors faire AUCUNE recherche floue.
+     *
+     * @param string $text Libellé ou ref
+     * @return string
+     */
+    public static function normalizeOptionKey($text)
+    {
+        $text = trim((string) $text);
+        if ($text === '') {
+            return '';
+        }
+        if (class_exists('Normalizer')) {
+            $decomposed = \Normalizer::normalize($text, \Normalizer::FORM_D);
+            if (is_string($decomposed)) {
+                // D4 : les marques combinantes ne sont retirées qu'APRÈS une lettre latine (accents) ; sur une
+                // écriture non latine (kana : « バ » = ハ + U+3099), elles distinguent des lettres et restent.
+                $text = preg_replace('/(?<=\p{Latin})\p{Mn}+/u', '', $decomposed);
+            }
+        } else {
+            $text = strtr($text, array(
+                'à' => 'a', 'â' => 'a', 'ä' => 'a', 'á' => 'a', 'ã' => 'a', 'å' => 'a', 'ç' => 'c',
+                'é' => 'e', 'è' => 'e', 'ê' => 'e', 'ë' => 'e', 'í' => 'i', 'ì' => 'i', 'î' => 'i', 'ï' => 'i',
+                'ñ' => 'n', 'ó' => 'o', 'ò' => 'o', 'ô' => 'o', 'ö' => 'o', 'õ' => 'o', 'ú' => 'u', 'ù' => 'u',
+                'û' => 'u', 'ü' => 'u', 'ý' => 'y', 'ÿ' => 'y',
+                'À' => 'A', 'Â' => 'A', 'Ä' => 'A', 'Á' => 'A', 'Ã' => 'A', 'Å' => 'A', 'Ç' => 'C',
+                'É' => 'E', 'È' => 'E', 'Ê' => 'E', 'Ë' => 'E', 'Í' => 'I', 'Ì' => 'I', 'Î' => 'I', 'Ï' => 'I',
+                'Ñ' => 'N', 'Ó' => 'O', 'Ò' => 'O', 'Ô' => 'O', 'Ö' => 'O', 'Õ' => 'O', 'Ú' => 'U', 'Ù' => 'U',
+                'Û' => 'U', 'Ü' => 'U', 'Ý' => 'Y',
+            ));
+        }
+        // D5 : mbstring peut manquer (comme intl) — repli strtolower (ASCII seul).
+        $text = function_exists('mb_strtolower') ? mb_strtolower((string) $text, 'UTF-8') : strtolower((string) $text);
+        $text = preg_replace('/[^\p{L}\p{N}\p{Mn}]+/u', '', $text);
+        return is_string($text) ? $text : '';
+    }
+
+    /**
+     * Le libellé contient-il un chiffre Unicode (`\p{N}`) ? (D3) Un rapprochement flou entre libellés
+     * numériques confondrait « 2,5 cm » et « 25 cm », « 1/2 » et « 12 » : ils ne se comparent qu'à
+     * l'identique (casse et espaces près).
+     *
+     * @param string $text Libellé ou ref
+     * @return bool
+     */
+    private static function containsDigit($text)
+    {
+        return preg_match('/\p{N}/u', (string) $text) === 1;
+    }
+
+    /**
+     * Libellé réduit à sa forme « exacte » (D3) : espaces superposés réunis, trim, casse ignorée.
+     *
+     * @param string $text Libellé ou ref
+     * @return string
+     */
+    private static function exactKey($text)
+    {
+        $text = trim((string) preg_replace('/\s+/u', ' ', (string) $text));
+        return function_exists('mb_strtolower') ? mb_strtolower($text, 'UTF-8') : strtolower($text);
+    }
+
+    /**
+     * Clé de regroupement « même libellé » partagée IMPORT / EXPORT (hotfix 2.6.2, story
+     * produit-declinaisons-options-homonymes-refuse-par-shopify) : mêmes primitives et même règle que
+     * findExistingByLabelOrRef() — un libellé contenant un chiffre ne se compare qu'à l'identique (casse et
+     * espaces près, jamais de rapprochement flou : « Taille 2,5 » ≠ « Taille 25 »), sinon clé normalisée
+     * (casse, accents latins, ponctuation) ; clé normalisée vide = comparaison exacte seulement. Deux libellés
+     * sont « homonymes » si et seulement si leurs clés sont égales.
+     *
+     * @param string $label Libellé d'attribut / d'option
+     * @return string Clé (préfixe `e:` exacte, `n:` normalisée)
+     * @since 2.6.2
+     */
+    public static function optionLabelKey($label)
+    {
+        $label = (string) $label;
+        if (self::containsDigit($label)) {
+            return 'e:' . self::exactKey($label);
+        }
+        $normalized = self::normalizeOptionKey($label);
+        return ($normalized === '') ? 'e:' . self::exactKey($label) : 'n:' . $normalized;
+    }
+
+    /**
+     * Retrouve une ligne attribut / valeur existante AVANT d'en créer une (hotfix 2.6.2, AC3) :
+     * 1) correspondance exacte du libellé, puis de la ref calculée ; 2) correspondance par clé
+     * normalisée (cf. normalizeOptionKey()) sur le libellé ET la ref ; 3) clé normalisée vide =
+     * AUCUNE recherche floue (deux libellés « tout symbole » n'en font pas un seul) ; 4) plusieurs
+     * candidats normalisés : pas de choix silencieux, LOG_WARNING, le plus petit rowid l'emporte
+     * (déterministe, c'est le plus ancien).
+     *
+     * @param string $table       Table complète (préfixe inclus)
+     * @param string $parentSql   Clause de portée parent SANS « WHERE » (ex. `fk_product_attribute = 5`), '' si aucune ;
+     *                            l'entité d'ÉCRITURE ($this->entity) est toujours ajoutée
+     * @param string $labelColumn Colonne libellé (`label` ou `value`)
+     * @param string $label       Libellé cherché (brut)
+     * @param string $ref         Ref calculée (déjà normalisée à l'ancienne)
+     * @param string $what        Libellé du type de ligne pour les journaux
+     * @return int rowid trouvé, 0 si aucun
+     * @since 2.6.2
+     */
+    private function findExistingByLabelOrRef($table, $parentSql, $labelColumn, $label, $ref, $what)
+    {
+        $label = trim((string) $label);
+        $parent = ($parentSql !== '') ? $parentSql . " AND " : "";
+        $entitySql = " AND entity = " . (int) $this->entity;
+
+        $queries = array();
+        if ($label !== '') {
+            $queries[] = "SELECT rowid FROM " . $table . " WHERE " . $parent . $labelColumn . " = '" . $this->db->escape($label) . "'" . $entitySql . " ORDER BY rowid ASC LIMIT 1";
+        }
+        $queries[] = "SELECT rowid FROM " . $table . " WHERE " . $parent . "ref = '" . $this->db->escape($ref) . "'" . $entitySql . " ORDER BY rowid ASC LIMIT 1";
+        foreach ($queries as $sql) {
+            $result = $this->db->query($sql);
+            if ($result && $this->db->num_rows($result) > 0) {
+                $obj = $this->db->fetch_object($result);
+                $this->db->free($result);
+                if ($obj && (int) $obj->rowid > 0) {
+                    return (int) $obj->rowid;
+                }
+            }
+        }
+
+        $wanted = self::normalizeOptionKey($label);
+        if ($wanted === '') {
+            return 0;
+        }
+
+        $numericLabel = self::containsDigit($label);
+        $sql = "SELECT rowid, ref, " . $labelColumn . " AS human_label FROM " . $table . " WHERE " . $parent . "entity = " . (int) $this->entity . " ORDER BY rowid ASC";
+        $result = $this->db->query($sql);
+        if (!$result) {
+            return 0;
+        }
+        $matches = array();
+        $count = (int) $this->db->num_rows($result);
+        for ($i = 0; $i < $count; $i++) {
+            $obj = $this->db->fetch_object($result);
+            if (!$obj) {
+                break;
+            }
+            if ($numericLabel || self::containsDigit($obj->human_label) || self::containsDigit($obj->ref)) {
+                // D3 : un chiffre d'un côté ou de l'autre = correspondance exacte seulement (casse/espaces près).
+                $exactWanted = self::exactKey($label);
+                if (self::exactKey($obj->human_label) === $exactWanted || self::exactKey($obj->ref) === $exactWanted) {
+                    $matches[] = (int) $obj->rowid;
+                }
+                continue;
+            }
+            if (self::normalizeOptionKey($obj->human_label) === $wanted || self::normalizeOptionKey($obj->ref) === $wanted) {
+                $matches[] = (int) $obj->rowid;
+            }
+        }
+        $this->db->free($result);
+
+        if (empty($matches)) {
+            return 0;
+        }
+        if (count($matches) > 1) {
+            $this->log("findExistingByLabelOrRef - " . $what . " '" . $label . "' : " . count($matches) . " candidats normalisés (rowid " . implode(', ', $matches) . "), retenu le plus ancien (#" . $matches[0] . ") — doublons à fusionner", LOG_WARNING);
+        } else {
+            $this->log("findExistingByLabelOrRef - " . $what . " '" . $label . "' retrouvé par libellé normalisé (#" . $matches[0] . ")", LOG_INFO);
+        }
+        return $matches[0];
+    }
+
+    /**
      * Get-or-create un ProductAttribute Dolibarr par nom (ref normalisée), filtré par entité.
      * Pas de fetchByRef natif côté core — recherche SQL directe.
      *
@@ -1430,16 +1601,21 @@ class ShopifyProductImporter
         // ($this->entity), pas sur getEntity('product') (= $conf->entity global). En
         // multi-entité, l'importer peut être construit avec $entity ≠ $conf->entity ; chercher
         // dans le mauvais scope créait des doublons attribut/valeur au ré-import.
-        $sql = "SELECT rowid FROM " . MAIN_DB_PREFIX . "product_attribute";
-        $sql .= " WHERE ref = '" . $this->db->escape($ref) . "'";
-        $sql .= " AND entity = " . (int) $this->entity;
-        $sql .= " LIMIT 1";
-
-        $result = $this->db->query($sql);
-        if ($result && $this->db->num_rows($result) > 0) {
-            $obj = $this->db->fetch_object($result);
-            return (int) $obj->rowid;
+        // Hotfix 2.6.2 : recherche exacte (libellé, puis ref), puis par libellé NORMALISÉ — sans
+        // cela « Finition (Effet) » (ref FINITION_(EFFET)) ne retrouvait pas l'attribut existant
+        // FINITION-EFFET et en créait un homonyme (4 options -> refus Shopify « max 3 options »).
+        $existingId = $this->findExistingByLabelOrRef(
+            MAIN_DB_PREFIX . "product_attribute",
+            "",
+            "label",
+            $name,
+            $ref,
+            "attribut"
+        );
+        if ($existingId > 0) {
+            return $existingId;
         }
+        $this->log("findOrCreateProductAttribute - création d'un NOUVEL attribut '" . $name . "' (ref " . $ref . ", entité " . (int) $this->entity . ") : aucun attribut existant ne correspond, même normalisé", LOG_WARNING);
 
         // Code review 3-couches (Blind Hunter) : ->ref DOIT utiliser la ref normalisée+repli
         // ($ref, déjà calculée ci-dessus pour le SELECT), PAS le nom brut. Sinon, si $name
@@ -1477,18 +1653,20 @@ class ShopifyProductImporter
         }
 
         // Code review 3-couches (Blind Hunter) : recherche alignée sur l'entité d'écriture,
-        // cf commentaire équivalent dans findOrCreateProductAttribute().
-        $sql = "SELECT rowid FROM " . MAIN_DB_PREFIX . "product_attribute_value";
-        $sql .= " WHERE fk_product_attribute = " . (int) $attributeId;
-        $sql .= " AND ref = '" . $this->db->escape($ref) . "'";
-        $sql .= " AND entity = " . (int) $this->entity;
-        $sql .= " LIMIT 1";
-
-        $result = $this->db->query($sql);
-        if ($result && $this->db->num_rows($result) > 0) {
-            $obj = $this->db->fetch_object($result);
-            return (int) $obj->rowid;
+        // cf commentaire équivalent dans findOrCreateProductAttribute(). Hotfix 2.6.2 : même
+        // recherche exacte puis normalisée, DANS l'attribut retenu.
+        $existingId = $this->findExistingByLabelOrRef(
+            MAIN_DB_PREFIX . "product_attribute_value",
+            "fk_product_attribute = " . (int) $attributeId,
+            "value",
+            $value,
+            $ref,
+            "valeur d'attribut #" . (int) $attributeId
+        );
+        if ($existingId > 0) {
+            return $existingId;
         }
+        $this->log("findOrCreateProductAttributeValue - création d'une NOUVELLE valeur '" . $value . "' (ref " . $ref . ") dans l'attribut #" . (int) $attributeId . " : aucune valeur existante ne correspond, même normalisée", LOG_WARNING);
 
         // Code review 3-couches (Blind Hunter) : ->ref = ref normalisée+repli ($ref), pas la
         // valeur brute — cf commentaire équivalent dans findOrCreateProductAttribute().
@@ -1974,7 +2152,11 @@ class ShopifyProductImporter
 
             // INSERT le mapping à jour (avec fk_store pour traçabilité par boutique)
             $sql = "INSERT INTO " . MAIN_DB_PREFIX . "doli2shop_products";
-            $sql .= " (fk_product, shopifyProductId, shopifyVariantId, fk_product_parent, entity, fk_store, last_sync_status, tms)";
+            // Hotfix 2.6.2 : last_content_sync reçoit la MÊME valeur que tms. Ce mapping est créé par
+            // l'import Shopify -> Dolibarr : le contenu Dolibarr vient d'être rapproché de Shopify, il est
+            // « synchronisé » à cet instant. Sans cela (colonne NULL sur une ligne 'success'), tout produit
+            // importé serait vu « modifié » par le cron et ré-exporté en masse vers Shopify.
+            $sql .= " (fk_product, shopifyProductId, shopifyVariantId, fk_product_parent, entity, fk_store, last_sync_status, tms, last_content_sync)";
             $sql .= " VALUES (";
             $sql .= (int)$dolibarrProductId . ", ";
             $sql .= "'" . $this->db->escape($shopifyProductId) . "', ";
@@ -1983,6 +2165,7 @@ class ShopifyProductImporter
             $sql .= (int)$this->entity . ", ";
             $sql .= $fkStore . ", ";
             $sql .= "'success', ";
+            $sql .= "'" . $this->db->idate(dol_now()) . "', ";
             $sql .= "'" . $this->db->idate(dol_now()) . "'";
             $sql .= ")";
 
@@ -2011,6 +2194,8 @@ class ShopifyProductImporter
                     $sqlUpdateAfterAbsorb .= ", fk_product_parent = " . ($parentProductId ? (int)$parentProductId : "NULL");
                     $sqlUpdateAfterAbsorb .= ", last_sync_status = 'success'";
                     $sqlUpdateAfterAbsorb .= ", tms = '" . $this->db->idate(dol_now()) . "'";
+                    // Hotfix 2.6.2 : même valeur que tms (cf. l'INSERT ci-dessus).
+                    $sqlUpdateAfterAbsorb .= ", last_content_sync = '" . $this->db->idate(dol_now()) . "'";
                     $sqlUpdateAfterAbsorb .= " WHERE fk_product = " . (int)$dolibarrProductId;
                     $sqlUpdateAfterAbsorb .= " AND entity = " . (int)$this->entity;
                     if ($fkStore > 0) {

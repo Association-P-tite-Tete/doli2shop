@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       2.0.22
  * @link        https://doli2shop.ptitetete.org
  */
@@ -143,6 +143,13 @@ $recalageConfirmMessage = $langs->trans("StockRecalageConfirm", (string) $recala
 $repairStoreId = $recalageStoreId;
 $repairService = new VariantRepairService($db, $user, $conf->entity);
 $repairEnabled = $repairService->isEnabled();
+// Hotfix 2.6.2 (AC1, D2) : raison pour laquelle l'outil est INDISPONIBLE (sens de synchronisation des produits
+// seul : Dolibarr fait foi) — '' si la réparation est permise pour la portée affichée.
+$repairBlockReason = $repairService->getRepairUnavailableReason($recalageStoreId);
+$repairBlockMessage = '';
+if ($repairBlockReason !== '') {
+    $repairBlockMessage = $langs->trans('VariantRepairBlockedFlow');
+}
 // Story 63-17 (AC4) : includeLabelOnly=true — le compteur/bouton initiaux doivent refléter le
 // pool "libellés" MÊME quand le pool "rattachement" est à 0 (scénario exact du rapport client :
 // des variantes déjà rattachées dont le libellé est resté celui du parent). Sans ce paramètre, le
@@ -690,6 +697,12 @@ if ($currentAdminStore !== null) {
         </div>
         <?php endif; ?>
 
+        <?php if ($repairBlockReason !== '') : ?>
+        <div class="d2s-alert-banner d2s-alert--warning" id="d2s-repair-blocked" style="margin-bottom: 12px;">
+            <i class="fa fa-lock"></i> <?php echo dol_escape_htmltag($repairBlockMessage); ?>
+        </div>
+        <?php endif; ?>
+
         <p><strong id="d2s-repair-count"><?php echo dol_escape_htmltag($langs->trans("VariantRepairCountLabel", (string) $repairCandidateCount)); ?></strong></p>
 
         <?php if ($repairLabelOnlyCount > 0) : ?>
@@ -714,7 +727,7 @@ if ($currentAdminStore !== null) {
         </div>
 
         <div class="center">
-            <button type="button" class="butAction" id="d2s-repair-button" <?php echo (!$repairEnabled || $repairCandidateCount <= 0) ? 'disabled' : ''; ?>>
+            <button type="button" class="butAction" id="d2s-repair-button" <?php echo (!$repairEnabled || $repairBlockReason !== '' || $repairCandidateCount <= 0) ? 'disabled' : ''; ?>>
                 <?php echo $langs->trans("VariantRepairButton"); ?>
             </button>
         </div>
@@ -1879,7 +1892,8 @@ if ($currentAdminStore !== null) {
                     return;
                 }
                 if (!data.enabled) {
-                    finish(VTRANS.variantRepairDisabledWarning);
+                    // Hotfix 2.6.2 (AC1) : la raison renvoyée par le serveur (sens de synchro) prime sur le message générique.
+                    finish(data.unavailableMessage ? data.unavailableMessage : VTRANS.variantRepairDisabledWarning);
                     return;
                 }
                 totalToProcess = data.total || 0;
@@ -1899,7 +1913,9 @@ if ($currentAdminStore !== null) {
                 runBatch(0, fixLabels);
             },
             error: function(xhr, status, err) {
-                finish(VTRANS.errorSync + ': ' + err);
+                // D6 : le refus serveur (HTTP 409, sens de synchro) porte sa raison dans `message`.
+                var serverMessage = (xhr && xhr.responseJSON && xhr.responseJSON.message) ? String(xhr.responseJSON.message) : '';
+                finish(serverMessage !== '' ? serverMessage : (VTRANS.errorSync + ': ' + err));
             }
         });
     });
@@ -1952,7 +1968,9 @@ if ($currentAdminStore !== null) {
                 }
             },
             error: function(xhr, status, err) {
-                finish(VTRANS.errorSync + ': ' + err);
+                // D6 : le refus serveur (HTTP 409, sens de synchro) porte sa raison dans `message`.
+                var serverMessage = (xhr && xhr.responseJSON && xhr.responseJSON.message) ? String(xhr.responseJSON.message) : '';
+                finish(serverMessage !== '' ? serverMessage : (VTRANS.errorSync + ': ' + err));
             }
         });
     }

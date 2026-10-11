@@ -199,7 +199,7 @@ ModuleDisabled = Modulo disattivato
 
 # Configurazione cron
 MaxOrdersPerSyncHelp=Numero massimo di ordini elaborati durante una sincronizzazione. Limitare questo numero per evitare il sovraccarico del server.
-ProductsPerCronUpdateHelp=Numero massimo di prodotti aggiornati durante un'esecuzione di attività pianificata. Utile per cataloghi ampi.
+ProductsPerCronUpdateHelp=Numero massimo di prodotti aggiornati durante un'esecuzione di attività pianificata. Utile per cataloghi ampi. I prodotti il cui prezzo è cambiato in Dolibarr passano per primi; fino a un terzo di questo numero è riservato alle altre modifiche di contenuto (nome, descrizione, foto), le più vecchie per prime, e fino alla metà del resto ai prodotti con varianti, in modo che i prodotti semplici non li escludano.
 
 RequiredFields=I campi contrassegnati con un asterisco (*) sono obbligatori
 
@@ -1756,6 +1756,7 @@ StockRecalageErrorDetail=Dettaglio errori
 VariantRepairTitle=Riparazione delle varianti (importazioni esistenti)
 VariantRepairIntro=Collega a posteriori i prodotti già importati come schede separate al loro prodotto padre, tramite una vera variante Dolibarr — utile per riparare un catalogo importato prima della versione 2.4.4 (varianti invisibili nell'interfaccia Dolibarr).
 VariantRepairDisabledWarning=Il modulo Variants di Dolibarr non è attivato; la riparazione non può essere avviata.
+VariantRepairBlockedFlow=Lo strumento non è disponibile: per i prodotti fa fede Dolibarr (la sincronizzazione da Shopify a Dolibarr non è consentita per questo negozio). Ricreerebbe varianti che avete eliminato volutamente in Dolibarr.
 VariantRepairCountLabel=%s prodotto/i da riparare
 VariantRepairLastRunLabel=Ultima riparazione:
 VariantRepairLastRunSummary=%s — %s prodotto/i riparato/i, %s errore/i
@@ -2256,3 +2257,6 @@ ShopifyOrderNoCustomerIdentity=L'ordine %s non ha alcuna identità cliente (ness
 SyncReportCollectionsAutomaticSkipped=%s raccolta/e gestita/e da condizioni in Shopify: il modulo non vi aggiunge prodotti — impostate la raccolta su manuale se volete che il modulo la riempia
 SyncReportCollectionsAutomaticRefused=%s raccolta/e rifiutata/e da Shopify (messaggio che indica una raccolta automatica): nessun prodotto ha potuto essere associato — aggiungete una condizione o impostate la raccolta su manuale in Shopify
 SyncReportCollectionsDetailUnreadable=%s raccolta/e ignorata/e per precauzione: Shopify rifiuta la lettura delle loro condizioni, il modulo non può sapere se sono gestite da condizioni e non vi aggiunge prodotti
+Doli2ShopBackfillConflictsWarning=%s corrispondenza/e di impostazioni in conflitto durante l'assegnazione al negozio predefinito: la stessa chiave esisteva già, assegnata al negozio, con un valore diverso. La corrispondenza assegnata viene mantenuta, l'altra resta invariata (dettagli nel registro del modulo).
+ProductOptionsLimitRefusal=Prodotto %s rifiutato prima dell'invio: %s opzioni dopo l'unione degli attributi con la stessa etichetta, Shopify ne accetta al massimo %s. Opzioni: %s. Rimuova o raggruppi un attributo in Dolibarr.
+ProductVariantsDroppedRefusal=Prodotto %s rifiutato prima dell'invio: %s variante/i attiva/e non possono essere inviate (%s). Shopify eliminerebbe le varianti assenti dall'invio; completi o corregga queste varianti in Dolibarr.

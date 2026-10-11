@@ -11,7 +11,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.1
+ * @version     2.6.2
  * @since       1.0.0
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -371,7 +371,7 @@ function doli2shopStoreSwitchDroppedParams()
  * @param  DoliDB $db Connexion base de données
  * @return void
  * @since  2.3.10
- * @version     2.6.1
+ * @version     2.6.2
  */
 function doli2shopRenderAdminTopBar($db)
 {
@@ -1563,7 +1563,7 @@ function doli2shopGetGenuinelyExpiredStatuses(): array
  *
  * @param array|null $payload Payload (déjà déplié) de get-license-by-shop
  * @return array Clés : state, titleKey, badgeKey, noteKey, badgeClass, cardClass
- * @version     2.6.1
+ * @version     2.6.2
  * @since   2.6.0
  */
 function doli2shopResolveLicenseDisplayState($payload)
@@ -1620,7 +1620,7 @@ function doli2shopResolveLicenseDisplayState($payload)
  * @param string      $shopDomain       Domaine boutique (xxx.myshopify.com)
  * @param string|null $officialEndpoint Surcharge réservée aux tests ; null = constante par défaut
  * @return string URL absolue https, ou '' si indisponible
- * @version     2.6.1
+ * @version     2.6.2
  * @since   2.6.0
  */
 function doli2shopBuildLinkSerialUrl($shopDomain, $officialEndpoint = null)
@@ -1644,7 +1644,7 @@ function doli2shopBuildLinkSerialUrl($shopDomain, $officialEndpoint = null)
  * @param array $displayState Résultat de doli2shopResolveLicenseDisplayState()
  * @param bool  $isValid      Champ `valid` du payload
  * @return array Clés : cardClass, titleKey, badgeClass, badgeKey, noteKey, showSourceBadge, showPlan, showLicenseDetails, showRelinkAction
- * @version     2.6.1
+ * @version     2.6.2
  * @since   2.6.0
  */
 function doli2shopResolveLicenseCardLayout($displayState, $isValid)

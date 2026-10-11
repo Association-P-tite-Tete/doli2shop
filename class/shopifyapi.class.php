@@ -8,7 +8,7 @@
  * @package     ShopifyIntegration
  * @subpackage  Class
  * @category    class
- * @version     2.6.1
+ * @version     2.6.2
  * @since       2.0.0
  * @author      P'tite Tête <doli2shop@ptitetete.com>
  * @copyright   2022-2025 Robert Steinbacher<robert.steinbacher@xivtech.de>
@@ -1985,8 +1985,15 @@ class ShopifyApi
      * réponse, cf. `aggregateInventoryResults()`) → stocks Shopify jamais corrigés (négatifs).
      * DÉSORMAIS : le lot est scindé AVANT de choisir la mutation — les items AVEC
      * `current_shopify_quantity` partent en delta (inventoryAdjustQuantities, pas de
-     * compare-and-swap requis), les items SANS partent séparément en fallback
-     * (inventorySetOnHandQuantities). Un item « fantôme » ne pénalise plus les autres.
+     * compare-and-swap requis), les items SANS `current_` mais AVEC `on_hand_shopify_quantity`
+     * non null (0 compris) partent séparément en SET absolu (inventorySetOnHandQuantities,
+     * `changeFromQuantity` = cette quantité on_hand exacte).
+     *
+     * Hotfix 2.6.2 (push-stock-temps-reel-compare-and-swap-quantite-inconnue) : un item sans AUCUNE
+     * des deux références (absente ou null) est REFUSÉ ligne par ligne AVANT tout envoi, par une
+     * `userError` synthétique « référence de stock inconnue » (jamais de `changeFromQuantity: 0`
+     * inventé, qui affirmerait à Shopify un stock nul). Les autres lignes du lot partent. La référence
+     * se résout en amont par `InventoryReferenceResolver::resolve()`.
      *
      * FIX v2.4.1 (review 50-11, CRITICAL) : AVANT, un échec du seul sous-lot fallback faisait
      * retourner une réponse agrégée qui, une fois transmise au retry de
@@ -2014,20 +2021,27 @@ class ShopifyApi
         // changeFromQuantity (compare-and-swap). On utilise inventoryAdjustQuantities
         // avec delta = target - current pour éviter cette contrainte quand on connaît
         // la quantité courante. Les items sans quantité courante connue partent en
-        // fallback isolé (SET absolu, changeFromQuantity=0 par construction).
+        // fallback isolé (SET absolu) SI on_hand_shopify_quantity est connue ; sinon la ligne est
+        // refusée avant envoi (hotfix 2.6.2 : plus de changeFromQuantity=0 inventé).
         $withCurrent = [];
         $withoutCurrent = [];
+        $unknownReference = [];
         foreach ($quantities as $qty) {
             if (array_key_exists('current_shopify_quantity', $qty) && $qty['current_shopify_quantity'] !== null) {
                 $withCurrent[] = $qty;
-            } else {
+            } elseif (array_key_exists('on_hand_shopify_quantity', $qty) && $qty['on_hand_shopify_quantity'] !== null) {
                 $withoutCurrent[] = $qty;
+            } else {
+                $unknownReference[] = $qty;
+                $this->log('ShopifyApi::inventorySetQuantities - référence de stock inconnue pour '
+                    . ($qty['inventory_item_id'] ?? '?') . ' : ligne refusée avant envoi (aucune mutation).', LOG_WARNING);
             }
         }
 
         $this->log("ShopifyApi::inventorySetQuantities - lot scindé : " . count($withCurrent)
             . " item(s) en delta (inventoryAdjustQuantities), " . count($withoutCurrent)
-            . " item(s) en fallback (inventorySetOnHandQuantities)", LOG_DEBUG);
+            . " item(s) en SET on_hand (inventorySetOnHandQuantities), " . count($unknownReference)
+            . " item(s) refusé(s) (référence inconnue)", LOG_DEBUG);
 
         $deltaResponse = null;
         $fallbackResponse = null;
@@ -2039,7 +2053,7 @@ class ShopifyApi
             $fallbackResponse = $this->inventorySetOnHandQuantitiesBatch($withoutCurrent);
         }
 
-        return $this->aggregateInventoryResults($deltaResponse, $fallbackResponse, $withCurrent, $withoutCurrent);
+        return $this->aggregateInventoryResults($deltaResponse, $fallbackResponse, $withCurrent, $withoutCurrent, $unknownReference);
     }
 
     /**
@@ -2118,11 +2132,11 @@ class ShopifyApi
 
     /**
      * Exécute la mutation inventorySetOnHandQuantities (SET absolu, compare-and-swap) pour un
-     * sous-lot d'items SANS current_shopify_quantity connue. Extrait de inventorySetQuantities()
+     * sous-lot d'items SANS current_shopify_quantity mais AVEC on_hand_shopify_quantity non null. Extrait de inventorySetQuantities()
      * (FIX v2.4.1) — isolé du sous-lot delta pour qu'un item fantôme ne fasse plus échouer les
      * items qui, eux, avaient une quantité courante fiable.
      *
-     * @param array $quantities Sous-lot d'items sans current_shopify_quantity
+     * @param array $quantities Sous-lot d'items portant tous on_hand_shopify_quantity (non null)
      * @return object Réponse GraphQL brute
      * @since 2.4.1
      */
@@ -2150,23 +2164,24 @@ class ShopifyApi
 
         $convertedQuantities = [];
         foreach ($quantities as $qty) {
-            if (!array_key_exists('on_hand_shopify_quantity', $qty)) {
-                $this->log('ShopifyApi::inventorySetOnHandQuantitiesBatch - quantite on_hand INCONNUE pour '
-                    . ($qty['inventory_item_id'] ?? '?') . ' : le compare-and-swap partira avec 0 et sera '
-                    . 'refuse par Shopify si le stock enregistre n\'est pas nul.', LOG_WARNING);
+            // Garde défensive (AC5) : jamais de repli sur 0, qui serait une vraie quantité.
+            if (!is_array($qty) || !array_key_exists('on_hand_shopify_quantity', $qty) || $qty['on_hand_shopify_quantity'] === null) {
+                throw new \InvalidArgumentException(
+                    'ShopifyApi::inventorySetOnHandQuantitiesBatch - on_hand_shopify_quantity manquant pour '
+                    . (is_array($qty) ? ($qty['inventory_item_id'] ?? '?') : '?')
+                );
             }
             $convertedQuantities[] = [
                 'inventoryItemId' => $qty['inventory_item_id'] ?? '',
                 'locationId' => $qty['location_id'] ?? '',
                 'quantity' => (int)($qty['available_adjustment'] ?? 0),
                 // `changeFromQuantity` est compare a la quantite ON_HAND. On emploie donc la
-                // valeur lue sur cette grandeur (ImportProducts::fillMissingOnHandQuantities()),
-                // JAMAIS `current_shopify_quantity`, qui porte la quantite `available`.
+                // valeur lue sur cette grandeur (InventoryReferenceResolver::resolve()), JAMAIS
+                // `current_shopify_quantity`, qui porte la quantite `available`.
                 //
-                // A defaut, l'ancien comportement (0) est conserve — mais il est desormais
-                // ANNONCE : il affirme a Shopify que le stock enregistre vaut zero, ce qui fait
-                // refuser tout le lot des que c'est faux.
-                'changeFromQuantity' => (int)($qty['on_hand_shopify_quantity'] ?? 0)
+                // Hotfix 2.6.2 : aucun repli. Une ligne sans on_hand connue n'arrive jamais ici
+                // (refusee en amont par inventorySetQuantities()) ; 0 est une vraie valeur.
+                'changeFromQuantity' => (int)$qty['on_hand_shopify_quantity']
             ];
         }
 
@@ -2203,12 +2218,14 @@ class ShopifyApi
      * @param object|null $fallbackResponse Réponse brute du chemin fallback (ou null si non exécuté)
      * @param array $withCurrentItems Items d'origine envoyés au chemin delta (pour retryableQuantities)
      * @param array $withoutCurrentItems Items d'origine envoyés au chemin fallback (pour retryableQuantities)
+     * @param array $unknownReferenceItems Items refusés avant envoi (aucune référence de stock) : une
+     *                                     userError synthétique chacun, JAMAIS dans retryableQuantities
      * @return object Réponse agrégée : errors[], data->inventoryAdjustQuantities,
      *                data->inventorySetOnHandQuantities, userErrors[], failedCount,
      *                failedFields[], retryableQuantities[]
      * @since 2.4.1
      */
-    private function aggregateInventoryResults($deltaResponse, $fallbackResponse, array $withCurrentItems = [], array $withoutCurrentItems = [])
+    private function aggregateInventoryResults($deltaResponse, $fallbackResponse, array $withCurrentItems = [], array $withoutCurrentItems = [], array $unknownReferenceItems = [])
     {
         $topErrors = [];
         $userErrors = [];
@@ -2256,6 +2273,23 @@ class ShopifyApi
                 $failedFields[] = $field;
                 $retryableQuantities = array_merge($retryableQuantities, $pathData['items']);
             }
+        }
+
+        // Hotfix 2.6.2 : refus ligne par ligne des items sans référence de stock. Message volontairement
+        // ni transitoire (cf. isTransientFailureMessage) ni « changeFromQuantity » : persistant.
+        if (!empty($unknownReferenceItems)) {
+            foreach ($unknownReferenceItems as $unknownItem) {
+                $userErrors[] = (object)[
+                    'field' => ['setQuantities', 'inventoryItemId'],
+                    'message' => 'référence de stock inconnue pour ' . ($unknownItem['inventory_item_id'] ?? '?')
+                        . ' : ligne refusée avant envoi',
+                    // Drapeau structurel : l'appelant distingue ce refus (définitif, jamais rejoué) des
+                    // userErrors Shopify, sans reposer sur un motif textuel.
+                    'refused' => true,
+                ];
+                $failedCount++;
+            }
+            $failedFields[] = 'referenceStockInconnue';
         }
 
         return (object)[
@@ -6066,7 +6100,7 @@ GRAPHQL;
      * @param string $collectionId The collection ID (legacy resource ID)
      * @return object|null Collection details or null if not found
      * @since 2.0.31
-     * @version     2.6.1 Story 66-7 : détail des sources (inclusion.conditions) + repli par boutique
+     * @version     2.6.2 Story 66-7 : détail des sources (inclusion.conditions) + repli par boutique
      */
     public function getCollectionDetails($collectionId)
     {
@@ -6436,7 +6470,7 @@ GRAPHQL;
      * @param string $collectionId The collection ID (legacy resource ID)
      * @return bool True if Smart Collection, false if Manual Collection
      * @since 2.0.31
-     * @version     2.6.1 Story 66-7 : CollectionConditionsSource sans condition = MANUAL
+     * @version     2.6.2 Story 66-7 : CollectionConditionsSource sans condition = MANUAL
      */
     public function isSmartCollection($collectionId)
     {
@@ -7013,6 +7047,82 @@ GRAPHQL;
             $this->log(__METHOD__ . " - Error: " . $e->getMessage(), LOG_ERR);
             return null;
         }
+    }
+
+    /** Nombre d'options par produit retenu quand la limite de la boutique est illisible (valeur historique de Shopify). */
+    const DEFAULT_MAX_PRODUCT_OPTIONS = 3;
+
+    /** Durée de validité (secondes) de la limite d'options mise en cache, par boutique. */
+    const MAX_PRODUCT_OPTIONS_CACHE_TTL = 86400;
+
+    /** @var array<string,int> Limite d'options lue pendant ce processus, par "entité:boutique" (y compris le repli). */
+    private static $maxProductOptionsCache = [];
+
+    /**
+     * Nombre maximal d'options par produit accepté par la boutique courante
+     * (`Shop.resourceLimits.maxProductOptions`, `Int!`, vérifié sur l'API 2026-07). Cache 24 h PAR BOUTIQUE
+     * (constante `DOLI2SHOP_MAX_PRODUCT_OPTIONS[_<fk_store>]` = « limite|horodatage », entité courante) +
+     * cache de processus ; repli 3 si la lecture échoue (non persisté : retenté au prochain processus).
+     * L'écriture de la constante partage la transaction de l'appelant : annulée par un rollback, elle sera
+     * simplement relue au cycle suivant (jamais d'erreur, jamais bloquant).
+     *
+     * @return int Limite (>= 1)
+     * @since 2.6.2
+     */
+    public function getMaxProductOptions()
+    {
+        $cacheKey = $this->entity . ':' . $this->fkStore;
+        if (isset(self::$maxProductOptionsCache[$cacheKey])) {
+            return self::$maxProductOptionsCache[$cacheKey];
+        }
+
+        $constName = 'DOLI2SHOP_MAX_PRODUCT_OPTIONS' . ($this->fkStore > 0 ? '_' . (int) $this->fkStore : '');
+        try {
+            $sql = "SELECT value FROM " . MAIN_DB_PREFIX . "const WHERE name = '" . $this->db->escape($constName)
+                . "' AND entity = " . (int) $this->entity;
+            $resql = $this->db->query($sql);
+            if ($resql) {
+                $row = $this->db->fetch_object($resql);
+                $this->db->free($resql);
+                if ($row && preg_match('/^(\d{1,4})\|(\d{9,})$/', (string) $row->value, $m)
+                    && (int) $m[1] >= 1 && (time() - (int) $m[2]) < self::MAX_PRODUCT_OPTIONS_CACHE_TTL) {
+                    self::$maxProductOptionsCache[$cacheKey] = (int) $m[1];
+                    return (int) $m[1];
+                }
+            }
+        } catch (\Throwable $e) {
+            // Cache illisible : on interroge Shopify.
+        }
+
+        $limit = null;
+        try {
+            $response = $this->executeGraphQL(['query' => '{ shop { resourceLimits { maxProductOptions } } }']);
+            $value = isset($response->data->shop->resourceLimits->maxProductOptions)
+                ? $response->data->shop->resourceLimits->maxProductOptions : null;
+            if (is_int($value) && $value >= 1) {
+                $limit = $value;
+            } elseif (is_string($value) && ctype_digit($value) && (int) $value >= 1) {
+                $limit = (int) $value;
+            }
+        } catch (\Throwable $e) {
+            $this->log(__METHOD__ . " - lecture impossible : " . $e->getMessage(), LOG_WARNING);
+        }
+
+        if ($limit === null) {
+            $this->log(__METHOD__ . " - maxProductOptions illisible, repli sur " . self::DEFAULT_MAX_PRODUCT_OPTIONS, LOG_WARNING);
+            self::$maxProductOptionsCache[$cacheKey] = self::DEFAULT_MAX_PRODUCT_OPTIONS;
+            return self::DEFAULT_MAX_PRODUCT_OPTIONS;
+        }
+
+        self::$maxProductOptionsCache[$cacheKey] = $limit;
+        try {
+            if (function_exists('dolibarr_set_const')) {
+                dolibarr_set_const($this->db, $constName, $limit . '|' . time(), 'chaine', 0, '', (int) $this->entity);
+            }
+        } catch (\Throwable $e) {
+            // Jamais bloquant.
+        }
+        return $limit;
     }
 
     /**

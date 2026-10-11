@@ -10,7 +10,7 @@
  * @package     ShopifyIntegration
  * @subpackage  Class
  * @category    class
- * @version     2.6.1
+ * @version     2.6.2
  * @since       2.0.14
  * @author      P'tite Tête <doli2shop@ptitetete.com>
  * @copyright   2022-2025 Robert Steinbacher<robert .steinbacher@xivtech.de>
@@ -208,6 +208,10 @@ class PaymentMethodsMapping extends CommonObject
         if ((int) $storeId > 0) {
             $sql .= " AND fk_store = ?";
             $params[] = (int) $storeId;
+        } else {
+            // Hotfix 2.6.2 (AC9) : sans boutique, plusieurs lignes peuvent coexister pour la même méthode
+            // (fk_store = 0 historique + rattachée) : résultat déterminé, la ligne rattachée d'abord.
+            $sql .= " ORDER BY fk_store DESC";
         }
 
         $resql = SqlUtils::executeQuery($this->db, $sql, "getting Dolibarr payment ID", false, $params);
@@ -235,6 +239,26 @@ class PaymentMethodsMapping extends CommonObject
     public static function getDefaultMappingsDefinition(): array
     {
         return self::DEFAULT_PAYMENT_MAPPINGS;
+    }
+
+    /**
+     * Rowid de la boutique par défaut de l'entité (0 s'il n'y en a pas, ou si la table est illisible).
+     *
+     * @param  int $entity Entité
+     * @return int
+     */
+    private function resolveDefaultStoreId(int $entity): int
+    {
+        $sql = "SELECT rowid FROM " . MAIN_DB_PREFIX . "doli2shop_stores"
+            . " WHERE entity = " . (int) $entity . " AND is_default = 1 ORDER BY rowid ASC";
+        $resql = $this->db->query($sql);
+        if (!$resql) {
+            return 0;
+        }
+        $obj = $this->db->fetch_object($resql);
+        $this->db->free($resql);
+
+        return ($obj && (int) $obj->rowid > 0) ? (int) $obj->rowid : 0;
     }
 
     /**
@@ -274,14 +298,22 @@ class PaymentMethodsMapping extends CommonObject
 
         $inserted = 0;
 
+        // Hotfix 2.6.2 : le seed pose la ligne sur la boutique PAR DÉFAUT (0 seulement s'il n'y en a pas
+        // encore). Avant, il testait et insérait fk_store = 0 en dur : après le backfill (0 -> boutique),
+        // chaque init() ne voyait plus de fk_store = 0, réinsérait (méthode, entité, 0), et le backfill
+        // suivant butait sur la clé unique « Duplicate entry 'card-1-1' » (à CHAQUE réactivation).
+        $seedStoreId = $this->resolveDefaultStoreId($entity);
+
         foreach (self::DEFAULT_PAYMENT_MAPPINGS as $mapping) {
             $shopifyMethod = $mapping['shopify_payment_method'];
             $dolibarrPaymentId = (int) $mapping['dolibarr_payment_id'];
 
-            // AC3 : garde par (entité, méthode, fk_store=0) — jamais sur toute la table.
+            // AC3 : garde par (entité, méthode, boutique) — jamais sur toute la table.
             // Une ligne déjà présente n'est jamais retouchée, même si le client l'a modifiée.
+            // Une orpheline fk_store = 0 compte comme présente : le backfill la rattachera (c'est
+            // peut-être la correspondance personnalisée du client), le seed ne la double pas.
             $sqlExists = "SELECT rowid FROM " . MAIN_DB_PREFIX . $this->table_element
-                . " WHERE entity = ? AND shopify_payment_method = ? AND fk_store = 0";
+                . " WHERE entity = ? AND shopify_payment_method = ? AND fk_store IN (0, " . (int) $seedStoreId . ")";
             $resqlExists = SqlUtils::executeQuery(
                 $this->db,
                 $sqlExists,
@@ -341,13 +373,13 @@ class PaymentMethodsMapping extends CommonObject
 
             $sqlInsert = "INSERT INTO " . MAIN_DB_PREFIX . $this->table_element
                 . " (shopify_payment_method, dolibarr_payment_id, entity, fk_store, active)"
-                . " VALUES (?, ?, ?, 0, 1)";
+                . " VALUES (?, ?, ?, ?, 1)";
             $resqlInsert = SqlUtils::executeQuery(
                 $this->db,
                 $sqlInsert,
                 "seeding default payment mapping",
                 false,
-                [$shopifyMethod, $dolibarrPaymentId, $entity]
+                [$shopifyMethod, $dolibarrPaymentId, $entity, $seedStoreId]
             );
 
             if ($resqlInsert === false) {
