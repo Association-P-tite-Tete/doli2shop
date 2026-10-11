@@ -8,7 +8,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.4.2
  * @link        https://doli2shop.ptitetete.org
  */
@@ -121,7 +121,7 @@ class StockRecalageService
 
     /**
      * Traite un lot de produits mappés (curseur = offset paginé) : pousse le stock absolu de
-     * chaque produit vers Shopify via ShopifyStockTrigger::updateShopifyStock(), journalise
+     * chaque produit vers Shopify via ShopifyStockTrigger::updateShopifyStockBatch(), journalise
      * chaque résultat (ActionLogger, AC #5), sous garde SYNC_IN_PROGRESS (try/finally + nesting
      * guard, AC #7). JAMAIS d'exception non catchée n'interrompt le lot : un produit en échec ne
      * bloque jamais les suivants.
@@ -186,39 +186,49 @@ class StockRecalageService
         }
 
         try {
+            // Story 66-1 (2.6.1) : UN appel batch sur le lot (BATCH_SIZE) — le trigger regroupe par
+            // (boutique, emplacement) : une lecture et une écriture par boutique. Même chemin de code
+            // que la file asynchrone et `POST /stock/push` (cas n=1). Compteurs par produit conservés.
+            $outcomes = array();
+            try {
+                $trigger = $this->createStockTrigger();
+                // HIGH-1 (review 52-2) : bypass du plafond de résolutions API. Le recalage est un
+                // batch admin délibéré (borné BATCH_SIZE + set_time_limit(0) + rate-limit client API
+                // + write-through) qui DOIT résoudre tous les produits × toutes les boutiques ; sans
+                // bypass, le plafond partagé par requête (20) provoquerait des skips silencieux
+                // comptés "poussés" dès ~10 produits en multi-boutiques → recalage incomplet.
+                $outcomes = $trigger->updateShopifyStockBatch($productIds, true);
+            } catch (\Throwable $e) {
+                // AC #7 : non-blocage — une exception imprévue du lot (ex. panne réseau Shopify) ne
+                // doit JAMAIS interrompre le traitement : chaque produit du lot est compté en erreur.
+                $this->log('processBatch() - Exception du lot: ' . $e->getMessage(), LOG_ERR);
+                foreach ($productIds as $failedProductId) {
+                    $outcomes[$failedProductId] = array('code' => -1, 'stock' => null, 'errors' => array('Exception: ' . $e->getMessage()));
+                }
+            }
+
             foreach ($productIds as $dolibarrProductId) {
                 $result['processed']++;
-                try {
-                    $trigger = $this->createStockTrigger();
-                    $pushedStock = null;
-                    // HIGH-1 (review 52-2) : bypass du plafond de résolutions API. Le recalage est un
-                    // batch admin délibéré (borné BATCH_SIZE + set_time_limit(0) + rate-limit client API
-                    // + write-through) qui DOIT résoudre tous les produits × toutes les boutiques ; sans
-                    // bypass, le plafond partagé par requête (20) provoquerait des skips silencieux
-                    // comptés "poussés" dès ~10 produits en multi-boutiques → recalage incomplet.
-                    $pushResult = $trigger->updateShopifyStock($dolibarrProductId, $pushedStock, true);
+                $outcome = isset($outcomes[$dolibarrProductId])
+                    ? $outcomes[$dolibarrProductId]
+                    : array('code' => -1, 'stock' => null, 'errors' => array('résultat de push absent pour ce produit'));
 
-                    if ($pushResult === 0 && empty($trigger->errors)) {
-                        $result['pushed']++;
-                        $message = 'Recalage stock produit ID ' . $dolibarrProductId . ' : valeur poussée='
-                            . ($pushedStock !== null ? $pushedStock : 'n/a');
-                        $this->logAction(ActionLogger::RESULT_SUCCESS, $dolibarrProductId, $message);
-                    } else {
-                        $result['errors']++;
-                        $errMsg = 'Recalage stock produit ID ' . $dolibarrProductId . ' échoué : '
-                            . (!empty($trigger->errors) ? implode('; ', $trigger->errors) : 'erreur non détaillée');
-                        $result['errorDetails'][] = $errMsg;
-                        $this->logAction(ActionLogger::RESULT_ERROR, $dolibarrProductId, $errMsg);
+                if ($outcome['code'] === 0 && empty($outcome['errors'])) {
+                    $result['pushed']++;
+                    $message = 'Recalage stock produit ID ' . $dolibarrProductId . ' : valeur poussée='
+                        . ($outcome['stock'] !== null ? $outcome['stock'] : 'n/a');
+                    $this->logAction(ActionLogger::RESULT_SUCCESS, $dolibarrProductId, $message);
+                    if (!empty($outcome['warnings'])) {
+                        // Une boutique a réussi, une autre est mal configurée : jamais silencieux.
+                        $this->logAction(ActionLogger::RESULT_ERROR, $dolibarrProductId, 'Recalage stock produit ID ' . $dolibarrProductId
+                            . ' : configuration à corriger sur une boutique : ' . implode('; ', $outcome['warnings']));
                     }
-                } catch (\Throwable $e) {
-                    // AC #7 : non-blocage — un produit en échec (exception imprévue, ex. panne
-                    // réseau Shopify) ne doit JAMAIS interrompre le traitement des produits
-                    // suivants du même lot.
+                } else {
                     $result['errors']++;
-                    $errMsg = 'Exception recalage produit ID ' . $dolibarrProductId . ': ' . $e->getMessage();
+                    $errMsg = 'Recalage stock produit ID ' . $dolibarrProductId . ' échoué : '
+                        . (!empty($outcome['errors']) ? implode('; ', $outcome['errors']) : 'erreur non détaillée');
                     $result['errorDetails'][] = $errMsg;
                     $this->logAction(ActionLogger::RESULT_ERROR, $dolibarrProductId, $errMsg);
-                    $this->log('processBatch() - ' . $errMsg, LOG_ERR);
                 }
             }
         } finally {

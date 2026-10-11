@@ -9,7 +9,7 @@
  * @package     ShopifyIntegration
  * @subpackage  Class
  * @category    class
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.0.0
  * @author      P'tite Tête <doli2shop@ptitetete.com>
  * @copyright   2022-2025 Robert Steinbacher<robert .steinbacher@xivtech.de>
@@ -43,6 +43,7 @@ dol_include_once('/expedition/class/expedition.class.php'); // v2.2.0: Story 2.3
 require_once dirname(__FILE__) . '/../lib/doli2shop.lib.php'; // v2.2.0: Story 7.3 — PII masking helpers
 require_once dirname(__FILE__) . '/storeservice.class.php';         // Epic 47, Story 47-5: tag catégories boutique
 require_once dirname(__FILE__) . '/storecategoryhelper.class.php';  // Epic 47, Story 47-5: tag catégories boutique
+require_once dirname(__FILE__) . '/customerlinkrepository.class.php'; // Story 66-6 : lien client Shopify <-> tiers
 
 class ShopifyOrderManager
 {
@@ -123,6 +124,18 @@ class ShopifyOrderManager
     /** @var StoreSettings|null Accesseur réglages per-store (Story 49-4) */
     private $storeSettings = null;
 
+    /** @var CustomerLinkRepository|null Lien client Shopify <-> tiers (Story 66-6, instancié à la demande) */
+    private $customerLinkRepository = null;
+
+    /**
+     * Story 66-6 (AC11) — Cause explicite du dernier échec de createOrUpdateCustomer() (ex. option
+     * Dolibarr SOCIETE_EMAIL_MANDATORY), remontée par processSingleOrderFromWebhook() dans $errors
+     * au lieu du générique « Failed to create/update customer ». '' = pas de cause particulière.
+     *
+     * @var string
+     */
+    private $lastCustomerFailureReason = '';
+
     public function __construct($db, $entity = null, $store = null)
     {
         global $conf;
@@ -196,11 +209,22 @@ class ShopifyOrderManager
 
         // Si l'utilisateur n'est pas chargé (contexte webhook), charger l'utilisateur CRON
         if (empty($user->id)) {
-            $cronUserId = getDolGlobalInt('DOLI2SHOP_WEBHOOK_USER_ID', getDolGlobalInt('MAIN_CRON_USERID', 0));
+            // Story 68-2 : même résolution que webhooks/index.php — une valeur <= 0 en base
+            // (ex. -1) ne doit plus laisser la commande se créer sans aucun utilisateur chargé.
+            // Constante absente (0) : MAIN_CRON_USERID, puis admin ID=1 (comportement des webhooks).
+            $configuredUserId = getDolGlobalInt('DOLI2SHOP_WEBHOOK_USER_ID', 0);
+            $cronUserId = doli2shopResolveWebhookUserId($configuredUserId, getDolGlobalInt('MAIN_CRON_USERID', 0));
+            if ($configuredUserId < 0) {
+                $this->log("checkUserPermissions - DOLI2SHOP_WEBHOOK_USER_ID invalide (" . $configuredUserId . ") ignoré, repli sur l'utilisateur ID=" . $cronUserId, LOG_WARNING);
+            }
             if ($cronUserId > 0) {
-                $user->fetch($cronUserId);
-                $user->getRights();
-                $this->log("checkUserPermissions - Loaded CRON user ID=" . $cronUserId . " (" . $user->login . ")", LOG_INFO);
+                $fetchResult = $user->fetch($cronUserId);
+                if ($fetchResult > 0) {
+                    $user->getRights();
+                    $this->log("checkUserPermissions - Loaded CRON user ID=" . $cronUserId . " (" . $user->login . ")", LOG_INFO);
+                } else {
+                    $this->log("checkUserPermissions - Cannot load webhook/CRON user ID=" . $cronUserId . " (fetch=" . $fetchResult . ")", LOG_WARNING);
+                }
             }
         }
 
@@ -461,171 +485,817 @@ class ShopifyOrderManager
         return $countryMap[$upperName] ?? $countryName;
     }
 
+    /**
+     * Story 66-6 — Repli client quand aucun nom exploitable n'existe : « Client Shopify #1001 ».
+     * Jamais l'e-mail ni le téléphone comme nom (données personnelles, et un e-mail n'est pas un nom).
+     *
+     * @param  object $shopifyCustomer Identité client (propriétés orderName, id)
+     * @return string
+     */
+    private function buildFallbackCustomerName($shopifyCustomer)
+    {
+        $orderName = trim((string) ($shopifyCustomer->orderName ?? ''));
+        if ($orderName !== '') {
+            return 'Client Shopify ' . $orderName;
+        }
+        $customerId = CustomerLinkRepository::cleanShopifyCustomerId($shopifyCustomer->id ?? '');
+        return ($customerId !== '') ? 'Client Shopify #' . $customerId : 'Client Shopify';
+    }
+
+    /**
+     * Story 66-6 (AC8, N4) — Nom du verrou advisory d'un client. Clé = e-mail s'il existe (clé
+     * historique, inchangée), sinon id client Shopify (avec la boutique), sinon téléphone normalisé,
+     * sinon nom + code postal. Deux clients sans e-mail ne partagent JAMAIS un verrou ; le même
+     * client traité deux fois (webhook + rattrapage) prend le même.
+     *
+     * @param  string $email           E-mail ('' si absent)
+     * @param  string $shopifyCustomerId Id client Shopify nettoyé ('' si absent)
+     * @param  string $phoneKey        Clé téléphone normalisée ('' si non comparable)
+     * @param  string $identityText    Nom + code postal normalisés (dernier recours)
+     * @return string
+     */
+    private function buildCustomerLockName($email, $shopifyCustomerId, $phoneKey, $identityText)
+    {
+        if ($email !== '') {
+            $lockKey = md5($email);
+        } elseif ($shopifyCustomerId !== '') {
+            $lockKey = md5('id|' . $this->getStoreId() . '|' . $shopifyCustomerId);
+        } elseif ($phoneKey !== '') {
+            $lockKey = md5('tel|' . $phoneKey);
+        } else {
+            $lockKey = md5('nom|' . $identityText);
+        }
+        return 'doli2shop_customer_' . $this->entity . '_' . $lockKey;
+    }
+
+    /**
+     * Story 66-6 — Dépôt des liens client Shopify <-> tiers (instancié à la demande).
+     *
+     * @return CustomerLinkRepository
+     */
+    private function customerLinks()
+    {
+        if ($this->customerLinkRepository === null) {
+            $this->customerLinkRepository = new CustomerLinkRepository($this->db, $this->entity);
+        }
+        return $this->customerLinkRepository;
+    }
+
+    /**
+     * Story 66-6 — Aucune donnée d'identité exploitable (R7, et garde N5 de createOrUpdateCustomer).
+     *
+     * @param  object $shopifyCustomer Identité client
+     * @return bool true si ni e-mail, ni id client Shopify, ni téléphone, ni nom, ni société, ni adresse
+     */
+    private function customerIdentityIsEmpty($shopifyCustomer)
+    {
+        $addr = (isset($shopifyCustomer->defaultAddress) && is_object($shopifyCustomer->defaultAddress)) ? $shopifyCustomer->defaultAddress : null;
+        $values = array(
+            $shopifyCustomer->email ?? '',
+            CustomerLinkRepository::cleanShopifyCustomerId($shopifyCustomer->id ?? ''),
+            $shopifyCustomer->phone ?? '',
+            $shopifyCustomer->firstName ?? '',
+            $shopifyCustomer->lastName ?? '',
+            $addr !== null ? ($addr->company ?? '') : '',
+            $addr !== null ? ($addr->address1 ?? '') : '',
+            $addr !== null ? ($addr->zip ?? '') : '',
+        );
+        foreach ($values as $value) {
+            if (is_scalar($value) && trim((string) $value) !== '') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Review 4 couches — l'identité ne contient que l'identifiant client Shopify (rien d'autre n'est renseigné).
+     *
+     * @param  object $shopifyCustomer Identité client
+     * @return bool
+     */
+    private function customerIdentityHasOnlyShopifyId($shopifyCustomer)
+    {
+        if (CustomerLinkRepository::cleanShopifyCustomerId($shopifyCustomer->id ?? '') === '') {
+            return false;
+        }
+        $withoutId = clone $shopifyCustomer;
+        $withoutId->id = '';
+        return $this->customerIdentityIsEmpty($withoutId);
+    }
+
+    /**
+     * Review 4 couches (LOW) — message traduit (clé de langue du module), avec repli en anglais si les
+     * traductions ne sont pas chargées (webhook, cron) : l'identifiant technique reste dans le texte de repli.
+     *
+     * @param  string $key      Clé de langue
+     * @param  string $fallback Texte de repli
+     * @return string
+     */
+    private function translateOrFallback($key, $fallback, array $args = array())
+    {
+        global $langs;
+        if (isset($langs) && is_object($langs) && method_exists($langs, 'trans')) {
+            if (method_exists($langs, 'loadLangs')) {
+                $langs->loadLangs(array('doli2shop@doli2shop'));
+            }
+            $translated = (string) $langs->trans($key, ...$args);
+            if ($translated !== '' && $translated !== $key && strpos($translated, '[') !== 0) {
+                return $translated;
+            }
+        }
+        return empty($args) ? $fallback : vsprintf($fallback, $args);
+    }
+
+    /**
+     * Review 4 couches (MEDIUM M2) — Le tiers candidat est-il déjà lié à un AUTRE client Shopify de la même
+     * boutique (même entité) ? Alors il appartient à un autre compte (mère / fille, même fixe, même nom) :
+     * jamais retenu par heuristique. Sans identifiant client (guest) ou sans boutique, aucune exclusion.
+     *
+     * @param  int    $candidateSocId    Tiers candidat
+     * @param  string $shopifyCustomerId Identifiant client Shopify de la commande ('' = guest)
+     * @return bool
+     */
+    private function candidateLinkedToAnotherShopifyCustomer($candidateSocId, $shopifyCustomerId)
+    {
+        $shopifyCustomerId = CustomerLinkRepository::cleanShopifyCustomerId($shopifyCustomerId);
+        if ($shopifyCustomerId === '') {
+            return false;
+        }
+        $sql = "SELECT 1 FROM " . MAIN_DB_PREFIX . "doli2shop_customers WHERE fk_soc = " . (int) $candidateSocId
+            . " AND entity = " . (int) $this->entity
+            . " AND shopify_customer_id <> '" . $this->db->escape($shopifyCustomerId) . "'";
+        if ($this->getStoreId() > 0) {
+            $sql .= " AND fk_store = " . (int) $this->getStoreId();
+        }
+        $sql .= " LIMIT 1";
+        $resql = $this->db->query($sql);
+        if (!$resql) {
+            return false;
+        }
+        $linked = ((int) $this->db->num_rows($resql)) > 0;
+        $this->db->free($resql);
+        return $linked;
+    }
+
+    /**
+     * Story 66-6 — Construit l'identité client d'une commande depuis `customer`, puis
+     * `billingAddress`, puis `shippingAddress` (jamais depuis le seul e-mail : une commande passée
+     * avec le téléphone seul n'a ni customer.email ni order.email).
+     *
+     *  - e-mail : customer.email (ou defaultEmailAddress), sinon order.email (guest checkout) ;
+     *  - téléphone d'identité (R3) : customer.phone, customer.defaultPhoneNumber, billingAddress.phone,
+     *    customer.defaultAddress.phone — JAMAIS shippingAddress.phone (peut être celui d'un destinataire
+     *    de cadeau) ;
+     *  - nom : prénom/nom du customer, sinon de la facturation, sinon de la livraison ;
+     *  - adresse (et société) : customer.defaultAddress, sinon billingAddress, sinon shippingAddress ;
+     *  - noms de rapprochement (matchNames) : customer + facturation + société, jamais la livraison.
+     *
+     * Ne modifie pas $order (le customer d'origine n'est jamais muté).
+     *
+     * @param  object $order Commande Shopify (nœud GraphQL converti en objet)
+     * @return object|null Identité (propriétés id, email, firstName, lastName, phone, defaultAddress,
+     *                     emailMarketingConsent, orderName, countryCode, matchNames) ou null si
+     *                     aucune identité exploitable (R7)
+     */
+    private function buildOrderCustomerIdentity($order)
+    {
+        $asObject = function ($value) {
+            return (is_object($value)) ? $value : null;
+        };
+        $str = function ($obj, $prop) {
+            return ($obj !== null && isset($obj->$prop) && is_scalar($obj->$prop)) ? trim((string) $obj->$prop) : '';
+        };
+
+        $customer = $asObject($order->customer ?? null);
+        $billing = $asObject($order->billingAddress ?? null);
+        $shipping = $asObject($order->shippingAddress ?? null);
+        $customerAddress = $customer !== null ? $asObject($customer->defaultAddress ?? null) : null;
+
+        // E-mail
+        $email = $str($customer, 'email');
+        if ($email === '' && $customer !== null && isset($customer->defaultEmailAddress) && is_object($customer->defaultEmailAddress)) {
+            $email = $str($customer->defaultEmailAddress, 'emailAddress');
+        }
+        $emailFromOrder = false;
+        if ($email === '' && !empty($order->email) && is_scalar($order->email)) {
+            $email = trim((string) $order->email);
+            $emailFromOrder = ($email !== '');
+        }
+        if ($emailFromOrder) {
+            $this->log(
+                'processSingleOrderFromWebhook - Guest checkout détecté - email commande utilisé: ' . doli2shop_mask_email($email),
+                LOG_INFO
+            );
+        }
+
+        // Bloc adresse : customer.defaultAddress s'il contient quelque chose, sinon facturation, sinon livraison
+        $hasContent = function ($addr) use ($str) {
+            if ($addr === null) {
+                return false;
+            }
+            foreach (array('company', 'address1', 'zip', 'city') as $prop) {
+                if ($str($addr, $prop) !== '') {
+                    return true;
+                }
+            }
+            return false;
+        };
+        $addressSource = null;
+        foreach (array($customerAddress, $billing, $shipping) as $candidateAddress) {
+            if ($hasContent($candidateAddress)) {
+                $addressSource = $candidateAddress;
+                break;
+            }
+        }
+
+        // Nom : customer, puis facturation, puis livraison
+        $firstName = '';
+        $lastName = '';
+        foreach (array($customer, $billing, $shipping) as $nameSource) {
+            $first = $str($nameSource, 'firstName');
+            $last = $str($nameSource, 'lastName');
+            if ($first !== '' || $last !== '') {
+                $firstName = $first;
+                $lastName = $last;
+                break;
+            }
+        }
+
+        // Téléphone d'identité (R3) — jamais shippingAddress.phone
+        $phone = '';
+        $phoneCandidates = array(
+            $str($customer, 'phone'),
+            ($customer !== null && isset($customer->defaultPhoneNumber) && is_object($customer->defaultPhoneNumber)) ? $str($customer->defaultPhoneNumber, 'phoneNumber') : '',
+            $str($billing, 'phone'),
+            $str($customerAddress, 'phone'),
+        );
+        foreach ($phoneCandidates as $phoneCandidate) {
+            if ($phoneCandidate !== '') {
+                $phone = $phoneCandidate;
+                break;
+            }
+        }
+
+        $countryCode = '';
+        foreach (array($addressSource, $billing, $shipping, $customerAddress) as $countrySource) {
+            $code = $str($countrySource, 'countryCodeV2');
+            if ($code !== '') {
+                $countryCode = strtoupper($code);
+                break;
+            }
+        }
+
+        $identity = new \stdClass();
+        $identity->id = $str($customer, 'id');
+        $identity->email = $email;
+        $identity->firstName = $firstName;
+        $identity->lastName = $lastName;
+        $identity->phone = $phone;
+        $identity->emailMarketingConsent = ($customer !== null && isset($customer->emailMarketingConsent)) ? $customer->emailMarketingConsent : null;
+        $identity->orderName = $str($order, 'name');
+        $identity->countryCode = $countryCode;
+        $identity->defaultAddress = null;
+        if ($addressSource !== null) {
+            $identity->defaultAddress = (object) array(
+                'company' => $str($addressSource, 'company'),
+                'address1' => $str($addressSource, 'address1'),
+                'address2' => $str($addressSource, 'address2'),
+                'city' => $str($addressSource, 'city'),
+                'zip' => $str($addressSource, 'zip'),
+                'province' => $str($addressSource, 'province'),
+                'country' => $str($addressSource, 'country'),
+                'countryCodeV2' => $str($addressSource, 'countryCodeV2'),
+                'phone' => $phone,
+            );
+        }
+
+        // Noms servant au rapprochement : customer + facturation + société (jamais la livraison)
+        $matchNames = array();
+        foreach (array($customer, $billing) as $nameSource) {
+            $first = $str($nameSource, 'firstName');
+            $last = $str($nameSource, 'lastName');
+            if ($last !== '') {
+                $matchNames[] = $last;
+            }
+            if ($first !== '' && $last !== '') {
+                $matchNames[] = $first . ' ' . $last;
+            }
+        }
+        foreach (array($customerAddress, $billing) as $companySource) {
+            $company = $str($companySource, 'company');
+            if ($company !== '') {
+                $matchNames[] = $company;
+            }
+        }
+        $identity->matchNames = array_values(array_unique($matchNames));
+
+        // Personnes (prénom + nom, les DEUX exigés, review 4 couches M1) et sociétés servant au rapprochement par téléphone
+        $matchPersons = array();
+        foreach (array($customer, $billing) as $nameSource) {
+            $first = $str($nameSource, 'firstName');
+            $last = $str($nameSource, 'lastName');
+            if ($first !== '' && $last !== '') {
+                $matchPersons[$first . '|' . $last] = array('first' => $first, 'last' => $last);
+            }
+        }
+        $matchCompanies = array();
+        foreach (array($customerAddress, $billing) as $companySource) {
+            $company = $str($companySource, 'company');
+            if ($company !== '') {
+                $matchCompanies[] = $company;
+            }
+        }
+        $identity->matchPersons = array_values($matchPersons);
+        $identity->matchCompanies = array_values(array_unique($matchCompanies));
+
+        if ($this->customerIdentityIsEmpty($identity)) {
+            return null;
+        }
+
+        // Review 4 couches (LOW) : un client réduit à son seul identifiant Shopify (aucun e-mail, téléphone, nom ni
+        // adresse — typiquement « Protected customer data » refusé) n'est une identité QUE si un lien existe déjà ;
+        // sinon on créerait un tiers vide « Client Shopify #n » : même rejet explicite que « aucune identité » (D1).
+        if ($this->customerIdentityHasOnlyShopifyId($identity)
+            && $this->customerLinks()->findThirdpartyId($this->getStoreId(), $identity->id) <= 0) {
+            $this->log("buildOrderCustomerIdentity - identité réduite à l'identifiant client Shopify sans lien existant : traitée comme aucune identité", LOG_WARNING);
+            return null;
+        }
+        return $identity;
+    }
+
+    /**
+     * Story 66-6 (D4/D6) — Le tiers candidat porte-t-il déjà un AUTRE e-mail non vide que celui de la commande ?
+     *
+     * @param  string $candidateEmail E-mail du tiers candidat
+     * @param  string $incomingEmail  E-mail de la commande ('' si absent)
+     * @return bool
+     */
+    private function candidateHasConflictingEmail($candidateEmail, $incomingEmail)
+    {
+        $candidateEmail = strtolower(trim((string) $candidateEmail));
+        $incomingEmail = strtolower(trim((string) $incomingEmail));
+        return $candidateEmail !== '' && $incomingEmail !== '' && $candidateEmail !== $incomingEmail;
+    }
+
+    /**
+     * Story 66-6 (R4) — Le code postal ET la ligne d'adresse du tiers candidat coïncident-ils avec
+     * ceux de la commande ? Les deux doivent être non vides.
+     *
+     * @param  object $shopifyCustomer Identité client
+     * @param  object $candidateRow    Ligne llx_societe (zip, address)
+     * @return bool
+     */
+    private function candidateAddressMatches($shopifyCustomer, $candidateRow)
+    {
+        $addr = (isset($shopifyCustomer->defaultAddress) && is_object($shopifyCustomer->defaultAddress)) ? $shopifyCustomer->defaultAddress : null;
+        if ($addr === null) {
+            return false;
+        }
+        $zip = strtoupper(str_replace(' ', '', trim((string) ($addr->zip ?? ''))));
+        $street = doli2shop_fold_text(trim((string) ($addr->address1 ?? '') . ' ' . (string) ($addr->address2 ?? '')));
+        $candidateZip = strtoupper(str_replace(' ', '', trim((string) ($candidateRow->zip ?? ''))));
+        $candidateStreet = doli2shop_fold_text(str_replace(array("\r", "\n"), ' ', (string) ($candidateRow->address ?? '')));
+        return $zip !== '' && $street !== '' && $zip === $candidateZip && $street === $candidateStreet;
+    }
+
+    /**
+     * Story 66-6 (R3/D4/D6) — Rapprochement par téléphone normalisé : SEULEMENT si exactement UN tiers
+     * porte ce numéro ET que son nom est compatible (nom de famille / société). Un candidat portant un
+     * autre e-mail exige en plus la concordance d'adresse (D6). En cas de doute : null (création).
+     *
+     * @param  object $shopifyCustomer Identité client
+     * @param  string $phoneKey        Clé téléphone normalisée ('' = non comparable, rien n'est tenté)
+     * @param  string $email           E-mail de la commande ('' si absent)
+     * @return int  rowid du tiers retrouvé, 0 sinon
+     */
+    private function findThirdpartyByPhone($shopifyCustomer, $phoneKey, $email)
+    {
+        $suffix = doli2shop_phone_sql_suffix($phoneKey);
+        if ($phoneKey === '' || $suffix === '') {
+            $this->log("createOrUpdateCustomer - critère=phone ignoré (téléphone absent ou non comparable)", LOG_DEBUG);
+            return 0;
+        }
+        $countryCode = (string) ($shopifyCustomer->countryCode ?? '');
+        // $this->db->query() direct, pas SqlUtils::executeQuery() : ce dernier journalise, en plus, la requête ET
+        // ses paramètres dans le journal DU MODULE (AC12). Limite assumée : DoliDB::query() du cœur journalise
+        // lui-même « sql=… » en DEBUG dans dolibarr.log (journal général, hors du périmètre de l'AC12).
+        $sql = "SELECT s.rowid, s.nom, s.email, s.address, s.zip, s.phone FROM " . MAIN_DB_PREFIX . "societe s"
+            . " WHERE s.entity = " . (int) $this->entity . " AND s.status = 1 AND s.client IN (1, 2, 3)"
+            . " AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(s.phone, ' ', ''), '.', ''), '-', ''), '(', ''), ')', ''), '/', '')"
+            . " LIKE '%" . $this->db->escape($suffix) . "'";
+        $resql = $this->db->query($sql);
+        if (!$resql) {
+            $this->log("createOrUpdateCustomer - critère=phone erreur SQL: " . $this->db->lasterror(), LOG_WARNING);
+            return 0;
+        }
+        $confirmed = array();
+        $rowCount = (int) $this->db->num_rows($resql);
+        for ($rowIndex = 0; $rowIndex < $rowCount; $rowIndex++) {
+            $row = $this->db->fetch_object($resql);
+            if (!$row) {
+                break;
+            }
+            if (doli2shop_normalize_phone($row->phone ?? '', $countryCode) === $phoneKey
+                && !$this->candidateLinkedToAnotherShopifyCustomer($row->rowid, (string) ($shopifyCustomer->id ?? ''))) {
+                $confirmed[] = $row;
+            }
+        }
+        $this->db->free($resql);
+
+        if (count($confirmed) !== 1) {
+            $this->log("createOrUpdateCustomer - critère=phone candidats=" . count($confirmed) . " : aucun rattachement (un seul tiers exigé)", LOG_DEBUG);
+            return 0;
+        }
+        $candidate = $confirmed[0];
+        // Prénom ET nom exigés (review 4 couches M1) ; société : égalité / inclusion en mots entiers
+        $nameCompatible = false;
+        foreach ((array) ($shopifyCustomer->matchPersons ?? array()) as $person) {
+            if (doli2shop_person_matches_thirdparty_name($person['first'], $person['last'], $candidate->nom ?? '')) {
+                $nameCompatible = true;
+                break;
+            }
+        }
+        if (!$nameCompatible) {
+            foreach ((array) ($shopifyCustomer->matchCompanies ?? array()) as $company) {
+                if (doli2shop_person_names_compatible($company, $candidate->nom ?? '')) {
+                    $nameCompatible = true;
+                    break;
+                }
+            }
+        }
+        if (!$nameCompatible) {
+            $this->log("createOrUpdateCustomer - critère=phone 1 candidat mais nom incompatible : aucun rattachement", LOG_DEBUG);
+            return 0;
+        }
+        if ($this->candidateHasConflictingEmail($candidate->email ?? '', $email) && !$this->candidateAddressMatches($shopifyCustomer, $candidate)) {
+            $this->log("createOrUpdateCustomer - critère=phone candidat avec un autre e-mail et adresse différente (D6) : aucun rattachement", LOG_DEBUG);
+            return 0;
+        }
+        return (int) $candidate->rowid;
+    }
+
+    /**
+     * Story 66-6 (R4) — Rapprochement par nom + code postal + adresse : les TROIS doivent coïncider
+     * et un seul tiers doit répondre. Jamais sur le nom seul, ni nom + code postal.
+     *
+     * @param  object $shopifyCustomer Identité client
+     * @return int  rowid du tiers retrouvé, 0 sinon
+     */
+    private function findThirdpartyByNameAndAddress($shopifyCustomer)
+    {
+        $addr = (isset($shopifyCustomer->defaultAddress) && is_object($shopifyCustomer->defaultAddress)) ? $shopifyCustomer->defaultAddress : null;
+        $zip = $addr !== null ? trim((string) ($addr->zip ?? '')) : '';
+        $street = $addr !== null ? doli2shop_fold_text(trim((string) ($addr->address1 ?? '') . ' ' . (string) ($addr->address2 ?? ''))) : '';
+        $matchNames = (array) ($shopifyCustomer->matchNames ?? array());
+        if ($zip === '' || $street === '' || empty($matchNames)) {
+            $this->log("createOrUpdateCustomer - critère=name_addr ignoré (nom, code postal ou adresse manquant)", LOG_DEBUG);
+            return 0;
+        }
+        // $this->db->query() direct (voir findThirdpartyByPhone) : rien dans le journal du module ; le cœur journalise le SQL en DEBUG.
+        $sql = "SELECT s.rowid, s.nom, s.email, s.address, s.zip FROM " . MAIN_DB_PREFIX . "societe s"
+            . " WHERE s.entity = " . (int) $this->entity . " AND s.status = 1 AND s.client IN (1, 2, 3)"
+            . " AND s.zip = '" . $this->db->escape($zip) . "'";
+        $resql = $this->db->query($sql);
+        if (!$resql) {
+            $this->log("createOrUpdateCustomer - critère=name_addr erreur SQL: " . $this->db->lasterror(), LOG_WARNING);
+            return 0;
+        }
+        $matches = array();
+        $rowCount = (int) $this->db->num_rows($resql);
+        for ($rowIndex = 0; $rowIndex < $rowCount; $rowIndex++) {
+            $row = $this->db->fetch_object($resql);
+            if (!$row) {
+                break;
+            }
+            if (!$this->candidateAddressMatches($shopifyCustomer, $row)
+                || $this->candidateLinkedToAnotherShopifyCustomer($row->rowid, (string) ($shopifyCustomer->id ?? ''))) {
+                continue;
+            }
+            foreach ($matchNames as $matchName) {
+                if (doli2shop_person_names_equal($matchName, $row->nom ?? '')) {
+                    $matches[] = $row;
+                    break;
+                }
+            }
+        }
+        $this->db->free($resql);
+
+        if (count($matches) !== 1) {
+            $this->log("createOrUpdateCustomer - critère=name_addr candidats=" . count($matches) . " : aucun rattachement (un seul tiers exigé)", LOG_DEBUG);
+            return 0;
+        }
+        return (int) $matches[0]->rowid;
+    }
+
+    /**
+     * Story 66-6 (AC11) — Cause explicite d'un échec de création/mise à jour d'un tiers SANS e-mail
+     * quand le réglage Dolibarr SOCIETE_EMAIL_MANDATORY est actif (au lieu du générique « Failed to
+     * create/update customer »).
+     *
+     * @param  string $email E-mail que le tiers portera ('' si absent)
+     * @return string Message de cause, '' si le réglage n'est pas en cause
+     */
+    private function emailMandatoryCause($email)
+    {
+        if (trim((string) $email) !== '' || !getDolGlobalInt('SOCIETE_EMAIL_MANDATORY')) {
+            return '';
+        }
+        return $this->translateOrFallback(
+            'ShopifyCustomerEmailMandatoryCause',
+            "The Dolibarr option SOCIETE_EMAIL_MANDATORY (Setup > Third parties) requires an e-mail for every third party, "
+            . "but this Shopify customer has none (order placed with a phone number only): disable this option, "
+            . "or enter the customer's e-mail in Shopify."
+        );
+    }
+
     private function createOrUpdateCustomer($shopifyCustomer)
     {
         global $user;
-        $this->log("Creating or updating customer: " . (isset($shopifyCustomer->email) ? doli2shop_mask_email($shopifyCustomer->email) : 'unknown'), LOG_DEBUG);
+        $this->lastCustomerFailureReason = '';
 
-        // Advisory lock pour empêcher la création concurrente du même client
-        $customerEmail = isset($shopifyCustomer->email) ? $shopifyCustomer->email : '';
-        $lockName = 'doli2shop_customer_' . $this->entity . '_' . md5($customerEmail);
+        $customerEmail = trim((string) ($shopifyCustomer->email ?? ''));
+        $shopifyCustomerId = CustomerLinkRepository::cleanShopifyCustomerId($shopifyCustomer->id ?? '');
+        $customerPhone = trim((string) ($shopifyCustomer->phone ?? ''));
+        $addressBlock = (isset($shopifyCustomer->defaultAddress) && is_object($shopifyCustomer->defaultAddress)) ? $shopifyCustomer->defaultAddress : null;
+        $phoneCountryCode = (string) ($shopifyCustomer->countryCode ?? ($addressBlock->countryCodeV2 ?? ''));
+        $phoneKey = doli2shop_normalize_phone($customerPhone, $phoneCountryCode);
+
+        $this->log("Creating or updating customer: " . ($customerEmail !== '' ? doli2shop_mask_email($customerEmail) : 'no-email')
+            . ($shopifyCustomerId !== '' ? " (ID Shopify: {$shopifyCustomerId})" : ''), LOG_DEBUG);
+
+        // N5 : défense en profondeur — jamais de requête sur un e-mail vide, jamais de tiers sans aucune identité
+        if ($this->customerIdentityIsEmpty($shopifyCustomer)) {
+            $this->lastCustomerFailureReason = "no customer identity";
+            $this->log("createOrUpdateCustomer - aucune identité client (ni e-mail, ni id Shopify, ni nom, ni téléphone, ni adresse) : aucun tiers créé", LOG_ERR);
+            return -1;
+        }
+
+        // Advisory lock pour empêcher la création concurrente du même client (clé : voir buildCustomerLockName())
+        $identityText = doli2shop_fold_text(trim((string) ($shopifyCustomer->firstName ?? '') . ' ' . (string) ($shopifyCustomer->lastName ?? '') . ' ' . (string) ($addressBlock->company ?? '')))
+            . '|' . doli2shop_fold_text((string) ($addressBlock->zip ?? ''));
+        $lockName = $this->buildCustomerLockName($customerEmail, $shopifyCustomerId, $phoneKey, $identityText);
         $lockResult = $this->db->query("SELECT GET_LOCK('" . $this->db->escape($lockName) . "', 10) as locked");
         $lockObj = $this->db->fetch_object($lockResult);
         if (!$lockObj || $lockObj->locked != 1) {
-            $this->log("createOrUpdateCustomer - Cannot acquire lock for customer " . doli2shop_mask_email($customerEmail) . ", another process is creating it", LOG_WARNING);
+            $this->log("createOrUpdateCustomer - Cannot acquire lock for customer " . ($customerEmail !== '' ? doli2shop_mask_email($customerEmail) : 'no-email') . ", another process is creating it", LOG_WARNING);
             return -1;
         }
 
         try {
             $soc = new Societe($this->db);
+            // Critère ayant retrouvé le tiers : email | id_link | phone | name_addr ; 'created' si aucun
+            $criterion = 'created';
 
-            // Recherche par email vérifié avec filtre entité
-            $sql = "SELECT rowid FROM " . MAIN_DB_PREFIX . "societe WHERE email = ? AND entity = ?";
-            $resql = SqlUtils::executeQuery($this->db, $sql, "checking customer email", false, [$shopifyCustomer->email, $this->entity]);
+            // 1. E-mail (comportement historique, requête inchangée). Jamais de requête sur un e-mail vide (N5).
+            if ($customerEmail !== '') {
+                $sql = "SELECT rowid FROM " . MAIN_DB_PREFIX . "societe WHERE email = ? AND entity = ?";
+                $resql = SqlUtils::executeQuery($this->db, $sql, "checking customer email", false, [$customerEmail, $this->entity]);
 
-            if ($resql && $this->db->num_rows($resql) > 0) {
-                $this->log("Client existant trouvé par email dans entity " . $this->entity, LOG_DEBUG);
-                $obj = $this->db->fetch_object($resql);
-                $fetchResult = $soc->fetch($obj->rowid);
-                if ($fetchResult <= 0) {
-                    $this->log("Erreur fetch société ID " . $obj->rowid . ": " . $soc->error, LOG_ERR);
-                    throw new Exception("Impossible de charger la société ID " . $obj->rowid);
+                if ($resql && $this->db->num_rows($resql) > 0) {
+                    $this->log("Client existant trouvé par email dans entity " . $this->entity, LOG_DEBUG);
+                    $obj = $this->db->fetch_object($resql);
+                    $fetchResult = $soc->fetch($obj->rowid);
+                    if ($fetchResult <= 0) {
+                        $this->log("Erreur fetch société ID " . $obj->rowid . ": " . $soc->error, LOG_ERR);
+                        throw new Exception("Impossible de charger la société ID " . $obj->rowid);
+                    }
+                    $this->log("Client chargé avec succès: ID=" . $soc->id . ", Email=" . doli2shop_mask_email($soc->email) . ", Entity=" . $this->entity, LOG_DEBUG);
+                    $this->db->free($resql);
+                    $criterion = 'email';
+                } elseif ($resql) {
+                    $this->log("Aucun client existant trouvé pour email " . doli2shop_mask_email($customerEmail) . " dans entity " . $this->entity, LOG_DEBUG);
+                    $this->db->free($resql);
+                } else {
+                    $this->log("Erreur SQL lors recherche client: " . $this->db->lasterror(), LOG_ERR);
                 }
-                $this->log("Client chargé avec succès: ID=" . $soc->id . ", Email=" . doli2shop_mask_email($soc->email) . ", Entity=" . $this->entity, LOG_DEBUG);
-                $this->db->free($resql);
-            } elseif ($resql) {
-                $this->log("Aucun client existant trouvé pour email " . doli2shop_mask_email($shopifyCustomer->email) . " dans entity " . $this->entity, LOG_DEBUG);
-                $this->db->free($resql);
-            } else {
-                $this->log("Erreur SQL lors recherche client: " . $this->db->lasterror(), LOG_ERR);
             }
 
-            // Mise à jour des données
-            // CORRECTION v2.1.5: Priorité au champ "company" si fourni par le client
-            // v2.1.6-fix: Ignorer company si c'est juste une civilité
-            $civilityTerms = array('madame', 'mme', 'mme.', 'monsieur', 'mr', 'mr.', 'm.', 'mademoiselle', 'mlle', 'mlle.', 'ms', 'ms.', 'mrs', 'mrs.');
-            $companyValue = !empty($shopifyCustomer->defaultAddress->company) ? trim($shopifyCustomer->defaultAddress->company) : '';
-            $companyIsJustCivility = in_array(strtolower($companyValue), $civilityTerms);
+            // 2. Lien id client Shopify -> tiers (seulement si l'e-mail n'a rien trouvé)
+            if ($soc->id <= 0 && $shopifyCustomerId !== '') {
+                $linkedSocId = $this->customerLinks()->findThirdpartyId($this->getStoreId(), $shopifyCustomerId);
+                if ($linkedSocId > 0) {
+                    $linkedSoc = new Societe($this->db);
+                    if ($linkedSoc->fetch($linkedSocId) > 0 && (int) ($linkedSoc->status ?? 1) === 0) {
+                        // Voie prudente (review 4 couches) : un tiers lié mais FERMÉ n'est pas réactivé ni réutilisé ;
+                        // on poursuit (les heuristiques excluent aussi les tiers fermés) et un nouveau tiers est créé,
+                        // auquel le lien est ensuite re-pointé (upsert). Journalisé.
+                        $this->log("createOrUpdateCustomer - critère=id_link tiers " . $linkedSocId . " fermé : non réutilisé", LOG_WARNING);
+                    } elseif ($linkedSoc->id > 0) {
+                        $soc = $linkedSoc;
+                        $criterion = 'id_link';
+                    } else {
+                        $this->log("createOrUpdateCustomer - critère=id_link tiers " . $linkedSocId . " introuvable : lien ignoré", LOG_WARNING);
+                    }
+                } else {
+                    $this->log("createOrUpdateCustomer - critère=id_link aucun lien pour l'ID Shopify " . $shopifyCustomerId, LOG_DEBUG);
+                }
+            }
 
-            if (!empty($companyValue) && !$companyIsJustCivility) {
-                // Priorité 1 : Company si fourni ET pas juste une civilité
-                $soc->name = $companyValue;
-                $this->log("Client créé/màj avec company: " . doli2shop_mask_name($soc->name) . " (ID Shopify: {$shopifyCustomer->id})", LOG_INFO);
+            // 3. Téléphone, puis 4. nom + code postal + adresse (D3 : aussi quand l'e-mail ne trouve rien)
+            if ($soc->id <= 0) {
+                $heuristicSocId = $this->findThirdpartyByPhone($shopifyCustomer, $phoneKey, $customerEmail);
+                $heuristicCriterion = 'phone';
+                if ($heuristicSocId <= 0) {
+                    $heuristicSocId = $this->findThirdpartyByNameAndAddress($shopifyCustomer);
+                    $heuristicCriterion = 'name_addr';
+                }
+                if ($heuristicSocId > 0) {
+                    $heuristicSoc = new Societe($this->db);
+                    if ($heuristicSoc->fetch($heuristicSocId) > 0) {
+                        $soc = $heuristicSoc;
+                        $criterion = $heuristicCriterion;
+                    } else {
+                        $this->log("createOrUpdateCustomer - critère=" . $heuristicCriterion . " tiers " . $heuristicSocId . " introuvable : ignoré", LOG_WARNING);
+                    }
+                }
+            }
+            $isHeuristicMatch = ($criterion === 'phone' || $criterion === 'name_addr');
+            $this->log("createOrUpdateCustomer - critère retenu=" . $criterion . ($soc->id > 0 ? " socid=" . $soc->id : ''), LOG_INFO);
+
+            // Données du client Shopify
+            $civilityTerms = array('madame', 'mme', 'mme.', 'monsieur', 'mr', 'mr.', 'm.', 'mademoiselle', 'mlle', 'mlle.', 'ms', 'ms.', 'mrs', 'mrs.');
+            $companyValue = !empty($addressBlock->company) ? trim($addressBlock->company) : '';
+            $companyIsJustCivility = in_array(strtolower($companyValue), $civilityTerms);
+            $hasValidCompany = !empty($companyValue) && !$companyIsJustCivility;
+
+            $firstName = trim((string) ($shopifyCustomer->firstName ?? ''));
+            $lastName = trim((string) ($shopifyCustomer->lastName ?? ''));
+            if (in_array(strtolower($firstName), $civilityTerms)) {
+                $this->log("Civilité détectée dans firstName: '$firstName' - ignorée", LOG_INFO);
+                $firstName = '';
+            }
+            if (in_array(strtolower($lastName), $civilityTerms)) {
+                $this->log("Civilité détectée dans lastName: '$lastName' - ignorée", LOG_INFO);
+                $lastName = '';
+            }
+
+            $addressLine = $addressBlock !== null ? implode("\n", array_filter([
+                (string) ($addressBlock->address1 ?? ''),
+                (string) ($addressBlock->address2 ?? '')
+            ])) : '';
+            $zipValue = $addressBlock !== null ? trim((string) ($addressBlock->zip ?? '')) : '';
+            $townValue = $addressBlock !== null ? trim((string) ($addressBlock->city ?? '')) : '';
+            $stateValue = $addressBlock !== null ? trim((string) ($addressBlock->province ?? '')) : '';
+            $countryCode = '';
+            $countryInfo = null;
+            if ($addressBlock !== null) {
+                $countryCode = isset($addressBlock->countryCodeV2) && $addressBlock->countryCodeV2 !== '' ?
+                    $addressBlock->countryCodeV2 :
+                    (!empty($addressBlock->country) ? $this->mapCountryNameToCode($addressBlock->country) : '');
+                if ($countryCode !== '') {
+                    $countryInfo = getCountry($countryCode, 'all', $this->db);
+                }
+            }
+
+            $changedByHeuristic = false;
+            if ($isHeuristicMatch) {
+                // R5 : un tiers retrouvé par heuristique n'est JAMAIS réécrit — seuls les champs vides se remplissent.
+                // Ni nom, ni typent, ni code client, ni consentement marketing.
+                if (empty($soc->phone) && $customerPhone !== '') {
+                    $soc->phone = $customerPhone;
+                    $changedByHeuristic = true;
+                }
+                if ($customerEmail !== '') {
+                    if (empty($soc->email)) {
+                        $soc->email = $customerEmail;
+                        $changedByHeuristic = true;
+                    } elseif ($this->candidateHasConflictingEmail($soc->email, $customerEmail)) {
+                        $this->log("createOrUpdateCustomer - email_conflict : le tiers " . $soc->id . " porte déjà un autre e-mail (" . doli2shop_mask_email($soc->email) . " / " . doli2shop_mask_email($customerEmail) . "), e-mail conservé", LOG_INFO);
+                    }
+                }
+                if (empty($soc->address) && $addressLine !== '') {
+                    $soc->address = $addressLine;
+                    $changedByHeuristic = true;
+                }
+                if (empty($soc->zip) && $zipValue !== '') {
+                    $soc->zip = $zipValue;
+                    $changedByHeuristic = true;
+                }
+                if (empty($soc->town) && $townValue !== '') {
+                    $soc->town = $townValue;
+                    $changedByHeuristic = true;
+                }
+                if (empty($soc->country_id) && is_array($countryInfo)) {
+                    $soc->country_id = $countryInfo['id'];
+                    $soc->country_code = $countryInfo['code'];
+                    $changedByHeuristic = true;
+                }
             } else {
+                // Nom : société > prénom + nom > nom déjà connu du tiers > « Client Shopify #n » (jamais l'e-mail, R6/N3)
+                $realName = $hasValidCompany ? $companyValue : trim($firstName . ' ' . $lastName);
                 if ($companyIsJustCivility) {
                     $this->log("Company ignoré car civilité détectée: '$companyValue'", LOG_INFO);
                 }
-                // Fallback : firstName + lastName (en nettoyant les civilités)
-                $firstName = trim($shopifyCustomer->firstName);
-                $lastName = trim($shopifyCustomer->lastName);
-
-                // Nettoyer civilités du prénom/nom
-                if (in_array(strtolower($firstName), $civilityTerms)) {
-                    $this->log("Civilité détectée dans firstName: '$firstName' - ignorée", LOG_INFO);
-                    $firstName = '';
-                }
-                if (in_array(strtolower($lastName), $civilityTerms)) {
-                    $this->log("Civilité détectée dans lastName: '$lastName' - ignorée", LOG_INFO);
-                    $lastName = '';
+                if ($realName !== '') {
+                    $soc->name = $realName;
+                    $this->log("Client créé/màj avec " . ($hasValidCompany ? "company: " : "firstName+lastName: ") . doli2shop_mask_name($soc->name) . " (ID Shopify: {$shopifyCustomerId})", LOG_DEBUG);
+                } elseif (empty($soc->name)) {
+                    $soc->name = $this->buildFallbackCustomerName($shopifyCustomer);
+                    $this->log("Nom vide après nettoyage civilités, utilisation du libellé de repli: " . $soc->name, LOG_WARNING);
                 }
 
-                $soc->name = trim($firstName . ' ' . $lastName);
+                // v2.2.0: Auto-positionnement type de tiers B2B/B2C
+                $typentWithCompany = $this->storeSettings->getInt($this->getStoreId(), 'TYPENT_WITH_COMPANY', 0);
+                $typentWithoutCompany = $this->storeSettings->getInt($this->getStoreId(), 'TYPENT_WITHOUT_COMPANY', 0);
+                $configTypentId = $hasValidCompany ? $typentWithCompany : $typentWithoutCompany;
 
-                // Si le nom est vide après nettoyage, utiliser l'email
-                if (empty($soc->name)) {
-                    $soc->name = $shopifyCustomer->email;
-                    $this->log("Nom vide après nettoyage civilités, utilisation email: " . doli2shop_mask_email($soc->name), LOG_WARNING);
-                } else {
-                    $this->log("Client créé/màj avec firstName+lastName: " . doli2shop_mask_name($soc->name) . " (ID Shopify: {$shopifyCustomer->id})", LOG_DEBUG);
+                if ($configTypentId > 0 && $soc->id <= 0) {
+                    $soc->typent_id = $configTypentId;
+                    $this->log("createOrUpdateCustomer - Customer type set to typent_id=" . $configTypentId
+                        . " (" . ($hasValidCompany ? "company detected: " . doli2shop_mask_name($companyValue) : "no company") . ")", LOG_INFO);
+                } elseif ($configTypentId > 0 && $soc->id > 0) {
+                    $this->log("createOrUpdateCustomer - Existing customer, skipping typent_id assignment (current typent_id=" . $soc->typent_id . ")", LOG_DEBUG);
                 }
-            }
 
-            // v2.2.0: Auto-positionnement type de tiers B2B/B2C
-            $hasValidCompany = !empty($companyValue) && !$companyIsJustCivility;
-            $typentWithCompany = $this->storeSettings->getInt($this->getStoreId(), 'TYPENT_WITH_COMPANY', 0);
-            $typentWithoutCompany = $this->storeSettings->getInt($this->getStoreId(), 'TYPENT_WITHOUT_COMPANY', 0);
-            $configTypentId = $hasValidCompany ? $typentWithCompany : $typentWithoutCompany;
+                // N2 : jamais écraser une valeur existante par du vide (e-mail, téléphone, adresse)
+                if ($customerEmail !== '') {
+                    $soc->email = $customerEmail;
+                }
+                if ($customerPhone !== '') {
+                    $soc->phone = $customerPhone;
+                }
+                $soc->client = 1;
 
-            if ($configTypentId > 0 && $soc->id <= 0) {
-                $soc->typent_id = $configTypentId;
-                $this->log("createOrUpdateCustomer - Customer type set to typent_id=" . $configTypentId
-                    . " (" . ($hasValidCompany ? "company detected: " . doli2shop_mask_name($companyValue) : "no company") . ")", LOG_INFO);
-            } elseif ($configTypentId > 0 && $soc->id > 0) {
-                $this->log("createOrUpdateCustomer - Existing customer, skipping typent_id assignment (current typent_id=" . $soc->typent_id . ")", LOG_DEBUG);
-            }
+                // CORRECTION v2.0.31: Génération adaptative code client selon modèle Dolibarr
+                $this->setClientCode($soc, $shopifyCustomer);
 
-            $soc->email = $shopifyCustomer->email;
-            $soc->phone = $shopifyCustomer->phone;
-            $soc->client = 1;
+                if ($addressBlock !== null) {
+                    if ($addressLine !== '') {
+                        $soc->address = $addressLine;
+                    }
+                    if ($zipValue !== '') {
+                        $soc->zip = $zipValue;
+                    }
+                    if ($townValue !== '') {
+                        $soc->town = $townValue;
+                    }
+                    if ($stateValue !== '') {
+                        $soc->state = $stateValue;
+                    }
+                    if ($countryCode !== '') {
+                        if (is_array($countryInfo)) {
+                            $soc->country_id = $countryInfo['id'];
+                            $soc->country_code = $countryInfo['code'];
+                        } else {
+                            $this->log("Pays non trouvé pour le code: " . $countryCode, LOG_WARNING);
+                            $soc->country_id = 0;
+                            $soc->country_code = $countryCode;
+                        }
+                    }
+                }
 
-            // CORRECTION v2.0.31: Génération adaptative code client selon modèle Dolibarr
-            $this->setClientCode($soc, $shopifyCustomer);
-
-            if ($shopifyCustomer->defaultAddress) {
-                $soc->address = implode("\n", array_filter([
-                    $shopifyCustomer->defaultAddress->address1,
-                    $shopifyCustomer->defaultAddress->address2
-                ]));
-                $soc->zip = $shopifyCustomer->defaultAddress->zip;
-                $soc->town = $shopifyCustomer->defaultAddress->city;
-                $soc->state = $shopifyCustomer->defaultAddress->province;
-                $soc->phone = $shopifyCustomer->defaultAddress->phone;
-
-                // Gestion du pays avec getCountry()
-                $countryCode = isset($shopifyCustomer->defaultAddress->countryCodeV2) ?
-                    $shopifyCustomer->defaultAddress->countryCodeV2 :
-                    $countryCode = isset($shopifyCustomer->defaultAddress->countryCodeV2) ?
-                    $shopifyCustomer->defaultAddress->countryCodeV2 :
-                    $this->mapCountryNameToCode($shopifyCustomer->defaultAddress->country);
-                $countryInfo = getCountry($countryCode, 'all', $this->db);
-
-                if (is_array($countryInfo)) {
-                    $soc->country_id = $countryInfo['id'];
-                    $soc->country_code = $countryInfo['code'];
-                } else {
-                    $this->log("Pays non trouvé pour le code: " . $countryCode, LOG_WARNING);
-                    $soc->country_id = 0;
-                    $soc->country_code = $countryCode;
+                // FIX v2.0.36: Mapping consentement marketing Shopify → Dolibarr natif "Refuser les e-mails de masse"
+                // Shopify marketingState: SUBSCRIBED, UNSUBSCRIBED, NOT_SUBSCRIBED, PENDING, etc.
+                if (isset($shopifyCustomer->emailMarketingConsent) && isset($shopifyCustomer->emailMarketingConsent->marketingState)) {
+                    $marketingState = $shopifyCustomer->emailMarketingConsent->marketingState;
+                    // Si client SUBSCRIBED = accepte emails (no_email = 0), sinon refuse emails (no_email = 1)
+                    $noEmail = ($marketingState === 'SUBSCRIBED') ? 0 : 1;
+                    $soc->setNoEmail($noEmail);
+                    $this->log("Consentement marketing Shopify: " . $marketingState . " → no_email=" . $noEmail, LOG_DEBUG);
                 }
             }
 
-            // FIX v2.0.36: Mapping consentement marketing Shopify → Dolibarr natif "Refuser les e-mails de masse"
-            // Shopify marketingState: SUBSCRIBED, UNSUBSCRIBED, NOT_SUBSCRIBED, PENDING, etc.
-            if (isset($shopifyCustomer->emailMarketingConsent) && isset($shopifyCustomer->emailMarketingConsent->marketingState)) {
-                $marketingState = $shopifyCustomer->emailMarketingConsent->marketingState;
-                // Si client SUBSCRIBED = accepte emails (no_email = 0), sinon refuse emails (no_email = 1)
-                $noEmail = ($marketingState === 'SUBSCRIBED') ? 0 : 1;
-                $soc->setNoEmail($noEmail);
-                $this->log("Consentement marketing Shopify: " . $marketingState . " → no_email=" . $noEmail, LOG_DEBUG);
-            }
             // LOGS v2.0.30: Informations avant création/mise à jour
             global $user;
             $operation = ($soc->id > 0) ? "mise à jour" : "création";
             $this->log("Tentative " . $operation . " société: " . doli2shop_mask_name($soc->name) . " (email: " . doli2shop_mask_email($soc->email) . ")", LOG_INFO);
             $this->log("Contexte utilisateur: ID=" . $user->id . " (" . $user->login . "), Entity=" . $this->entity, LOG_DEBUG);
-            
+
+            // AC11 : réglage Dolibarr « e-mail obligatoire » + client sans e-mail → cause explicite, pas le générique
+            $mandatoryCause = ($soc->id <= 0 || !$isHeuristicMatch) ? $this->emailMandatoryCause($soc->email) : '';
+            if ($mandatoryCause !== '' && $soc->id <= 0) {
+                $this->lastCustomerFailureReason = $mandatoryCause;
+                throw new Exception($mandatoryCause);
+            }
+
             // Création ou mise à jour
             if ($soc->id > 0) {
-                // FIX v2.0.36: Contourner bug Dolibarr avec extrafields vides
-                // L'erreur peut être une exception directe au lieu d'un code retour
-                try {
-                    $result = $soc->update(0, $user);
+                if ($isHeuristicMatch && !$changedByHeuristic) {
+                    // Rien à remplir : aucune écriture sur un tiers retrouvé par heuristique
+                    $result = 1;
+                } else {
+                    // FIX v2.0.36: Contourner bug Dolibarr avec extrafields vides
+                    // L'erreur peut être une exception directe au lieu d'un code retour
+                    try {
+                        $result = $soc->update(0, $user);
 
-                    // Vérifier également si erreur dans $soc->error sans exception
-                    if ($result < 0 && strpos($soc->error, 'llx_societe_extrafields SET') !== false && strpos($soc->error, 'WHERE fk_object') !== false) {
-                        $this->log("Bug Dolibarr extrafields vides (code retour) ignoré pour société ID=" . $soc->id, LOG_WARNING);
-                        $result = 1; // Considérer comme succès
-                        $soc->error = ''; // Effacer l'erreur
-                    }
-                } catch (Exception $e) {
-                    // Vérifier si c'est l'erreur SQL extrafields vides
-                    $errorMsg = $e->getMessage();
-                    if (strpos($errorMsg, 'llx_societe_extrafields SET') !== false && strpos($errorMsg, 'WHERE fk_object') !== false) {
-                        $this->log("Bug Dolibarr extrafields vides (exception) ignoré pour société ID=" . $soc->id . " - Exception: " . $errorMsg, LOG_WARNING);
-                        $result = 1; // Considérer comme succès car la société existe déjà
-                    } else {
-                        // Autre exception, la relancer
-                        throw $e;
+                        // Vérifier également si erreur dans $soc->error sans exception
+                        if ($result < 0 && strpos($soc->error, 'llx_societe_extrafields SET') !== false && strpos($soc->error, 'WHERE fk_object') !== false) {
+                            $this->log("Bug Dolibarr extrafields vides (code retour) ignoré pour société ID=" . $soc->id, LOG_WARNING);
+                            $result = 1; // Considérer comme succès
+                            $soc->error = ''; // Effacer l'erreur
+                        }
+                    } catch (Exception $e) {
+                        // Vérifier si c'est l'erreur SQL extrafields vides
+                        $errorMsg = $e->getMessage();
+                        if (strpos($errorMsg, 'llx_societe_extrafields SET') !== false && strpos($errorMsg, 'WHERE fk_object') !== false) {
+                            $this->log("Bug Dolibarr extrafields vides (exception) ignoré pour société ID=" . $soc->id . " - Exception: " . $errorMsg, LOG_WARNING);
+                            $result = 1; // Considérer comme succès car la société existe déjà
+                        } else {
+                            // Autre exception, la relancer
+                            throw $e;
+                        }
                     }
                 }
             } else {
@@ -646,11 +1316,28 @@ class ShopifyOrderManager
                     'user_id' => $user->id,
                     'operation' => $operation
                 )), LOG_DEBUG);
-                
-                throw new Exception("Erreur " . $operation . " société [Email: " . doli2shop_mask_email($shopifyCustomer->email) . ", Entity: " . $this->entity . "]: " . $errorMsg);
+
+                // AC11 : la cause SOCIETE_EMAIL_MANDATORY prime sur le message générique du cœur
+                $mandatoryCause = $this->emailMandatoryCause($soc->email);
+                if ($mandatoryCause !== '') {
+                    $this->lastCustomerFailureReason = $mandatoryCause;
+                    $errorMsg = $mandatoryCause . ' [' . $errorMsg . ']';
+                }
+
+                throw new Exception("Erreur " . $operation . " société [Email: " . ($customerEmail !== '' ? doli2shop_mask_email($customerEmail) : 'no-email') . ", Entity: " . $this->entity . "]: " . $errorMsg);
             } else {
                 // LOGS v2.0.30: Succès avec détails
                 $this->log("Succès " . $operation . " société: ID=" . $soc->id . ", Nom=" . doli2shop_mask_name($soc->name), LOG_INFO);
+
+                // Lien id client Shopify -> tiers : posé sur TOUT tiers résolu (e-mail, lien, heuristique, création),
+                // pour que la commande suivante du même client le retrouve même sans e-mail. Non bloquant.
+                if ($shopifyCustomerId !== '') {
+                    if ($this->customerLinks()->upsert($this->getStoreId(), $shopifyCustomerId, $soc->id)) {
+                        $this->log("createOrUpdateCustomer - lien posé critère=" . $criterion . " socid=" . $soc->id . " shopifyCustomerId=" . $shopifyCustomerId, LOG_INFO);
+                    } else {
+                        $this->log("createOrUpdateCustomer - lien NON posé (non bloquant) socid=" . $soc->id . " shopifyCustomerId=" . $shopifyCustomerId, LOG_WARNING);
+                    }
+                }
 
                 // Attribution automatique de la catégorie client Shopify (si configurée)
                 $customerCategoryId = isset($this->config->dolibarr_customer_category) ? $this->config->dolibarr_customer_category : '0';
@@ -662,12 +1349,13 @@ class ShopifyOrderManager
                 }
             }
 
-            $this->db->query("SELECT RELEASE_LOCK('" . $this->db->escape($lockName) . "')");
             return $soc;
         } catch (Exception $e) {
             $this->log("Erreur: " . $e->getMessage(), LOG_ERR);
-            $this->db->query("SELECT RELEASE_LOCK('" . $this->db->escape($lockName) . "')");
             return -1;
+        } finally {
+            // Review 4 couches (LOW) : le verrou est libéré même sur une Error / TypeError (non attrapée par le catch)
+            $this->db->query("SELECT RELEASE_LOCK('" . $this->db->escape($lockName) . "')");
         }
     }
 
@@ -4294,7 +4982,7 @@ class ShopifyOrderManager
      * @param string $shopifyStatus Statut fulfillment Shopify (FULFILLED, PARTIALLY_FULFILLED, UNFULFILLED, FULFILLMENT_NOT_REQUIRED...)
      * @return string Valeur locale dolOrderFulfillment
      * @since 2.0.0
-     * @version     2.6.0 Story 51-2 : ajout mapping FULFILLMENT_NOT_REQUIRED
+     * @version     2.6.1 Story 51-2 : ajout mapping FULFILLMENT_NOT_REQUIRED
      */
     private function mapFulfillmentStatus($shopifyStatus)
     {
@@ -5550,41 +6238,19 @@ class ShopifyOrderManager
                 . " fulfillmentStatus=" . ($order->displayFulfillmentStatus ?? ''), LOG_INFO);
 
             // Créer ou mettre à jour le client
-            // v2.3.0: Fallback email guest checkout (AC 39-3 #3)
-            $shopifyCustomerForLookup = !empty($order->customer) ? $order->customer : null;
-            if ((empty($shopifyCustomerForLookup) || empty($shopifyCustomerForLookup->email))
-                && !empty($order->email)) {
-                $this->log(
-                    'processSingleOrderFromWebhook - Guest checkout détecté - email commande utilisé: ' . doli2shop_mask_email($order->email),
-                    LOG_INFO
-                );
-                if (empty($shopifyCustomerForLookup)) {
-                    $shopifyCustomerForLookup = new \stdClass();
-                }
-                $shopifyCustomerForLookup->email = $order->email;
-                // Initialiser les champs nécessaires à createOrUpdateCustomer si absents
-                if (!isset($shopifyCustomerForLookup->firstName)) {
-                    $shopifyCustomerForLookup->firstName = '';
-                }
-                if (!isset($shopifyCustomerForLookup->lastName)) {
-                    $shopifyCustomerForLookup->lastName = '';
-                }
-                if (!isset($shopifyCustomerForLookup->phone)) {
-                    $shopifyCustomerForLookup->phone = '';
-                }
-                if (!isset($shopifyCustomerForLookup->defaultAddress)) {
-                    $shopifyCustomerForLookup->defaultAddress = null;
-                }
-                if (!isset($shopifyCustomerForLookup->emailMarketingConsent)) {
-                    $shopifyCustomerForLookup->emailMarketingConsent = null;
-                }
-                if (!isset($shopifyCustomerForLookup->id)) {
-                    $shopifyCustomerForLookup->id = '';
-                }
-            }
+            // Story 66-6 : l'identité se construit depuis customer, puis billingAddress, puis
+            // shippingAddress (v2.3.0 : e-mail de la commande pour le guest checkout, AC 39-3 #3) —
+            // une commande passée avec le téléphone seul n'a AUCUN e-mail mais reste identifiable.
+            $shopifyCustomerForLookup = $this->buildOrderCustomerIdentity($order);
 
-            if (empty($shopifyCustomerForLookup) || empty($shopifyCustomerForLookup->email)) {
-                $this->error = "Order " . $shopifyOrderId . " has no customer data";
+            if ($shopifyCustomerForLookup === null) {
+                // R7 / D1 : rejet explicite et visible (Événements, rejouable après correction), aucun tiers fictif.
+                $this->error = $this->translateOrFallback(
+                    'ShopifyOrderNoCustomerIdentity',
+                    "Order %s has no customer identity (no e-mail, no Shopify customer id, no name, phone or address) — check the "
+                    . "\"Protected customer data\" access of the Shopify app, then replay the event",
+                    array($shopifyOrderId)
+                );
                 $this->errors[] = $this->error;
                 $this->log("processSingleOrderFromWebhook - " . $this->error, LOG_ERR);
                 return -1;
@@ -5594,6 +6260,9 @@ class ShopifyOrderManager
 
             if (!is_object($customer) || $customer->id <= 0) {
                 $this->error = "Failed to create/update customer for order " . $shopifyOrderId;
+                if ($this->lastCustomerFailureReason !== '') {
+                    $this->error .= " : " . $this->lastCustomerFailureReason;
+                }
                 $this->errors[] = $this->error;
                 $this->log("processSingleOrderFromWebhook - " . $this->error, LOG_ERR);
                 return -1;

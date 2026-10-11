@@ -24,7 +24,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.4.7
+ * @version     2.6.1
  * @since       2.4.7
  * @link        https://doli2shop.ptitetete.org
  */
@@ -586,12 +586,12 @@ class WebhookSettingsSaver
      * (page admin) via `GETPOST(...)` — seules la validation/normalisation (bornage retry/timeout) et
      * la persistance restent ici, à l'identique du bloc original.
      *
-     * @param  int $webhookProcessLimit    GETPOST("webhook_process_limit", 'int')
-     * @param  int $webhookKeepDays        GETPOST("webhook_keep_days", 'int')
-     * @param  int $webhookImmediateProcess GETPOST("webhook_immediate_process", 'int')
+     * @param  int $webhookProcessLimit    GETPOSTINT("webhook_process_limit") — borné [1,1000] (hors plage : 100 / 1000)
+     * @param  int $webhookKeepDays        GETPOSTINT("webhook_keep_days") — borné [1,365] (hors plage : 30 / 365)
+     * @param  int $webhookImmediateProcess GETPOSTINT("webhook_immediate_process") — normalisé 0/1 (case décochée = 0)
      * @param  int $webhookMaxTries        GETPOSTINT("webhook_max_tries") — Story 36.3, borné [1,20]
      * @param  int $webhookStuckTimeout    GETPOSTINT("webhook_stuck_timeout") — borné [1,60]
-     * @param  int $webhookUserId          GETPOST("webhook_user_id", 'int')
+     * @param  int $webhookUserId          GETPOSTINT("webhook_user_id") — <= 0 (ligne vide du sélecteur = -1) : constante supprimée
      * @param  int $entity                 Entité Dolibarr courante ($conf->entity)
      * @return array{hadError:bool, errorMessages:array}
      */
@@ -616,11 +616,23 @@ class WebhookSettingsSaver
         // globale unique rattrapait ce cas par effet de bord ; ce filet accidentel a disparu avec
         // les transactions par opération, il est donc remplacé par un contrôle explicite.
         $constWriteFailed = false;
+
+        // Story 68-2 : bornes serveur, silencieuses, sur le patron de max_tries/stuck_timeout ci-dessous
+        // (les bornes HTML min/max de l'écran ne protègent pas d'une valeur vidée ou forcée).
+        $processLimitVal = $webhookProcessLimit;
+        if ($processLimitVal < 1) { $processLimitVal = 100; }
+        if ($processLimitVal > 1000) { $processLimitVal = 1000; }
+        $keepDaysVal = $webhookKeepDays;
+        if ($keepDaysVal < 1) { $keepDaysVal = 30; }
+        if ($keepDaysVal > 365) { $keepDaysVal = 365; }
+        // Case à cocher : décochée = champ absent du POST = 0 ; toute valeur positive = 1.
+        $immediateProcessVal = ($webhookImmediateProcess > 0) ? 1 : 0;
+
         $db->begin();
         foreach (array(
-            "SHOPIFY_WEBHOOK_PROCESS_LIMIT" => $webhookProcessLimit,
-            "SHOPIFY_WEBHOOK_KEEP_DAYS" => $webhookKeepDays,
-            "SHOPIFY_WEBHOOK_IMMEDIATE_PROCESS" => $webhookImmediateProcess,
+            "SHOPIFY_WEBHOOK_PROCESS_LIMIT" => $processLimitVal,
+            "SHOPIFY_WEBHOOK_KEEP_DAYS" => $keepDaysVal,
+            "SHOPIFY_WEBHOOK_IMMEDIATE_PROCESS" => $immediateProcessVal,
         ) as $constName => $constValue) {
             if (dolibarr_set_const($db, $constName, $constValue, 'chaine', 0, '', $entity) <= 0) {
                 $constWriteFailed = true;
@@ -643,8 +655,21 @@ class WebhookSettingsSaver
         if (dolibarr_set_const($db, "DOLI2SHOP_WEBHOOK_STUCK_TIMEOUT_MIN", $stuckVal, 'chaine', 0, '', $entity) <= 0) {
             $constWriteFailed = true;
         }
-        if (dolibarr_set_const($db, "DOLI2SHOP_WEBHOOK_USER_ID", $webhookUserId, 'chaine', 0, '', $entity) <= 0) {
-            $constWriteFailed = true;
+        // Story 68-2 : la ligne vide du sélecteur d'utilisateur vaut -1. Une valeur <= 0 n'est
+        // JAMAIS écrite : la constante est supprimée (avec l'entité), ce qui rétablit le repli
+        // MAIN_CRON_USERID puis administrateur à la lecture — et répare un -1 déjà enregistré.
+        if ($webhookUserId > 0) {
+            if (dolibarr_set_const($db, "DOLI2SHOP_WEBHOOK_USER_ID", $webhookUserId, 'chaine', 0, '', $entity) <= 0) {
+                $constWriteFailed = true;
+            }
+        } else {
+            if (dolibarr_del_const($db, "DOLI2SHOP_WEBHOOK_USER_ID", $entity) < 0) {
+                $constWriteFailed = true;
+                dol_syslog(
+                    "webhooksettingssaver.class.php: échec dolibarr_del_const DOLI2SHOP_WEBHOOK_USER_ID : " . $db->lasterror(),
+                    LOG_ERR
+                );
+            }
         }
 
         $errorMessages = array();

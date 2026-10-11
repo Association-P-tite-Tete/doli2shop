@@ -9,7 +9,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
  */
@@ -114,6 +114,8 @@ if (($action == 'update') && !empty($_POST) && verifToken()) {
     // — un script procédural avec `exit` sur une branche ne peut structurellement pas être inclus
     // dans PHPUnit, la classe injectable si. Cette page ne garde que la lecture du POST, l'appel à
     // la classe et l'affichage des messages qu'elle restitue (elle n'affiche jamais rien elle-même).
+    // Story 68-2 : le message global n'est construit que si l'enregistrement a eu lieu — un POST
+    // `update` sans `save` laissait les compteurs indéfinis (null) -> TypeError sur la fonction typée.
     if ($action == 'update' && GETPOST('save', 'alpha')) {
         $active_topics = GETPOST('active_topics', 'array');
 
@@ -129,12 +131,12 @@ if (($action == 'update') && !empty($_POST) && verifToken()) {
 
         // Story 36.3 : politique de retry webhook (bornage fait dans la classe, lecture POST ici)
         $generalSettingsReport = $webhookSettingsSaver->saveGeneralSettings(
-            GETPOST("webhook_process_limit", 'int'),
-            GETPOST("webhook_keep_days", 'int'),
-            GETPOST("webhook_immediate_process", 'int'),
+            GETPOSTINT("webhook_process_limit"),
+            GETPOSTINT("webhook_keep_days"),
+            GETPOSTINT("webhook_immediate_process"),
             GETPOSTINT("webhook_max_tries"),
             GETPOSTINT("webhook_stuck_timeout"),
-            GETPOST("webhook_user_id", 'int'),
+            GETPOSTINT("webhook_user_id"),
             $conf->entity
         );
 
@@ -153,23 +155,23 @@ if (($action == 'update') && !empty($_POST) && verifToken()) {
         // pour ne jamais laisser « Configuration sauvegardée » s'afficher quand une partie du
         // formulaire n'a en réalité pas pu être confirmée.
         $topicsUnverifiable = $topicsReport['topicsUnverifiable'];
-    }
 
-    // Les topics ont chacun été committés ou annulés individuellement dans la classe : il ne reste
-    // qu'à qualifier le résultat d'ensemble. Un échec partiel n'annule plus les topics réussis,
-    // et ne doit donc plus être annoncé comme un succès global.
-    // Story 60-1 (points 2/3) : décision extraite dans une fonction PURE testable
-    // (doli2shopBuildWebhookSaveMessage(), lib/doli2shop.lib.php) — sur le modèle déjà établi par
-    // doli2shopBuildActivateAllWebhooksMessage() pour le bouton "Activer tous les webhooks". Avant
-    // cette extraction, cette logique vivait en `if`/`elseif` inline SANS AUCUN test dédié : la
-    // mutation consistant à retirer `&& empty($topicsUnverifiable)` — réintroduisant exactement le
-    // défaut d'origine de cette story — laissait la suite de tests au vert.
-    $saveMessage = doli2shopBuildWebhookSaveMessage($error > 0, $topicsApplied, $topicsFailed, $topicsUnverifiable);
-    setEventMessages(
-        $langs->trans($saveMessage['langKey'], ...$saveMessage['params']),
-        null,
-        $saveMessage['messageType']
-    );
+        // Les topics ont chacun été committés ou annulés individuellement dans la classe : il ne reste
+        // qu'à qualifier le résultat d'ensemble. Un échec partiel n'annule plus les topics réussis,
+        // et ne doit donc plus être annoncé comme un succès global.
+        // Story 60-1 (points 2/3) : décision extraite dans une fonction PURE testable
+        // (doli2shopBuildWebhookSaveMessage(), lib/doli2shop.lib.php) — sur le modèle déjà établi par
+        // doli2shopBuildActivateAllWebhooksMessage() pour le bouton "Activer tous les webhooks". Avant
+        // cette extraction, cette logique vivait en `if`/`elseif` inline SANS AUCUN test dédié : la
+        // mutation consistant à retirer `&& empty($topicsUnverifiable)` — réintroduisant exactement le
+        // défaut d'origine de cette story — laissait la suite de tests au vert.
+        $saveMessage = doli2shopBuildWebhookSaveMessage($error > 0, $topicsApplied, $topicsFailed, $topicsUnverifiable);
+        setEventMessages(
+            $langs->trans($saveMessage['langKey'], ...$saveMessage['params']),
+            null,
+            $saveMessage['messageType']
+        );
+    }
 }
 
 // Story 59-2 (AC1) : jusqu'ici, un jeton refusé sur l'une des 6 actions ci-dessous (toutes sauf
@@ -387,7 +389,7 @@ doli2shopShowLicenseWarningBanner();
 // Subheader
 
 // === DÉBUT ISOLATION CSS v2.1.3 ===
-print '<div class=\"doli2shop-page\">';
+print '<div class="doli2shop-page">';
 $linkback = '<a href="'.DOL_URL_ROOT.'/admin/modules.php?restore_lastsearch_values=1">'.$langs->trans("BackToModuleList").'</a>';
 
 print load_fiche_titre($langs->trans("ShopifyWebhooksConfiguration"), $linkback, 'title_setup');

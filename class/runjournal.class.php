@@ -26,7 +26,7 @@
  * @author     P'tite Tête
  * @copyright  2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license    GPL v3+
- * @version    2.6.0
+ * @version     2.6.1
  * @since      2.6.0
  * @link       https://doli2shop.ptitetete.org
  */

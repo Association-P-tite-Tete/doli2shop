@@ -12,6 +12,14 @@
  *    expédition Shopify » dans la fiche commande Dolibarr, alimenté depuis
  *    la table llx_doli2shop_fulfillment_events (Stories 40.1 / 40.2).
  *
+ * Hooks ajoutés par la story 66-6 (lien client Shopify <-> tiers) :
+ *  - formObjectOptions (contexte 'thirdpartycard') : affiche en LECTURE SEULE, sur la fiche tiers en
+ *    mode vue, l'identifiant client Shopify (et la boutique) de chaque lien ;
+ *  - replaceThirdparty (contextes 'thirdpartycard' ET 'api') : à la fusion de deux tiers, re-pointe les
+ *    liens du tiers supprimé vers le tiers conservé AVANT la suppression (sinon le ON DELETE CASCADE les
+ *    détruirait). Hors fusion de tiers (la fusion de TÂCHES de Dolibarr 24 émet le même nom de hook
+ *    avec d'autres paramètres), la méthode ne fait strictement rien.
+ *
  * Les événements affichés sont persistés par le catchup CRON
  * (ShopifyFulfillmentCatchupCron) via GraphQL enrichi ; le webhook temps réel
  * ne contient pas les FulfillmentEvents (GPS, timeline) et ne les persiste pas.
@@ -26,7 +34,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.3.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -38,6 +46,7 @@ if (!defined('DOLIBARR_INC_FOR_MODULES') && !defined('DOL_DOCUMENT_ROOT')) {
 }
 
 dol_include_once('/doli2shop/class/shopifyfulfillmentmanager.class.php');
+dol_include_once('/doli2shop/class/customerlinkrepository.class.php'); // Story 66-6
 
 /**
  * ActionsDoli2shop — Classe de hooks UI du module Doli2Shop
@@ -55,33 +64,147 @@ class ActionsDoli2shop
     /** @var array Erreurs éventuelles */
     public $errors = array();
 
+    /** @var string Dernière erreur (lue par le hookmanager en cas de retour < 0) */
+    public $error = '';
+
     /**
-     * Hook formObjectOptions — injecte le bloc timeline dans la fiche commande
+     * Hook formObjectOptions — aiguille selon le contexte de la page.
      *
-     * Appelé par Dolibarr sur toutes les pages enregistrées dans
-     * $module_parts['hooks']. On vérifie le contexte 'ordercard' et l'objet
-     * 'commande' avant d'afficher quoi que ce soit.
+     *  - 'ordercard'      : bloc « Suivi expédition Shopify » + adresses (comportement historique, inchangé) ;
+     *  - 'thirdpartycard' : lien(s) client Shopify en lecture seule (story 66-6) ;
+     *  - tout autre       : rien (return 0, aucune sortie).
      *
      * @param  array  $parameters  Hook parameters (currentcontext, object, etc.)
-     * @param  mixed  $object      Dolibarr object (Commande)
+     * @param  mixed  $object      Dolibarr object (Commande ou Societe)
      * @param  string $action      Current action
      * @param  mixed  $hookmanager HookManager instance
      * @return int    0 = OK (no error)
      */
     public function formObjectOptions($parameters, &$object, &$action, $hookmanager)
     {
-        global $conf, $langs, $user, $db;
+        // Jamais de sortie résiduelle d'un appel précédent (le gabarit extrafields appelle ce hook en vue,
+        // en édition et en création sur la même instance)
+        $this->resprints = '';
 
         // Vérifier que le module Doli2Shop est actif
         if (!isModEnabled('doli2shop')) {
             return 0;
         }
 
-        // Vérifier le contexte : on ne s'exécute que sur la fiche commande
         $contexts = $parameters['currentcontext'] ?? '';
-        if (!in_array('ordercard', is_array($contexts) ? $contexts : array($contexts), true)) {
+        $contexts = is_array($contexts) ? $contexts : array($contexts);
+
+        if (in_array('ordercard', $contexts, true)) {
+            return $this->formObjectOptionsOrderCard($parameters, $object, $action);
+        }
+        if (in_array('thirdpartycard', $contexts, true)) {
+            return $this->formObjectOptionsThirdpartyCard($object, $action);
+        }
+        return 0;
+    }
+
+    /**
+     * Story 66-6 (AC-F2) — Fiche tiers, MODE VUE SEULEMENT : une ligne « Client Shopify » par lien
+     * (identifiant + boutique), texte non éditable. Le gabarit extrafields appelle ce hook aussi en
+     * création, modification et ajout : on sort alors sans rien afficher.
+     *
+     * @param  mixed  $object Tiers (Societe)
+     * @param  string $action Action courante de la page
+     * @return int    0
+     */
+    private function formObjectOptionsThirdpartyCard(&$object, &$action)
+    {
+        global $langs, $user, $db, $conf;
+
+        if (in_array((string) $action, array('create', 'edit', 'add', 'update'), true)) {
             return 0;
         }
+        if (!is_object($object) || empty($object->element) || $object->element !== 'societe') {
+            return 0;
+        }
+        $dolibarrSocId = (int) ($object->id ?? 0);
+        if ($dolibarrSocId <= 0) {
+            return 0;
+        }
+        if (!$user->hasRight('societe', 'lire')) {
+            return 0;
+        }
+
+        $entity = isset($object->entity) && (int) $object->entity > 0 ? (int) $object->entity : (int) $conf->entity;
+        $repository = new CustomerLinkRepository($db, $entity);
+        $links = $repository->findByThirdparty($dolibarrSocId);
+        if (empty($links)) {
+            return 0;
+        }
+
+        $langs->loadLangs(array('doli2shop@doli2shop'));
+
+        $html = '';
+        foreach ($links as $link) {
+            $value = '#' . dol_escape_htmltag($link['shopify_customer_id']);
+            if ((int) $link['fk_store'] > 0 && $link['store_label'] !== '') {
+                $value .= ' <span class="opacitymedium">(' . dol_escape_htmltag($langs->trans('ShopifyCustomerLinkStore')) . ' : ' . dol_escape_htmltag($link['store_label']) . ')</span>';
+            }
+            $html .= '<tr class="oddeven"><td class="titlefield">' . dol_escape_htmltag($langs->trans('ShopifyCustomerLink')) . '</td><td>' . $value . '</td></tr>' . "\n";
+        }
+
+        $this->resprints = $html;
+        return 0;
+    }
+
+    /**
+     * Story 66-6 (AC-F1) — Hook de fusion de tiers (Societe::mergeCompany(), card.php en 18, API REST) :
+     * re-pointe les liens client Shopify du tiers supprimé vers le tiers conservé. Appelé AVANT la
+     * suppression du tiers d'origine : le ON DELETE CASCADE ne détruit donc aucun lien déjà re-pointé.
+     *
+     * Ne fait RIEN hors fusion de tiers : Dolibarr 24 émet aussi `replaceThirdparty` pour la fusion de
+     * TÂCHES (paramètres task_origin/task_dest) — sans soc_origin/soc_dest entiers > 0, return 0 sans
+     * aucune requête. Pas d'UPDATE IGNORE : une erreur SQL fait échouer la fusion proprement (return -1)
+     * plutôt que de laisser le cascade détruire les liens.
+     *
+     * @param  array  $parameters  ['soc_origin' => int tiers supprimé, 'soc_dest' => int tiers conservé]
+     * @param  mixed  $object      Tiers conservé
+     * @param  string $action      Action courante
+     * @param  mixed  $hookmanager HookManager
+     * @return int    0 = OK, < 0 = fusion annulée
+     */
+    public function replaceThirdparty($parameters, &$object, &$action, $hookmanager)
+    {
+        global $db;
+
+        if (!is_array($parameters) || !isset($parameters['soc_origin'], $parameters['soc_dest'])) {
+            return 0;
+        }
+        if (!is_numeric($parameters['soc_origin']) || !is_numeric($parameters['soc_dest'])) {
+            return 0;
+        }
+        $socOrigin = (int) $parameters['soc_origin'];
+        $socDest = (int) $parameters['soc_dest'];
+        if ($socOrigin <= 0 || $socDest <= 0 || $socOrigin === $socDest) {
+            return 0;
+        }
+
+        $repository = new CustomerLinkRepository($db);
+        if (!$repository->repointThirdparty($socOrigin, $socDest)) {
+            $this->error = 'Doli2Shop: ' . $repository->error;
+            $this->errors[] = $this->error;
+            return -1;
+        }
+        return 0;
+    }
+
+    /**
+     * Hook formObjectOptions de la fiche commande — comportement historique (contexte 'ordercard'),
+     * injecte le bloc timeline dans la fiche commande.
+     *
+     * @param  array  $parameters  Hook parameters
+     * @param  mixed  $object      Commande
+     * @param  string $action      Current action
+     * @return int    0
+     */
+    private function formObjectOptionsOrderCard($parameters, &$object, &$action)
+    {
+        global $conf, $langs, $user, $db;
 
         // Vérifier que l'objet est bien une commande
         if (!is_object($object) || empty($object->element) || $object->element !== 'commande') {

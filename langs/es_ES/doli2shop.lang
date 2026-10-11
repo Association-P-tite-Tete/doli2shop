@@ -686,7 +686,6 @@ PaymentsSyncRequiresOrders=La sincronización de pagos requiere la sincronizaci�
 ShippingSyncRequiresOrders=La sincronización de envíos requiere la sincronización de pedidos
 
 # Maintenance v2.1.6
-ErrorLoadingConfiguration=Error al cargar la configuración del módulo
 
 # Diagnostic v2.1.6
 CronDuplicatesCleanedSuccess=%s CRON(s) duplicado(s) eliminado(s) con éxito
@@ -796,7 +795,6 @@ AboutDependenciesUpdate=Actualización de dependencias de módulos
 # Step 3 - Orders
 
 # Step 4 - Mappings
-OrderStatusMapping=Mapeo de estados de pedido
 
 # Step 5 - CRON
 
@@ -1395,6 +1393,9 @@ ProductJsonExportIdentifierHint=Ej. un SKU de variante, un título de producto o
 ProductJsonExportFetch=Obtener el JSON
 ProductJsonExportNoIdentifier=Introduzca un SKU, un título o un identificador de producto.
 ProductJsonExportNotFound=Producto no encontrado en Shopify.
+ProductJsonExportNotFoundNumeric=Ningún producto coincide con "%s" (buscado como SKU de variante, título y después ID de producto).
+ProductJsonExportResolveError=Error de Shopify al resolver el identificador del producto. Inténtelo de nuevo en un momento.
+ProductJsonExportIdentifierNotFound=No se encontró ningún producto para el identificador indicado.
 ProductJsonExportResultFor=JSON del producto
 ProductJsonExportDownload=Descargar el JSON
 ProductJsonExportCopy=Copiar
@@ -1789,37 +1790,14 @@ CANCELLED=Cancelado
 EXPIRED=Expirado
 FULFILLED=Enviado
 FULFILLMENT_NOT_REQUIRED=Envío no requerido
-IN_PROGRESS=En curso
-ON_HOLD=En espera
-OPEN=Abierto
 PAID=Pagado
 PARTIALLY_FULFILLED=Parcialmente enviado
 PARTIALLY_PAID=Parcialmente pagado
 PARTIALLY_REFUNDED=Parcialmente reembolsado
 PENDING=Pendiente
 REFUNDED=Reembolsado
-SCHEDULED=Programado
-SUCCESS=Correcto
 UNFULFILLED=No enviado
 VOIDED=Anulado (pago)
-ERROR=Error
-AddOrderStatusMapping=Añadir correspondencia de estado de pedido
-ConfirmRestoreDefaultMappings=¿Seguro que desea restaurar las correspondencias por defecto? Esto eliminará sus correspondencias personalizadas.
-DefaultMapping=Correspondencia por defecto
-DefaultMappingsRestoredCount=%s correspondencia(s) por defecto restaurada(s)
-DolibarrOrderStatus=Estado de pedido Dolibarr
-DolibarrToShopifyStatusMapping=Correspondencia de estados de Dolibarr a Shopify
-MappingDescription=Descripción de la correspondencia
-MappingPriority=Prioridad de la correspondencia
-NoOrderStatusMappingDefined=No hay correspondencia de estado de pedido definida
-OrderStatusMappingDesc=Configure cómo se corresponden automáticamente los estados de pedido de Shopify y Dolibarr.
-OrderStatusMappingSaved=Correspondencia de estado de pedido guardada
-RestoreDefaultMappings=Restaurar correspondencias por defecto
-ShopifyFinancialStatus=Estado financiero de Shopify
-ShopifyFulfillmentStatus=Estado de envío de Shopify
-ShopifyToDolibarrStatusMapping=Correspondencia de estados de Shopify a Dolibarr
-StatusMappingExplanation=Estas correspondencias determinan automáticamente qué estado de Dolibarr aplicar según los estados financiero y de envío devueltos por Shopify.
-StatusOrderSentPartially=Enviado parcialmente
 TotalMappings=Correspondencias totales
 ValidMappings=Correspondencias válidas
 
@@ -2215,8 +2193,8 @@ DiagLocationTruncated=Ubicaciones adicionales no mostradas
 # --- 2.5.3 : limpieza de fotos duplicadas importadas (Story import-images-duplique) ---
 ImageDuplicatesCleanupTab=Fotos duplicadas
 ImageDuplicatesCleanupTitle=Limpieza de fotos duplicadas importadas
-ImageDuplicatesCleanupIntro=Antes de la corrección del 07/09/2026, cada sincronización de Shopify (en particular el webhook «products/update») volvía a copiar todas las fotos del producto con un nombre generado aleatoriamente (uniqid()): ninguna podía reconocer el archivo depositado por la sincronización anterior. Esta herramienta identifica esos duplicados y permite eliminarlos tras una vista previa.
-ImageDuplicatesCleanupWarning=Solo se proponen los archivos que coinciden EXACTAMENTE con el patrón depositado por el módulo (referencia del producto + identificador aleatorio). Las fotos que usted mismo haya subido nunca se ven afectadas. Se conserva el archivo más reciente de cada producto; los anteriores se proponen para su eliminación.
+ImageDuplicatesCleanupIntro=Antes de la corrección del 07/09/2026, cada sincronización de Shopify (en particular el webhook «products/update») volvía a copiar todas las fotos del producto con un nombre generado aleatoriamente (uniqid()): ninguna podía reconocer el archivo depositado por la sincronización anterior. Esta herramienta identifica las copias de contenido estrictamente idéntico y permite eliminarlas tras una vista previa. Tras una limpieza, las fotos de los productos afectados se reenvían una sola vez a Shopify, sin crear medios adicionales. Una copia recomprimida o reexportada no es estrictamente idéntica: no se propone.
+ImageDuplicatesCleanupWarning=Solo se proponen los archivos que coinciden EXACTAMENTE con el patrón depositado por el módulo (referencia del producto + identificador aleatorio) Y que tienen al menos una copia de contenido estrictamente idéntico. Una foto distinta nunca se propone, y las fotos que usted mismo haya subido nunca se ven afectadas. En cada grupo de copias idénticas se conserva una copia (la utilizada por el módulo; si no, la primera foto del producto; si no, la más reciente); las demás se proponen para su eliminación. No hay nada marcado por defecto: marque las copias que desea eliminar.
 ImageDuplicatesCleanupNoCandidates=No se han detectado duplicados — nada que limpiar.
 ImageDuplicatesCleanupColProduct=Producto
 ImageDuplicatesCleanupColFile=Archivo
@@ -2225,7 +2203,9 @@ ImageDuplicatesCleanupColDate=Fecha
 ImageDuplicatesCleanupColAction=Acción
 ImageDuplicatesCleanupKept=Conservado
 ImageDuplicatesCleanupApplyButton=Eliminar los duplicados seleccionados
-ImageDuplicatesCleanupApplyConfirm=Esta acción eliminará definitivamente hasta %s archivo(s) duplicado(s) (y sus miniaturas). ¿Continuar?
+ImageDuplicatesCleanupApplyConfirm=Esta acción eliminará definitivamente %s archivo(s) seleccionado(s) (y sus miniaturas). ¿Continuar?
+ImageDuplicatesCleanupNothingSelected=No hay ninguna copia marcada: marque al menos un archivo que eliminar.
+ImageDuplicatesCleanupLockBusy=Ya hay una limpieza en curso para uno de estos productos: no se ha eliminado nada para él. Inténtelo de nuevo en un momento.
 ImageDuplicatesCleanupApplied=%s archivo(s) eliminado(s) con éxito.
 ImageDuplicatesCleanupErrors=Errores encontrados:
 
@@ -2267,3 +2247,12 @@ UnderpriceAuditReasonMatchesNote=Importe conforme — sin acción
 UnderpriceAuditReasonUnderpricedDraft=Borrador no facturado — corrección posible directamente en el pedido (sin acción automática)
 UnderpriceAuditReasonUnderpricedCanceled=Pedido cancelado — nunca facturado, no requiere regularización
 UnderpriceAuditReasonUnderpricedCommitted=Pedido facturado/pagado — señalado, tratamiento mediante abono FUERA DE LA HERRAMIENTA
+
+# Story 66-6 — Vínculo cliente Shopify <-> tercero (ficha del tercero, solo lectura)
+ShopifyCustomerLink=Cliente Shopify
+ShopifyCustomerLinkStore=tienda
+ShopifyCustomerEmailMandatoryCause=La opción de Dolibarr SOCIETE_EMAIL_MANDATORY (Configuración > Terceros) exige un correo para cada tercero, pero este cliente de Shopify no tiene (pedido con solo teléfono): desactive la opción o introduzca el correo del cliente en Shopify.
+ShopifyOrderNoCustomerIdentity=El pedido %s no tiene identidad de cliente (sin correo, sin ID de cliente Shopify, sin nombre, teléfono ni dirección) — compruebe el acceso « Protected customer data » de la aplicación Shopify y vuelva a reproducir el evento
+SyncReportCollectionsAutomaticSkipped=%s colección(es) controlada(s) por condiciones en Shopify: el módulo no añade productos — cambie la colección a manual si desea que el módulo la rellene
+SyncReportCollectionsAutomaticRefused=%s colección(es) rechazada(s) por Shopify (mensaje que indica una colección automática): no se pudo asociar ningún producto — añada una condición o cambie la colección a manual en Shopify
+SyncReportCollectionsDetailUnreadable=%s colección(es) ignorada(s) por precaución: Shopify rechaza la lectura de sus condiciones, el módulo no puede saber si están controladas por condiciones y no añade productos

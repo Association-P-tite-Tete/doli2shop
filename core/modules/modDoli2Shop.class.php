@@ -10,7 +10,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       1.0.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -81,7 +81,7 @@ class modDoli2Shop extends DolibarrModules
             'theme' => 0,
             'css' => array('/doli2shop/css/doli2shop.css.php'),
             'js' => array('/doli2shop/js/doli2shop.js'),
-            'hooks' => array('ordercard'),
+            'hooks' => array('ordercard', 'thirdpartycard', 'api'),
             'moduleforexternal' => 0
         );
 
@@ -116,7 +116,8 @@ class modDoli2Shop extends DolibarrModules
             'doli2shop_fulfillment_events',    // Story 40.1 — Historique tracking FulfillmentEvents
             'doli2shop_action_log',            // Story 38.3 — Journal des actions module
             'doli2shop_stores',                // Epic 47, Story 47-1 — Configuration multi-boutiques Shopify
-            'doli2shop_store_settings'         // Story 49-3 — Réglages key-value par boutique (fallback global)
+            'doli2shop_store_settings',        // Story 49-3 — Réglages key-value par boutique (fallback global)
+            'doli2shop_customers'              // Story 66-6 — Lien client Shopify <-> tiers (entity, fk_store, id client)
             // Note: doli2shop_storedetails retiré - table dépréciée depuis v2.1.1, migrée vers llx_const
         );
         
@@ -614,6 +615,22 @@ class modDoli2Shop extends DolibarrModules
 					[
 						'version' => '2.6.0e_2.6.0f',
 						'file' => dol_buildpath('/doli2shop/sql/update_2.6.0e_2.6.0f.sql', 0)
+					],
+					// 2.6.0f_2.6.1 : UNIQUE fichier de migration du cycle 2.6.1 (les stories suivantes
+					// y ajoutent un bloc independant et idempotent, jamais un second fichier). Story 66-1 :
+					// remise en file (status 0, tries 0) des pushs stock dont last_error contient
+					// changeFromQuantity — refus deterministes de Shopify (reference inventee a 0),
+					// dormant en dead-letter. Donnees seules, sans DDL, aucune dependance a la boutique
+					// par defaut (l'invariant « backfill en PHP apres ensureDefaultStore() » ne
+					// s'applique pas : fk_store n'est pas touche). Cle de version NEUVE.
+					// Story 66-6 : bloc ajoute — table llx_doli2shop_customers (lien client Shopify <->
+					// tiers), DDL SEUL, AUCUN backfill (table vide : elle se remplit au fil des commandes) ;
+					// meme definition que sql/llx_doli2shop_customers.sql (_load_tables la cree aussi a la
+					// reactivation du module). Une instance de dev ayant deja applique 2.6.0f_2.6.1 ne
+					// rejouera pas ce bloc : reactiver le module (ou rejouer le bloc a la main).
+					[
+						'version' => '2.6.0f_2.6.1',
+						'file' => dol_buildpath('/doli2shop/sql/update_2.6.0f_2.6.1.sql', 0)
 					]
 				];
 
@@ -726,7 +743,8 @@ class modDoli2Shop extends DolibarrModules
 				// ENTITÉ. Remplace la lecture, jamais fonctionnelle, de
 				// sql/update_2.1.0_add_order_status_mapping.sql (fichier absent du dépôt — les
 				// deux tables restaient vides sur toute installation neuve). Définition PHP unique
-				// partagée avec l'action `restore_defaults` de admin/orderstatusmapping.php.
+				// utilisée par ce seeding seul (l'écran admin/orderstatusmapping.php et son action
+				// `restore_defaults` sont retirés depuis 2.6.1 : les tables restent semées, sans écran).
 				// Idempotent sur (entité, clé unique de chaque table) : ne recrée ni n'écrase
 				// jamais une correspondance existante, y compris modifiée par le client.
 				dol_include_once('/doli2shop/class/orderstatusmapper.class.php');

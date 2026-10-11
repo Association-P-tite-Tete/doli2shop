@@ -717,7 +717,6 @@ PaymentsSyncRequiresOrders=Payment synchronization requires order synchronizatio
 ShippingSyncRequiresOrders=Shipping synchronization requires order synchronization
 
 # Maintenance v2.1.6
-ErrorLoadingConfiguration=Error loading module configuration
 
 # Diagnostic v2.1.6
 CronDuplicatesCleanedSuccess=%s duplicate CRON(s) successfully removed
@@ -827,7 +826,6 @@ SetupGuide=Setup Guide
 # Step 3 - Orders
 
 # Step 4 - Mappings
-OrderStatusMapping=Order status mapping
 
 # Step 5 - CRON
 
@@ -1424,6 +1422,9 @@ ProductJsonExportIdentifierHint=E.g. a variant SKU, a product title or a GraphQL
 ProductJsonExportFetch=Fetch JSON
 ProductJsonExportNoIdentifier=Please enter a product SKU, title or identifier.
 ProductJsonExportNotFound=Product not found on Shopify.
+ProductJsonExportNotFoundNumeric=No product matches "%s" (searched as variant SKU, title, then product ID).
+ProductJsonExportResolveError=Shopify error while resolving the product identifier. Please try again shortly.
+ProductJsonExportIdentifierNotFound=No product found for the given identifier.
 ProductJsonExportResultFor=Product JSON
 ProductJsonExportDownload=Download JSON
 ProductJsonExportCopy=Copy
@@ -1823,37 +1824,14 @@ CANCELLED=Cancelled
 EXPIRED=Expired
 FULFILLED=Fulfilled
 FULFILLMENT_NOT_REQUIRED=Fulfillment not required
-IN_PROGRESS=In progress
-ON_HOLD=On hold
-OPEN=Open
 PAID=Paid
 PARTIALLY_FULFILLED=Partially fulfilled
 PARTIALLY_PAID=Partially paid
 PARTIALLY_REFUNDED=Partially refunded
 PENDING=Pending
 REFUNDED=Refunded
-SCHEDULED=Scheduled
-SUCCESS=Success
 UNFULFILLED=Unfulfilled
 VOIDED=Voided
-ERROR=Error
-AddOrderStatusMapping=Add order status mapping
-ConfirmRestoreDefaultMappings=Are you sure you want to restore the default mappings? This will delete your custom mappings.
-DefaultMapping=Default mapping
-DefaultMappingsRestoredCount=%s default mapping(s) restored
-DolibarrOrderStatus=Dolibarr order status
-DolibarrToShopifyStatusMapping=Dolibarr to Shopify status mapping
-MappingDescription=Mapping description
-MappingPriority=Mapping priority
-NoOrderStatusMappingDefined=No order status mapping defined
-OrderStatusMappingDesc=Configure how Shopify and Dolibarr order statuses automatically map to each other.
-OrderStatusMappingSaved=Order status mapping saved
-RestoreDefaultMappings=Restore default mappings
-ShopifyFinancialStatus=Shopify financial status
-ShopifyFulfillmentStatus=Shopify fulfillment status
-ShopifyToDolibarrStatusMapping=Shopify to Dolibarr status mapping
-StatusMappingExplanation=These mappings automatically determine which Dolibarr status to apply based on the financial and fulfillment statuses returned by Shopify.
-StatusOrderSentPartially=Partially shipped
 TotalMappings=Total mappings
 ValidMappings=Valid mappings
 
@@ -2239,8 +2217,8 @@ DiagLocationTruncated=Additional locations not shown
 # --- 2.5.3 : imported photo duplicates cleanup (Story import-images-duplique) ---
 ImageDuplicatesCleanupTab=Duplicate photos
 ImageDuplicatesCleanupTitle=Imported photo duplicates cleanup
-ImageDuplicatesCleanupIntro=Before the 2026-09-07 fix, every Shopify sync (the "products/update" webhook in particular) re-copied all of the product's photos under a randomly generated name (uniqid()): none of them could recognize the file dropped by the previous sync. This tool identifies these duplicates and lets you delete them after a preview.
-ImageDuplicatesCleanupWarning=Only files matching EXACTLY the pattern deposited by the module (product reference + random identifier) are proposed. Photos you uploaded yourself are never affected. The most recent file for each product is kept, earlier ones are proposed for deletion.
+ImageDuplicatesCleanupIntro=Before the 2026-09-07 fix, every Shopify sync (the "products/update" webhook in particular) re-copied all of the product's photos under a randomly generated name (uniqid()): none of them could recognize the file dropped by the previous sync. This tool identifies copies with strictly identical content and lets you delete them after a preview. After a cleanup, the photos of the affected products are sent to Shopify once more, without creating any extra media. A recompressed or re-exported copy is not strictly identical: it is not proposed.
+ImageDuplicatesCleanupWarning=Only files matching EXACTLY the pattern deposited by the module (product reference + random identifier) AND having at least one copy with strictly identical content are proposed. A different photo is never proposed, and photos you uploaded yourself are never affected. For each group of identical copies, one copy is kept (the one used by the module, otherwise the product's first photo, otherwise the most recent); the others are proposed for deletion. Nothing is ticked by default: tick the copies you want to delete.
 ImageDuplicatesCleanupNoCandidates=No duplicates detected — nothing to clean up.
 ImageDuplicatesCleanupColProduct=Product
 ImageDuplicatesCleanupColFile=File
@@ -2249,7 +2227,9 @@ ImageDuplicatesCleanupColDate=Date
 ImageDuplicatesCleanupColAction=Action
 ImageDuplicatesCleanupKept=Kept
 ImageDuplicatesCleanupApplyButton=Delete selected duplicates
-ImageDuplicatesCleanupApplyConfirm=This will permanently delete up to %s duplicate file(s) (and their thumbnails). Continue?
+ImageDuplicatesCleanupApplyConfirm=This will permanently delete %s selected file(s) (and their thumbnails). Continue?
+ImageDuplicatesCleanupNothingSelected=No copy is ticked: tick at least one file to delete.
+ImageDuplicatesCleanupLockBusy=A cleanup is already running for one of these products: nothing was deleted for it. Please try again in a moment.
 ImageDuplicatesCleanupApplied=%s file(s) successfully deleted.
 ImageDuplicatesCleanupErrors=Errors encountered:
 
@@ -2291,3 +2271,12 @@ UnderpriceAuditReasonMatchesNote=Amount matches — no action
 UnderpriceAuditReasonUnderpricedDraft=Draft, not invoiced — can be corrected directly in the order (no automatic action)
 UnderpriceAuditReasonUnderpricedCanceled=Cancelled order — never invoiced, no regularization needed
 UnderpriceAuditReasonUnderpricedCommitted=Invoiced/paid order — flagged, treatment via credit note OUTSIDE THIS TOOL
+
+# Story 66-6 — Shopify customer <-> third party link (third party card, read only)
+ShopifyCustomerLink=Shopify customer
+ShopifyCustomerLinkStore=store
+ShopifyCustomerEmailMandatoryCause=The Dolibarr option SOCIETE_EMAIL_MANDATORY (Setup > Third parties) requires an e-mail for every third party, but this Shopify customer has none (order placed with a phone number only): disable this option, or enter the customer's e-mail in Shopify.
+ShopifyOrderNoCustomerIdentity=Order %s has no customer identity (no e-mail, no Shopify customer id, no name, phone or address) — check the "Protected customer data" access of the Shopify app, then replay the event
+SyncReportCollectionsAutomaticSkipped=%s collection(s) driven by conditions in Shopify: the module does not add products to them — switch the collection to manual if you want the module to fill it
+SyncReportCollectionsAutomaticRefused=%s collection(s) refused by Shopify (message pointing to an automatic collection): no product could be attached — add a condition or switch the collection to manual in Shopify
+SyncReportCollectionsDetailUnreadable=%s collection(s) skipped as a precaution: Shopify refuses to return their conditions, so the module cannot tell whether they are driven by conditions and adds no products to them

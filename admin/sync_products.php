@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.0.22
  * @link        https://doli2shop.ptitetete.org
  */
@@ -903,6 +903,10 @@ if ($currentAdminStore !== null) {
         // Story stock-article-non-active-emplacement-reselection-perpetuelle (AC3) : même
         // convention — articles ACTUELLEMENT plafonnés (plafond de cycles consécutifs atteint).
         'syncReportStockLocationCapped' => 'SyncReportStockLocationCapped',
+        // Story 66-7 : collections automatiques non alimentées.
+        'syncReportCollectionsAutomaticSkipped' => 'SyncReportCollectionsAutomaticSkipped',
+        'syncReportCollectionsAutomaticRefused' => 'SyncReportCollectionsAutomaticRefused',
+        'syncReportCollectionsDetailUnreadable' => 'SyncReportCollectionsDetailUnreadable',
     );
     $jsTransValues = array();
     foreach ($jsTransKeys as $jsKey => $langKey) {
@@ -917,7 +921,7 @@ if ($currentAdminStore !== null) {
     var storeId = <?php echo json_encode($currentAdminStoreIsSecondary ? (int) $currentAdminStore->rowid : 0); ?>;
 
     // Cumulative stats across all batches
-    var totalStats = { created: 0, updated: 0, skipped: 0, errors: 0, processed: 0, stockSyncEnabled: false, imagesResyncForced: 0, imagesNoSourceFound: 0, imagesNoSourceFoundRefs: [], runId: null, stockSyncFailed: 0, stockSyncLocationErrors: 0, stockLocationCapped: 0 };
+    var totalStats = { created: 0, updated: 0, skipped: 0, errors: 0, processed: 0, stockSyncEnabled: false, imagesResyncForced: 0, imagesNoSourceFound: 0, imagesNoSourceFoundRefs: [], runId: null, stockSyncFailed: 0, stockSyncLocationErrors: 0, stockLocationCapped: 0, collectionsAutomaticSkipped: new Set(), collectionsAutomaticRefused: new Set(), collectionsDetailUnreadable: new Set() };
     var allErrorDetails = [];
     var totalToSync = 0;
     var isSyncing = false;
@@ -980,7 +984,7 @@ if ($currentAdminStore !== null) {
         if (isSyncing) return;
 
         isSyncing = true;
-        totalStats = { created: 0, updated: 0, skipped: 0, errors: 0, processed: 0, stockSyncEnabled: false, imagesResyncForced: 0, imagesNoSourceFound: 0, imagesNoSourceFoundRefs: [], runId: null, stockSyncFailed: 0, stockSyncLocationErrors: 0, stockLocationCapped: 0 };
+        totalStats = { created: 0, updated: 0, skipped: 0, errors: 0, processed: 0, stockSyncEnabled: false, imagesResyncForced: 0, imagesNoSourceFound: 0, imagesNoSourceFoundRefs: [], runId: null, stockSyncFailed: 0, stockSyncLocationErrors: 0, stockLocationCapped: 0, collectionsAutomaticSkipped: new Set(), collectionsAutomaticRefused: new Set(), collectionsDetailUnreadable: new Set() };
         allErrorDetails = [];
         totalToSync = 0;
 
@@ -1091,6 +1095,12 @@ if ($currentAdminStore !== null) {
                 totalStats.stockSyncLocationErrors += (data.stockSyncLocationErrors || 0);
                 // Story stock-article-non-active-emplacement-reselection-perpetuelle (AC3)
                 totalStats.stockLocationCapped += (data.stockLocationCapped || 0);
+                // Story 66-7
+                // Re-review finale (LOW-3) : les ids de collection sont remis à zéro à chaque lot
+                // côté serveur ; on déduplique ici (Set) au lieu d'additionner des compteurs.
+                ['collectionsAutomaticSkipped', 'collectionsAutomaticRefused', 'collectionsDetailUnreadable'].forEach(function (key) {
+                    (data[key + 'Ids'] || []).forEach(function (collectionId) { totalStats[key].add(String(collectionId)); });
+                });
 
                 // Track stock sync status (Task 3 — AC4)
                 if (data.stockSyncEnabled) {
@@ -1291,6 +1301,26 @@ if ($currentAdminStore !== null) {
             stockCappedBanner.appendChild(document.createTextNode(' ' + TRANS.syncReportStockLocationCapped.replace('%s', String(totalStats.stockLocationCapped))));
             reportErrors.parentNode.insertBefore(stockCappedBanner, reportErrors);
         }
+
+        // Story 66-7 : collections AUTOMATIQUES (conditions) auxquelles aucun produit n'a pu être
+        // rattaché — ajouter une condition ou passer la collection en manuel côté Shopify.
+        // Deux bandeaux distincts (review 4 couches, LOW-5) : détectée automatique avant tout appel
+        // (ignorée) / refusée par Shopify (message évoquant une collection automatique).
+        [
+            ['collectionsAutomaticSkipped', 'syncReportCollectionsAutomaticSkipped', 'd2s-collections-automatic-skipped-banner'],
+            ['collectionsAutomaticRefused', 'syncReportCollectionsAutomaticRefused', 'd2s-collections-automatic-refused-banner'],
+            ['collectionsDetailUnreadable', 'syncReportCollectionsDetailUnreadable', 'd2s-collections-detail-unreadable-banner']
+        ].forEach(function (spec) {
+            if (totalStats[spec[0]].size > 0) {
+                var autoCollBanner = document.createElement('div');
+                autoCollBanner.className = 'd2s-alert-banner d2s-alert--warning ' + spec[2];
+                var autoCollIcon = document.createElement('i');
+                autoCollIcon.className = 'fa fa-exclamation-triangle';
+                autoCollBanner.appendChild(autoCollIcon);
+                autoCollBanner.appendChild(document.createTextNode(' ' + TRANS[spec[1]].replace('%s', String(totalStats[spec[0]].size))));
+                reportErrors.parentNode.insertBefore(autoCollBanner, reportErrors);
+            }
+        });
 
         // Error details — safe DOM construction
         while (reportErrors.firstChild) { reportErrors.removeChild(reportErrors.firstChild); }

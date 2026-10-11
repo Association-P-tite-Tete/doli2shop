@@ -8,7 +8,7 @@
  * @package     ShopifyIntegration
  * @subpackage  Class
  * @category cron
- * @version     2.6.0
+ * @version     2.6.1
  * @since 2.0.1
  * @author      P'tite Tête <doli2shop@ptitetete.com>
  * @copyright   2022-2025 Robert Steinbacher<robert.steinbacher@xivtech.de>
@@ -422,6 +422,41 @@ class ImportProductsCron extends CommonObject
         ];
     }
 
+    /**
+     * Story 66-7 : lignes [WARN] de la sortie CRON pour les TROIS catégories de collections non
+     * alimentées (ignorées car gérées par des conditions, refusées par Shopify, détail des
+     * conditions illisible), lues dans ImportProducts::getCollectionsReport() — la même source que
+     * la réponse ajax de l'écran. Auparavant : journal « Successfully added » et aucune trace.
+     *
+     * @param ImportProducts $importer   Importeur au terme du cycle
+     * @param string         $storeLabel Libellé de la boutique
+     * @return void
+     */
+    protected function appendCollectionsSummary($importer, $storeLabel)
+    {
+        $report = $importer->getCollectionsReport();
+        $categories = [
+            'collectionsAutomaticSkipped' => [
+                'collection(s) geree(s) par des conditions dans Shopify : le module n\'y ajoute pas de produits (passez la collection en manuelle pour qu\'il la remplisse, voir logs LOG_WARNING)',
+                'collection(s) geree(s) par des conditions, sans ajout de produit',
+            ],
+            'collectionsDetailUnreadable' => [
+                'collection(s) ignoree(s) par prudence, Shopify refuse la lecture de leurs conditions (voir logs LOG_WARNING)',
+                'collection(s) a detail de conditions illisible, sans ajout de produit',
+            ],
+            'collectionsAutomaticRefused' => [
+                'collection(s) refusee(s) par Shopify comme automatique(s) (ajoutez une condition ou passez la collection en manuelle, voir logs LOG_WARNING)',
+                'collection(s) refusee(s) par Shopify comme automatique(s)',
+            ],
+        ];
+        foreach ($categories as $key => $texts) {
+            if (!empty($report[$key])) {
+                $this->output .= "\n" . '[WARN] Store ' . $storeLabel . ': ' . $report[$key] . ' ' . $texts[0];
+                $this->log("[COLLECTIONS] " . $report[$key] . " " . $texts[1] . " pour store " . $storeLabel, LOG_WARNING);
+            }
+        }
+    }
+
     protected function runSyncForStore(int $entity, $store, float $startTime): int
     {
         $storeLabel = ($store !== null) ? ($store->shop_domain ?? ('store#' . $store->rowid)) : 'entity-fallback';
@@ -479,6 +514,9 @@ class ImportProductsCron extends CommonObject
             $this->output .= "\n" . '[WARN] Store ' . $storeLabel . ': ' . $importer->stockLocationCappedCount . ' article(s) plafonne(s) (jamais active(s) a l\'emplacement Shopify, action manuelle requise, voir logs LOG_WARNING)';
             $this->log("[STOCK-LOCATION-CAPPED] " . $importer->stockLocationCappedCount . " article(s) plafonne(s) pour store " . $storeLabel, LOG_WARNING);
         }
+
+        // Story 66-7 : collections non alimentées (trois catégories, voir appendCollectionsSummary()).
+        $this->appendCollectionsSummary($importer, $storeLabel);
 
         // Story variante-sans-correspondance-sku-ignoree-en-silence (AC1/AC2/AC3) : même
         // convention que $stockSyncFailedCount ci-dessus — compteur remonté par

@@ -9,7 +9,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.1.8
  */
 
@@ -23,6 +23,7 @@ dol_include_once('/core/db/Database.interface.php');
 require_once dirname(__FILE__) . '/syncflowpolicy.class.php';
 require_once dirname(__FILE__) . '/shopifyapi.class.php';
 require_once dirname(__FILE__) . '/storeservice.class.php';
+require_once dirname(__FILE__) . '/inventoryreferenceresolver.class.php';
 require_once dirname(__FILE__) . '/LoggerTrait.php';
 require_once dirname(__FILE__) . '/../lib/doli2shop.lib.php';
 dol_include_once('/product/class/product.class.php');
@@ -46,9 +47,10 @@ require_once dirname(__FILE__) . '/../lib/compatibility.lib.php';
  * story 52-4 : élimine le risque de lock-wait InnoDB sur llx_doli2shop_stores en cas de refresh
  * de jeton OAuth pendant Facture::validate()).
  *
- * Le push réel reste inchangé et vit désormais dans updateShopifyStock() (méthode PUBLIQUE
- * INCHANGÉE, cf. docblock de la méthode) : pour chaque boutique mappée,
- * ShopifyApi::forStore()->inventorySetQuantities() (valeur absolue, plancher 0). Elle est appelée
+ * Le push réel vit dans updateShopifyStock() (méthode PUBLIQUE, signature inchangée) = cas n=1 de
+ * updateShopifyStockBatch() (Story 66-1, 2.6.1) : pour chaque boutique mappée, LECTURE de la quantité
+ * Shopify à la localisation visée (InventoryReferenceResolver) puis écriture du delta
+ * `inventoryAdjustQuantities` via ShopifyApi::inventorySetQuantities() (plancher 0). Elle est appelée
  * DEUX façons :
  *   - HORS transaction, par StockPushQueueCron (5 min) via StockPushQueueService::drainQueue() —
  *     chemin ASYNCHRONE normal (STOCK_MOVEMENT).
@@ -70,6 +72,30 @@ class ShopifyStockTrigger
 
     /** @var array Error messages */
     public $errors = array();
+
+    /**
+     * Compteur d'erreurs STRUCTURELLES d'emplacement rencontrées par la lecture de référence
+     * (ShopifyLocationErrorException) — exigé par InventoryReferenceResolver::resolve(), même rôle
+     * que ImportProducts::$stockSyncLocationErrorCount.
+     *
+     * @var int
+     */
+    private $locationErrorCount = 0;
+
+    /** @var array<int,array<int,array{kind:string,message:string}>> Erreurs en attente de consolidation, par produit (lot en cours) */
+    private $batchPending = array();
+
+    /** @var array<int,int> Nombre de boutiques confirmées par produit (lot en cours) */
+    private $batchConfirmed = array();
+
+    /** @var array<int,bool> Produits dont au moins un lot n'a pas été traité faute de temps (lot en cours) */
+    private $batchDeferred = array();
+
+    /** @var float Horloge monotone au début du lot en cours */
+    private $batchStartedAt = 0.0;
+
+    /** @var float|null Budget de temps du lot en cours (null = illimité) */
+    private $batchMaxSeconds = null;
 
     /**
      * Taille max des registres statiques process-scoped (Story 52-1 review — MEDIUM).
@@ -94,6 +120,15 @@ class ShopifyStockTrigger
     const MAX_API_RESOLUTIONS_PER_REQUEST = 20;
 
     /**
+     * Plafond d'articles par appel d'écriture `inventorySetQuantities` (Story 66-1, décision
+     * mainteneur du 05/10/2026 : 100 éléments par mutation, = DOLI2SHOP_STOCK_PUSH_QUEUE_LIMIT par
+     * défaut). La limite exacte de `changes` par appel pour l'API 2026-04 est à vérifier dans la
+     * documentation Admin API ; 100 est retenu par prudence. Le plafond de 250 de `nodes(ids:)`
+     * (lecture) est, lui, déjà géré par ShopifyApi::getInventoryQuantitiesAtLocation() (chunks de 200).
+     */
+    const MAX_ITEMS_PER_MUTATION = 100;
+
+    /**
      * Compteur statique process-scoped du nombre de résolutions API RÉELLEMENT tentées
      * (`resolveInventoryItemIdViaApi()` invoquée) durant la requête HTTP/process courante
      * (Story 52-1 review passe 2, HIGH-1). Incrémenté uniquement quand la source DB
@@ -113,7 +148,7 @@ class ShopifyStockTrigger
      * strictement redondant (même couple + même valeur qu'un push précédent réussi). JAMAIS de
      * dédup « premier arrivé » : une valeur différente est toujours poussée (AC #5). Vit le temps
      * du process PHP (une requête HTTP) — pas de faux négatif inter-requêtes. Bornée à
-     * MAX_REGISTRY_SIZE (voir pushStockForStore()).
+     * MAX_REGISTRY_SIZE (voir confirmEntry()).
      *
      * @var array<string,int>
      */
@@ -192,7 +227,7 @@ class ShopifyStockTrigger
         }
 
         // Story 53-3 (site 5, gate routeur) : garde SyncFlowPolicy (flux stock, d2s, storeId=0).
-        // pushStockForStore() revérifie la direction PAR BOUTIQUE plus bas (nouveau gate per-store).
+        // prepareStockPush() revérifie la direction PAR BOUTIQUE plus bas (nouveau gate per-store).
         if (!$this->createSyncFlowPolicy()->isAllowed(SyncFlowPolicy::FLOW_STOCK, 'dolibarr_to_shopify', 0)) {
             $this->log("Synchronisation des stocks Dolibarr → Shopify désactivée", LOG_INFO);
             return 0;
@@ -270,45 +305,106 @@ class ShopifyStockTrigger
     /**
      * Mettre à jour le stock d'un produit dans Shopify pour toutes les boutiques mappées.
      *
-     * ⚠️ Story 52-4 : cette méthode reste INCHANGÉE — elle n'est plus appelée en synchrone par
-     * runTrigger() (remplacé par enqueueStockPush()), mais elle est désormais la primitive
-     * rappelée HORS transaction par StockPushQueueService::drainQueue() (CRON asynchrone,
-     * bypassApiResolutionCap=true) et reste utilisée telle quelle par
-     * StockRecalageService::processBatch() (recalage admin explicite, Story 52-2).
+     * Story 66-1 (2.6.1) : cette méthode (signature publique INCHANGÉE, y compris le paramètre OUT
+     * `$pushedStockOut`) est désormais le cas n=1 de updateShopifyStockBatch() — UN SEUL chemin de
+     * code pour le trigger, la file asynchrone, le recalage et `POST /stock/push`.
      *
-     * Résout le stock Dolibarr (réel/virtuel, plancher 0), puis pousse la valeur absolue vers
-     * chaque boutique active où le produit est mappé. Le flux inventorySetQuantities étant
-     * absolu/idempotent, la dernière valeur écrase toujours les précédentes (convergence).
+     * Résout le stock Dolibarr (réel/virtuel, plancher 0), LIT la quantité Shopify à la localisation
+     * visée de chaque boutique, puis écrit le delta `inventoryAdjustQuantities` (compare-and-swap
+     * sur `available`). Jamais de `changeFromQuantity` inventé : si la lecture est impossible,
+     * l'article n'est pas envoyé et le résultat est -1 (rejouable).
      *
      * @param int      $dolibarrProductId ID du produit Dolibarr
      * @param int|null $pushedStockOut    [OUT] Story 52-2 : reçoit la valeur de stock résolue et
      *                                    planchée (0 si non résolvable) — permet à un appelant
      *                                    batch (recalage) de journaliser la valeur poussée SANS
-     *                                    dupliquer la logique de résolution. Purement additif :
-     *                                    paramètre optionnel par référence, aucun appelant
-     *                                    existant (runTrigger()) n'est impacté.
+     *                                    dupliquer la logique de résolution. Inchangé si le produit
+     *                                    n'a pas pu être chargé.
+     * @param bool     $bypassApiResolutionCap Contourne le plafond de résolutions API par requête
      * @return int 0=OK (au moins pas d'erreur bloquante), -1=au moins une boutique en erreur
      */
     public function updateShopifyStock($dolibarrProductId, &$pushedStockOut = null, $bypassApiResolutionCap = false)
     {
-        $this->log("Mise à jour du stock Shopify pour le produit Dolibarr ID: " . $dolibarrProductId, LOG_INFO);
-
-        // Résoudre le stock Dolibarr (réel/virtuel selon config) une seule fois
-        $stock = $this->resolveStockValue($dolibarrProductId);
-        if ($stock === null) {
-            // Chargement produit impossible : erreur déjà loggée
-            return -1;
-        }
-
-        // Shopify n'accepte pas les stocks négatifs
-        $safeStock = max(0, (int) $stock);
-        if ($safeStock != $stock) {
-            $this->log("Stock négatif (" . $stock . ") ajusté à 0 pour Shopify", LOG_WARNING);
-        }
+        $dolibarrProductId = (int) $dolibarrProductId;
+        $outcomes = $this->updateShopifyStockBatch(array($dolibarrProductId), $bypassApiResolutionCap);
+        $outcome = isset($outcomes[$dolibarrProductId])
+            ? $outcomes[$dolibarrProductId]
+            : array('code' => -1, 'stock' => null, 'errors' => array());
 
         // Story 52-2 : expose la valeur planchée résolue pour observabilité côté appelant (batch
         // de recalage). Ne participe à AUCUNE décision de push (purement informatif).
-        $pushedStockOut = $safeStock;
+        if ($outcome['stock'] !== null) {
+            $pushedStockOut = $outcome['stock'];
+        }
+
+        return $outcome['code'];
+    }
+
+    /**
+     * Pousse le stock Dolibarr de PLUSIEURS produits vers Shopify, regroupé par (boutique,
+     * emplacement) : UN appel de lecture et UN appel d'écriture (par lots de
+     * MAX_ITEMS_PER_MUTATION) par boutique, au lieu de deux appels par produit (Story 66-1, D4).
+     *
+     * Algorithme : (1) résolution du stock Dolibarr de chaque produit ; (2) par produit et par
+     * boutique, les gates (licence, SyncFlowPolicy, API, article, emplacement, dédup) — inchangés ;
+     * (3) par groupe (boutique, emplacement) : lecture de la quantité Shopify à l'emplacement visé
+     * (InventoryReferenceResolver, la même primitive que l'import), puis écriture ; (4) si une
+     * écriture groupée est refusée (compare-and-swap : un seul stock périmé fait refuser le lot
+     * ENTIER), les articles du lot sont rejoués UN PAR UN après relecture — un article fautif
+     * n'envoie jamais ses voisins en échec (D5).
+     *
+     * @param int[] $dolibarrProductIds        IDs de produits Dolibarr
+     * @param bool  $bypassApiResolutionCap    Contourne le plafond de résolutions API par requête
+     *                                         (contexte CRON / admin délibéré, cf. resolveInventoryItemId())
+     * @param float|null $maxSeconds           Budget de temps du lot (re-review 66-1, MEDIUM-2) : au-delà, les
+     *                                         lots restants ne sont PAS traités (résultat `deferred`, sans
+     *                                         erreur ni push) pour que l'appelant les remette en attente
+     * @return array<int,array{code:int,stock:int|null,errors:string[],consumeTry:bool,warnings:string[],deferred:bool}> Par produit : code 0 (OK ou skip
+     *               non bloquant) / -1 (au moins une boutique en erreur), stock planché poussé (null si
+     *               produit non chargeable), messages d'erreur FINAUX de ce produit
+     * @since 2.6.1
+     */
+    public function updateShopifyStockBatch(array $dolibarrProductIds, $bypassApiResolutionCap = true, $maxSeconds = null)
+    {
+        $outcomes = array();
+        $targets = array();
+        $this->batchPending = array();
+        $this->batchConfirmed = array();
+        $this->batchDeferred = array();
+        $this->batchStartedAt = $this->monotonicNow();
+        $this->batchMaxSeconds = ($maxSeconds === null) ? null : (float) $maxSeconds;
+
+        foreach ($dolibarrProductIds as $rawProductId) {
+            $dolibarrProductId = (int) $rawProductId;
+            if (isset($outcomes[$dolibarrProductId])) {
+                continue;
+            }
+            $this->log("Mise à jour du stock Shopify pour le produit Dolibarr ID: " . $dolibarrProductId, LOG_INFO);
+            $outcomes[$dolibarrProductId] = array('code' => 0, 'stock' => null, 'errors' => array(), 'consumeTry' => true, 'warnings' => array(), 'deferred' => false);
+
+            // Résoudre le stock Dolibarr (réel/virtuel selon config) une seule fois par produit
+            $errorsBefore = count($this->errors);
+            $stock = $this->resolveStockValue($dolibarrProductId);
+            if ($stock === null) {
+                // Chargement produit impossible : erreur déjà loggée
+                $outcomes[$dolibarrProductId]['code'] = -1;
+                $outcomes[$dolibarrProductId]['errors'] = array_slice($this->errors, $errorsBefore);
+                continue;
+            }
+
+            // Shopify n'accepte pas les stocks négatifs
+            $safeStock = max(0, (int) $stock);
+            if ($safeStock != $stock) {
+                $this->log("Stock négatif (" . $stock . ") ajusté à 0 pour Shopify", LOG_WARNING);
+            }
+
+            $outcomes[$dolibarrProductId]['stock'] = $safeStock;
+            $targets[$dolibarrProductId] = $safeStock;
+        }
+
+        if (empty($targets)) {
+            return $outcomes;
+        }
 
         // Liste des boutiques actives (multi-boutiques Epic 47). getActiveStores() n'existe pas
         // côté StoreService → getAll(true).
@@ -333,37 +429,64 @@ class ShopifyStockTrigger
             $totalDeclaredStores = $this->countDeclaredStores();
             if ($totalDeclaredStores === null) {
                 $this->log("Erreur SQL indéterminée en comptant les boutiques déclarées (entity=" . $this->entity
-                    . "), skip stock produit ID: " . $dolibarrProductId . " — JAMAIS de fallback legacy sur erreur SQL (MEDIUM-1)", LOG_ERR);
-                return 0;
+                    . "), skip stock produits ID: " . implode(',', array_keys($targets)) . " — JAMAIS de fallback legacy sur erreur SQL (MEDIUM-1)", LOG_ERR);
+                return $outcomes;
             }
             if ($totalDeclaredStores > 0) {
                 $this->log("Boutiques déclarées (" . $totalDeclaredStores . ") mais aucune active/éligible, "
-                    . "skip stock produit ID: " . $dolibarrProductId . " — jamais de fallback legacy global", LOG_INFO);
-                return 0;
+                    . "skip stock produits ID: " . implode(',', array_keys($targets)) . " — jamais de fallback legacy global", LOG_INFO);
+                return $outcomes;
             }
             $this->log("Aucune boutique jamais déclarée (legacy pré-Epic-47), push legacy entité/constantes", LOG_DEBUG);
-            return $this->pushStockForStore($dolibarrProductId, null, $safeStock, $bypassApiResolutionCap);
+            $stores = array(null);
         }
 
-        $overall = 0;
-        foreach ($stores as $store) {
-            $r = $this->pushStockForStore($dolibarrProductId, $store, $safeStock, $bypassApiResolutionCap);
-            if ($r < 0) {
-                $overall = -1;
+        // Phase 1 : gates + préparation, par produit et par boutique, regroupement (boutique, emplacement).
+        $groups = array();
+        $apiByStore = array();
+        foreach ($targets as $dolibarrProductId => $safeStock) {
+            foreach ($stores as $store) {
+                $prepared = $this->prepareStockPush($dolibarrProductId, $store, $safeStock, $bypassApiResolutionCap, $apiByStore);
+                if ($prepared === null) {
+                    continue; // skip non bloquant (déjà loggé)
+                }
+                if (isset($prepared['error'])) {
+                    $this->recordProductError($dolibarrProductId, $prepared['error'], 'persistent');
+                    continue;
+                }
+                // Clé de regroupement : (boutique, emplacement). La boutique en fait PARTIE — deux
+                // boutiques aux credentials distincts ne partagent jamais un appel, même si leur
+                // identifiant d'emplacement est identique.
+                $groupKey = $prepared['storeId'] . '|' . $prepared['locationId'];
+                if (!isset($groups[$groupKey])) {
+                    $groups[$groupKey] = array('api' => $prepared['api'], 'entries' => array());
+                }
+                $groups[$groupKey]['entries'][] = $prepared;
             }
         }
-        return $overall;
+
+        // Phase 2 : lecture + écriture par groupe.
+        foreach ($groups as $group) {
+            $this->pushGroup($group['api'], $group['entries'], $outcomes);
+        }
+
+        $this->finalizeOutcomes($outcomes);
+
+        return $outcomes;
     }
 
     /**
-     * Pousse la valeur de stock absolue vers une boutique donnée (ou legacy si $store === null).
+     * Gates et préparation d'un push (produit, boutique) : tout ce que faisait pushStockForStore()
+     * AVANT la construction du payload (Story 66-1 : scindé en préparation / envoi).
      *
-     * @param int         $dolibarrProductId ID produit Dolibarr
-     * @param object|null $store             Boutique (null = chemin legacy entité/constantes)
-     * @param int         $safeStock         Stock cible (déjà planché à 0)
-     * @return int 0=OK/skip non bloquant, -1=erreur API pour cette boutique
+     * @param int         $dolibarrProductId       ID produit Dolibarr
+     * @param object|null $store                   Boutique (null = chemin legacy entité/constantes)
+     * @param int         $safeStock               Stock cible (déjà planché à 0)
+     * @param bool        $bypassApiResolutionCap  Contourne le plafond de résolutions API
+     * @param array       $apiByStore              [IN/OUT] cache des API par boutique, le temps du lot
+     * @return array|null null = skip non bloquant ; ['error' => string] = erreur ; sinon l'entrée prête
      */
-    private function pushStockForStore($dolibarrProductId, $store, $safeStock, $bypassApiResolutionCap = false)
+    private function prepareStockPush($dolibarrProductId, $store, $safeStock, $bypassApiResolutionCap, array &$apiByStore)
     {
         $storeId = ($store !== null && !empty($store->rowid)) ? (int) $store->rowid : 0;
         $storeLabel = ($store !== null && isset($store->label)) ? $store->label : 'legacy';
@@ -375,30 +498,33 @@ class ShopifyStockTrigger
         if (empty($licence['allowed'])) {
             $this->log("Boutique '" . $storeLabel . "' (rowid=" . $storeId . ") non autorisée à synchroniser (reason="
                 . ($licence['reason'] ?? 'unknown') . "), skip stock produit ID: " . $dolibarrProductId, LOG_INFO);
-            return 0;
+            return null;
         }
 
         // Story 53-3 : gate per-store SyncFlowPolicy (flux stock, d2s), AJOUTÉ APRÈS le gate
         // licence ci-dessus et AVANT tout appel API — un override per-store désactivant le push
         // pour CETTE boutique est désormais honoré (les autres boutiques mappées continuent de
-        // pousser normalement, cf. la boucle appelante updateShopifyStock()).
+        // pousser normalement).
         if (!$this->createSyncFlowPolicy()->isAllowed(SyncFlowPolicy::FLOW_STOCK, 'dolibarr_to_shopify', $storeId)) {
             $this->log("Synchronisation stock Dolibarr → Shopify désactivée pour la boutique '" . $storeLabel
                 . "' (rowid=" . $storeId . "), skip produit ID: " . $dolibarrProductId, LOG_DEBUG);
-            return 0;
+            return null;
         }
 
         // Instancier l'API de la boutique AVANT résolution inventaire : CRITICAL-1 (code review) —
         // le fallback API de résolution de l'inventory item id a besoin de l'API de CETTE boutique
         // (credentials propres, jamais celles d'une autre boutique).
-        $api = $this->buildApiForStore($store);
+        if (!array_key_exists($storeId, $apiByStore)) {
+            $apiByStore[$storeId] = $this->buildApiForStore($store);
+        }
+        $api = $apiByStore[$storeId];
         if ($api === null || !empty($api->error)) {
             $this->log("API Shopify indisponible pour la boutique '" . $storeLabel . "' (rowid=" . $storeId
                 . "): " . ($api !== null ? $api->error : 'null'), LOG_ERR);
             if ($api !== null && !empty($api->error)) {
-                $this->errors[] = $api->error;
+                return array('error' => (string) $api->error);
             }
-            return -1;
+            return array('error' => "API Shopify indisponible pour la boutique '" . $storeLabel . "' (rowid=" . $storeId . ")");
         }
 
         // Résoudre l'ID d'inventaire Shopify filtré par boutique. CRITICAL-1 (code review) :
@@ -410,7 +536,7 @@ class ShopifyStockTrigger
         if (empty($shopifyInventoryItemId)) {
             $this->log("Pas d'ID d'inventaire Shopify (DB ni API) pour le produit ID " . $dolibarrProductId
                 . " sur la boutique '" . $storeLabel . "' (rowid=" . $storeId . "), skip", LOG_DEBUG);
-            return 0;
+            return null;
         }
 
         // Résoudre la location Shopify de la boutique
@@ -418,7 +544,7 @@ class ShopifyStockTrigger
         if (empty($locationId)) {
             $this->log("Aucune location Shopify configurée pour la boutique '" . $storeLabel
                 . "' (rowid=" . $storeId . "), stock non synchronisé pour le produit ID: " . $dolibarrProductId, LOG_WARNING);
-            return 0;
+            return null;
         }
 
         // Consolidation « dernière valeur gagne » : ne supprimer QUE les push strictement redondants
@@ -426,56 +552,352 @@ class ShopifyStockTrigger
         if (isset(self::$lastPushed[$registryKey]) && self::$lastPushed[$registryKey] === $safeStock) {
             $this->log("Push redondant supprimé (produit ID " . $dolibarrProductId . ", boutique rowid " . $storeId
                 . ", valeur " . $safeStock . " déjà poussée)", LOG_DEBUG);
-            return 0;
+            return null;
         }
 
-        // Construire le payload en snake_case (cf. ImportProducts::updateInventoryQuantities()).
-        // current_shopify_quantity inconnue au moment du trigger → l'item part en fallback
-        // inventorySetOnHandQuantities (SET absolu), comportement voulu (valeur absolue convergente).
-        $quantities = array(
-            array(
-                'inventory_item_id'    => $shopifyInventoryItemId,
-                'location_id'          => $locationId,
-                'available_adjustment' => $safeStock,
-            ),
+        return array(
+            'productId' => $dolibarrProductId,
+            'storeId' => $storeId,
+            'storeLabel' => $storeLabel,
+            'locationId' => $locationId,
+            'inventoryItemId' => $shopifyInventoryItemId,
+            'safeStock' => $safeStock,
+            'registryKey' => $registryKey,
+            'api' => $api,
         );
+    }
 
-        $this->log("Push stock Shopify: boutique '" . $storeLabel . "' (rowid=" . $storeId . "), inventory_item_id="
-            . $shopifyInventoryItemId . ", location=" . $locationId . ", quantité=" . $safeStock, LOG_INFO);
+    /**
+     * Horloge monotone (mockable en test).
+     *
+     * @return float Secondes
+     */
+    protected function monotonicNow()
+    {
+        return microtime(true);
+    }
+
+    /**
+     * Le budget de temps du lot est-il épuisé ? (re-review 66-1, MEDIUM-2)
+     *
+     * @return bool
+     */
+    private function isOverBudget()
+    {
+        return $this->batchMaxSeconds !== null && ($this->monotonicNow() - $this->batchStartedAt) > $this->batchMaxSeconds;
+    }
+
+    /**
+     * Marque un article comme NON traité faute de temps : ni erreur ni push, l'appelant le remet en attente.
+     *
+     * @param array $entry Entrée préparée
+     * @return void
+     */
+    private function deferEntry(array $entry)
+    {
+        $this->batchDeferred[$entry['productId']] = true;
+        $this->log("Budget de temps du lot épuisé : produit ID " . $entry['productId'] . ", boutique rowid "
+            . $entry['storeId'] . " reporté au prochain cycle", LOG_WARNING);
+    }
+
+    /**
+     * Pousse un groupe (boutique, emplacement) : dédoublonne, puis traite par LOTS de
+     * MAX_ITEMS_PER_MUTATION, chacun avec SA propre lecture de référence juste avant SON écriture
+     * (review 66-1, MEDIUM-a : une référence lue pour 120 articles serait périmée pour le second lot).
+     *
+     * @param ShopifyApi $api      API de LA boutique du groupe
+     * @param array      $entries  Entrées préparées par prepareStockPush()
+     * @param array      $outcomes [IN/OUT] résultats par produit
+     * @return void
+     */
+    private function pushGroup($api, array $entries, array &$outcomes)
+    {
+        // Défensif (review 66-1, LOW) : deux produits visant le MÊME (article, emplacement) dans un
+        // lot enverraient deux deltas calculés sur la même référence — le second serait refusé. La
+        // DERNIÈRE valeur gagne (même principe que le registre de dédup) ; l'entrée écartée n'est pas
+        // enregistrée comme poussée.
+        $byTarget = array();
+        foreach ($entries as $position => $entry) {
+            $targetKey = $entry['inventoryItemId'] . '|' . $entry['locationId'];
+            if (isset($byTarget[$targetKey])) {
+                $this->log("Deux produits visent le même article/emplacement (" . $targetKey . ") : la valeur du produit ID "
+                    . $entry['productId'] . " remplace celle du produit ID " . $entries[$byTarget[$targetKey]]['productId'], LOG_WARNING);
+                // L'entrée écartée n'est PAS un succès silencieux (re-review 66-1, LOW-1) : erreur de nature
+                // `config` (valeur non poussée), avertissement si le produit a réussi ailleurs.
+                $discarded = $entries[$byTarget[$targetKey]];
+                $this->recordProductError($discarded['productId'], "Produit ID " . $discarded['productId'] . ", boutique '"
+                    . $discarded['storeLabel'] . "' (rowid=" . $discarded['storeId'] . ") : même variante que le produit "
+                    . $entry['productId'] . " (dernier dans l'ordre du lot, article " . $entry['inventoryItemId'] . ") — valeur non poussée, la dernière du lot l'emporte", 'config');
+                unset($entries[$byTarget[$targetKey]]);
+            }
+            $byTarget[$targetKey] = $position;
+        }
+
+        foreach (array_chunk(array_values($entries), self::MAX_ITEMS_PER_MUTATION) as $chunkEntries) {
+            if ($this->isOverBudget()) {
+                foreach ($chunkEntries as $deferredEntry) {
+                    $this->deferEntry($deferredEntry);
+                }
+                continue;
+            }
+            $this->pushChunk($api, $chunkEntries, $outcomes);
+        }
+    }
+
+    /**
+     * Lit la référence Shopify d'un lot (≤ MAX_ITEMS_PER_MUTATION articles), écrit le delta, isole les
+     * échecs (Story 66-1, D1/D3/D5).
+     *
+     * @param ShopifyApi $api      API de LA boutique du lot
+     * @param array      $entries  Entrées préparées (≤ MAX_ITEMS_PER_MUTATION)
+     * @param array      $outcomes [IN/OUT] résultats par produit
+     * @return void
+     */
+    private function pushChunk($api, array $entries, array &$outcomes)
+    {
+        // Payload en snake_case (cf. ImportProducts::updateInventoryQuantities()). AUCUNE référence
+        // n'est posée ici : elle est LUE à la localisation visée par le résolveur ci-dessous.
+        $rows = array();
+        foreach ($entries as $position => $entry) {
+            $rows[$position] = $this->buildQuantityRow($entry);
+        }
+
+        $failures = array();
+        $this->resolveReferences($rows, $api, $failures);
+
+        $readyPositions = array();
+        foreach ($entries as $position => $entry) {
+            $unreadable = $this->describeUnreadableReference($entry, $rows[$position], isset($failures[$position]) ? $failures[$position] : null);
+            if ($unreadable !== null) {
+                $this->failEntry($entry, array($unreadable['message']), $unreadable['kind']);
+                continue;
+            }
+            $readyPositions[] = $position;
+        }
+
+        if (empty($readyPositions)) {
+            return;
+        }
+
+        $chunkRows = array();
+        foreach ($readyPositions as $position) {
+            $chunkRows[] = $rows[$position];
+            $entry = $entries[$position];
+            $this->log("Push stock Shopify: boutique '" . $entry['storeLabel'] . "' (rowid=" . $entry['storeId']
+                . "), inventory_item_id=" . $entry['inventoryItemId'] . ", location=" . $entry['locationId']
+                . ", quantité=" . $entry['safeStock'], LOG_INFO);
+        }
 
         // MEDIUM-2 (review passe 2, cosmétique — NON bloquant) : ce push sortant ne pose PAS le
         // flag SHOPIFY_INTEGRATION_SYNC_IN_PROGRESS. Ce n'est PAS un oubli : l'écho webhook
-        // Shopify (inventory_levels/update déclenché par notre propre inventorySetQuantities())
-        // arrive dans une requête HTTP SÉPARÉE et ULTÉRIEURE (webhook async), donc un flag
-        // in-memory posé ICI (durée de vie = le process PHP courant) serait de toute façon retombé
-        // avant l'arrivée de cet écho — poser SYNC_IN_PROGRESS ici serait inefficace et donnerait une
-        // fausse impression de protection. L'anti-boucle réellement efficace contre cet écho est déjà
-        // en place ailleurs et suffisante : InventoryWebhookHandler pose PROCESSING_INVENTORY_WEBHOOK
-        // avant de créer le mouvement de stock inbound, et ShopifyStockTrigger::runTrigger() rejette
-        // tout mouvement dont origin_type == 'shopify_sync' (garde en tête de méthode). Aucune boucle
-        // infinie possible ; seul effet résiduel accepté : un mouvement de stock Dolibarr redondant
-        // (mais non-bouclant) créé par l'écho inbound de CE push sortant. Aucune action supplémentaire
-        // requise (décision produit : bruit résiduel accepté, cf. story 52-1 review passe 2).
+        // Shopify (inventory_levels/update déclenché par notre propre mutation) arrive dans une
+        // requête HTTP SÉPARÉE et ULTÉRIEURE, donc un flag in-memory posé ICI serait de toute
+        // façon retombé avant l'arrivée de cet écho. L'anti-boucle réellement efficace est déjà
+        // en place ailleurs : InventoryWebhookHandler pose PROCESSING_INVENTORY_WEBHOOK avant de
+        // créer le mouvement de stock inbound, et runTrigger() rejette tout mouvement dont
+        // origin_type == 'shopify_sync'. Aucune boucle infinie possible ; seul effet résiduel
+        // accepté : un mouvement de stock Dolibarr redondant (mais non-bouclant).
+        $sent = $this->sendQuantities($api, $chunkRows);
+        if ($sent === null) {
+            foreach ($readyPositions as $position) {
+                $this->confirmEntry($entries[$position]);
+            }
+            return;
+        }
+
+        $kind = $sent['transient'] ? 'transient' : 'persistent';
+
+        // D5 : une mutation Shopify est ATOMIQUE — un seul changeFromQuantity périmé (mouvement
+        // concurrent entre la lecture et l'écriture) fait refuser le lot ENTIER, et l'index de
+        // l'article fautif n'est pas fiable. On rejoue donc chaque article SEUL, après relecture —
+        // MAIS UNIQUEMENT sur une userError (refus portant sur les articles — compare-and-swap OU autre :
+        // article non stocké à l'emplacement, quantité hors bornes… sinon un seul article fautif ferait
+        // échouer les 99 autres, re-review 66-1 HIGH-B). Un throttle, un 5xx, une exception réseau, un
+        // 401/403 ou toute erreur de premier niveau n'a rien à voir avec un article : rejouer n articles un
+        // par un multiplierait les appels sur une API déjà saturée ou refusée. Échec du lot entier.
+        // Un article déjà appliqué relit delta = 0 et est sauté (jamais de double application).
+        if (!$sent['replay'] || count($readyPositions) === 1) {
+            foreach ($readyPositions as $position) {
+                $this->failEntry($entries[$position], $sent['errors'], $kind);
+            }
+            return;
+        }
+
+        $this->log("Écriture groupée refusée (userErrors" . ($sent['cas'] ? ', compare-and-swap' : '') . ") pour " . count($readyPositions) . " article(s) ("
+            . implode(', ', $sent['errors']) . ") — rejeu article par article après relecture", LOG_WARNING);
+        foreach ($readyPositions as $position) {
+            if ($this->isOverBudget()) {
+                $this->deferEntry($entries[$position]);
+                continue;
+            }
+            $this->replayEntry($api, $entries[$position]);
+        }
+    }
+
+    /**
+     * Rejoue UN article après relecture de sa référence (isolation D5).
+     *
+     * @param ShopifyApi $api   API de la boutique
+     * @param array      $entry Entrée préparée
+     * @return void
+     */
+    private function replayEntry($api, array $entry)
+    {
+        // Ligne NEUVE : aucune référence du premier passage ne survit (elle est périmée par hypothèse).
+        $rows = array($this->buildQuantityRow($entry));
+        $failures = array();
+        $this->resolveReferences($rows, $api, $failures);
+
+        $unreadable = $this->describeUnreadableReference($entry, $rows[0], isset($failures[0]) ? $failures[0] : null);
+        if ($unreadable !== null) {
+            $this->failEntry($entry, array($unreadable['message']), $unreadable['kind']);
+            return;
+        }
+
+        $sent = $this->sendQuantities($api, $rows);
+        if ($sent === null) {
+            $this->confirmEntry($entry);
+            return;
+        }
+        $this->failEntry($entry, $sent['errors'], $sent['transient'] ? 'transient' : 'persistent');
+    }
+
+    /**
+     * Ligne de quantité sans aucune référence (format snake_case de ShopifyApi::inventorySetQuantities()).
+     *
+     * @param array $entry Entrée préparée
+     * @return array
+     */
+    private function buildQuantityRow(array $entry)
+    {
+        return array(
+            'inventory_item_id'    => $entry['inventoryItemId'],
+            'location_id'          => $entry['locationId'],
+            'available_adjustment' => $entry['safeStock'],
+        );
+    }
+
+    /**
+     * Lit la référence Shopify (available/on_hand) à l'emplacement visé via la primitive commune
+     * InventoryReferenceResolver (la même que l'import, hotfix 2.5.7) — jamais une seconde implémentation.
+     *
+     * @param array      $rows     [IN/OUT] lignes de quantité
+     * @param ShopifyApi $api      API de la boutique
+     * @param array      $failures [OUT] échecs de lecture par index de ligne
+     * @return void
+     */
+    private function resolveReferences(array &$rows, $api, array &$failures)
+    {
+        $resolver = new InventoryReferenceResolver();
+        $logger = function ($message, $level) {
+            $this->log($message, $level);
+        };
+        $resolver->resolve($rows, $api, $this->locationErrorCount, $logger, $failures);
+    }
+
+    /**
+     * D3 : si la référence n'a pas pu être lue, l'article n'est PAS envoyé. Retourne le message
+     * d'erreur explicite et sa nature (jamais de valeur inventée), ou null si la référence est lue.
+     *
+     * Natures : 'config' (emplacement absent/désactivé : défaut de configuration de CETTE boutique,
+     * retenter ne sert à rien tant qu'il n'est pas corrigé), 'transient' (réseau, throttle, erreur
+     * partielle : incident passager), 'persistent' (article non activé à l'emplacement).
+     *
+     * @param array      $entry   Entrée préparée
+     * @param array      $row     Ligne après lecture
+     * @param array|null $failure Échec de lecture signalé par le résolveur (null = aucun)
+     * @return array{message:string,kind:string}|null
+     */
+    private function describeUnreadableReference(array $entry, array $row, $failure)
+    {
+        $prefix = "Produit ID " . $entry['productId'] . ", boutique '" . $entry['storeLabel'] . "' (rowid=" . $entry['storeId'] . ") : ";
+
+        if ($failure !== null) {
+            if ($failure['kind'] === 'location') {
+                return array('kind' => 'config', 'message' => $prefix . "lecture du stock Shopify impossible, emplacement " . $entry['locationId']
+                    . " invalide ou désactivé (" . $failure['reason'] . ") — configuration de la boutique à corriger : "
+                    . $failure['message']);
+            }
+            if ($failure['kind'] === 'persistent') {
+                return array('kind' => 'persistent', 'message' => $prefix . "lecture du stock Shopify refusée, erreur non transitoire ("
+                    . $failure['message'] . ") — vérifier la connexion Shopify (jeton, droits de l'application)");
+            }
+            return array('kind' => 'transient', 'message' => $prefix . "lecture du stock Shopify impossible (" . $failure['message'] . ") — sera retenté");
+        }
+
+        if (!array_key_exists('current_shopify_quantity', $row) && !array_key_exists('on_hand_shopify_quantity', $row)) {
+            return array('kind' => 'persistent', 'message' => $prefix . "article Shopify " . $entry['inventoryItemId'] . " absent de l'emplacement "
+                . $entry['locationId'] . " (non activé ou non suivi à cet emplacement) — stock non poussé. Activer l'article à cet "
+                . "emplacement dans Shopify ; la tentative sera renouvelée.");
+        }
+
+        return null;
+    }
+
+    /**
+     * Envoie un lot de lignes déjà munies de leur référence.
+     *
+     * @param ShopifyApi $api  API de la boutique
+     * @param array      $rows Lignes de quantité
+     * @return array{errors:string[],cas:bool,replay:bool,transient:bool}|null null = succès confirmé. `replay` =
+     *         au moins une userError (refus portant sur les articles) : seul cas qui justifie un rejeu
+     *         article par article ; `cas` = compare-and-swap (journal) ; `transient` = throttle/5xx/réseau
+     *         UNIQUEMENT (tout le reste est persistant).
+     */
+    private function sendQuantities($api, array $rows)
+    {
         try {
-            $response = $api->inventorySetQuantities($quantities);
+            $response = $api->inventorySetQuantities($rows);
         } catch (\Throwable $e) {
-            $this->log("Exception lors du push stock Shopify (produit ID " . $dolibarrProductId . ", boutique rowid "
-                . $storeId . "): " . $e->getMessage(), LOG_ERR);
-            $this->errors[] = $e->getMessage();
-            return -1;
+            $this->log("Exception lors du push stock Shopify (" . count($rows) . " article(s)): " . $e->getMessage(), LOG_ERR);
+            // Re-review 66-1 (HIGH-A) : transitoire = réseau/délai SEULEMENT ; toute autre exception
+            // (configuration absente, 401…) est persistante.
+            return array('errors' => array($e->getMessage()), 'cas' => false, 'replay' => false,
+                'transient' => ShopifyApi::isTransientFailureMessage($e->getMessage()));
         }
 
         // Détecter les erreurs de la réponse agrégée normalisée (userErrors / failedCount / errors)
-        if ($this->responseHasError($response)) {
-            $errMsgs = $this->extractResponseErrors($response);
-            $this->log("Erreur API Shopify lors du push stock (produit ID " . $dolibarrProductId . ", boutique rowid "
-                . $storeId . "): " . implode(', ', $errMsgs), LOG_ERR);
-            $this->errors = array_merge($this->errors, $errMsgs);
-            // Ne PAS enregistrer dans le registre : la valeur n'est pas confirmée poussée → un
-            // prochain mouvement re-tentera (jamais de valeur périmée figée).
-            return -1;
+        if (!$this->responseHasError($response)) {
+            return null;
         }
 
+        $userErrors = (is_object($response) && !empty($response->userErrors)) ? (array) $response->userErrors : array();
+        // Détection du compare-and-swap par le TEXTE : la mutation ne demande pas `userErrors.code`
+        // (champ à vérifier dans la doc Admin API 2026-04 avant de l'ajouter ; non inventé ici). Le
+        // drapeau `cas` ne sert plus qu'au journal : le rejeu vaut pour TOUTE userError.
+        $cas = false;
+        foreach ($userErrors as $userError) {
+            $text = (is_object($userError) && isset($userError->message))
+                ? (string) $userError->message
+                : (is_string($userError) ? $userError : (string) json_encode($userError));
+            if (preg_match('/changeFromQuantity|persisted quantity/i', $text)) {
+                $cas = true;
+            }
+        }
+
+        // Re-review 66-1 (HIGH-A) : sans userError, l'erreur est de premier niveau. Transitoire
+        // UNIQUEMENT si c'est un throttle ou une erreur serveur déclarée ; 401, 403, ACCESS_DENIED,
+        // schéma, inconnue = persistant. Réponse non-objet : corps illisible (passerelle 5xx).
+        if (!is_object($response)) {
+            $transient = true;
+        } elseif (!empty($userErrors)) {
+            $transient = false;
+        } else {
+            $transient = ShopifyApi::isTransientGraphQLErrors($response->errors ?? null);
+        }
+
+        return array('errors' => $this->extractResponseErrors($response), 'cas' => $cas, 'replay' => !empty($userErrors), 'transient' => $transient);
+    }
+
+    /**
+     * Enregistre un succès CONFIRMÉ dans le registre de dédup (jamais avant : un push refusé ne
+     * doit pas figer la valeur, Story 66-1 AC6) et le journalise.
+     *
+     * @param array $entry Entrée préparée
+     * @return void
+     */
+    private function confirmEntry(array $entry)
+    {
         // Registre borné (MEDIUM, review) : purge défensive avant écriture pour les contextes
         // CLI/CRON long-vivants (worker persistant traitant un très grand nombre de produits
         // distincts). Perte de l'optimisation de dédup uniquement, jamais de valeur périmée.
@@ -485,10 +907,102 @@ class ShopifyStockTrigger
         }
 
         // Succès : enregistrer la dernière valeur poussée pour ce couple
-        self::$lastPushed[$registryKey] = $safeStock;
-        $this->log("Stock Shopify mis à jour avec succès (produit ID " . $dolibarrProductId . ", boutique rowid "
-            . $storeId . ", quantité " . $safeStock . ")", LOG_INFO);
-        return 0;
+        self::$lastPushed[$entry['registryKey']] = $entry['safeStock'];
+        $this->batchConfirmed[$entry['productId']] = (isset($this->batchConfirmed[$entry['productId']]) ? $this->batchConfirmed[$entry['productId']] : 0) + 1;
+        $this->log("Stock Shopify mis à jour avec succès (produit ID " . $entry['productId'] . ", boutique rowid "
+            . $entry['storeId'] . ", quantité " . $entry['safeStock'] . ")", LOG_INFO);
+    }
+
+    /**
+     * Échec FINAL d'un article : journalise, mémorise l'erreur du produit (consolidée en fin de lot
+     * par finalizeOutcomes()). Ne PAS enregistrer dans le registre : la valeur n'est pas confirmée
+     * poussée → un prochain mouvement re-tentera.
+     *
+     * @param array    $entry  Entrée préparée
+     * @param string[] $errors Messages d'erreur
+     * @param string   $kind   'transient' | 'config' | 'persistent'
+     * @return void
+     */
+    private function failEntry(array $entry, array $errors, $kind)
+    {
+        $this->log("Push stock Shopify en échec (" . $kind . ", produit ID " . $entry['productId'] . ", boutique rowid "
+            . $entry['storeId'] . "): " . implode(', ', $errors), LOG_ERR);
+        foreach ($errors as $message) {
+            $this->recordProductError($entry['productId'], $message, $kind);
+        }
+    }
+
+    /**
+     * Mémorise une erreur d'un produit pour la consolidation de fin de lot.
+     *
+     * @param int    $dolibarrProductId ID produit
+     * @param string $message           Message
+     * @param string $kind              'transient' | 'config' | 'persistent'
+     * @return void
+     */
+    private function recordProductError($dolibarrProductId, $message, $kind)
+    {
+        $this->batchPending[$dolibarrProductId][] = array('kind' => $kind, 'message' => (string) $message);
+    }
+
+    /**
+     * Consolide les erreurs de chaque produit en fin de lot (review 66-1, MEDIUM-b/c) :
+     *  - une erreur 'persistent' ou 'transient' fait échouer le produit (code -1) ;
+     *  - `consumeTry` n'est vrai que si au moins une erreur est 'persistent' : un incident transitoire
+     *    ou une erreur de configuration ne consomme PAS les essais de la file (une panne Shopify ne
+     *    doit pas envoyer tout le lot en dead-letter ; le backoff complet reste hors périmètre) ;
+     *  - une erreur 'config' (emplacement absent/désactivé d'UNE boutique) ne fait pas échouer le
+     *    produit si au moins une autre boutique a été confirmée : elle devient un avertissement
+     *    (`warnings`), jamais silencieuse (LOG_ERR). Sans aucune boutique réussie, le produit échoue
+     *    (code -1) SANS consommer d'essai, avec le message explicite.
+     *
+     * @param array $outcomes [IN/OUT] résultats par produit
+     * @return void
+     */
+    private function finalizeOutcomes(array &$outcomes)
+    {
+        foreach ($outcomes as $dolibarrProductId => &$outcome) {
+            if (!empty($this->batchDeferred[$dolibarrProductId])) {
+                $outcome['deferred'] = true;
+            }
+            if (empty($this->batchPending[$dolibarrProductId])) {
+                continue;
+            }
+            $all = array();
+            $blocking = array();
+            $config = array();
+            foreach ($this->batchPending[$dolibarrProductId] as $pending) {
+                $all[] = $pending['message'];
+                if ($pending['kind'] === 'config') {
+                    $config[] = $pending['message'];
+                } else {
+                    $blocking[] = $pending;
+                }
+            }
+
+            if (!empty($blocking)) {
+                $outcome['code'] = -1;
+                $outcome['errors'] = array_merge($outcome['errors'], $all);
+                $consume = false;
+                foreach ($blocking as $pending) {
+                    if ($pending['kind'] === 'persistent') {
+                        $consume = true;
+                    }
+                }
+                $outcome['consumeTry'] = $consume;
+            } elseif (!empty($this->batchConfirmed[$dolibarrProductId])) {
+                $outcome['warnings'] = array_merge($outcome['warnings'], $config);
+            } else {
+                $outcome['code'] = -1;
+                $outcome['errors'] = array_merge($outcome['errors'], $config);
+                $outcome['consumeTry'] = false;
+            }
+
+            if ($outcome['code'] === -1) {
+                $this->errors = array_merge($this->errors, $all);
+            }
+        }
+        unset($outcome);
     }
 
     /**

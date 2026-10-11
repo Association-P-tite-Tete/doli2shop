@@ -12,7 +12,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       1.0.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -35,6 +35,7 @@ require_once dirname(__FILE__) . '/syncflowpolicy.class.php';
 require_once dirname(__FILE__) . '/dolibarrdirectfileresolver.class.php';
 require_once dirname(__FILE__) . '/productscopehelper.class.php';
 require_once dirname(__FILE__) . '/skuvariantmatcher.class.php';
+require_once dirname(__FILE__) . '/inventoryreferenceresolver.class.php';
 require_once dirname(__FILE__) . '/LoggerTrait.php';
 require_once dirname(__FILE__) . '/CronHelperTrait.php';
 
@@ -315,6 +316,57 @@ class ImportProducts extends CommonObject
     public $stockLocationCappedCount = 0;
 
     /**
+     * @var int Story 66-7 : nombre de COLLECTIONS AUTOMATIQUES (conditions) distinctes auxquelles
+     * le module n'a pas pu rattacher de produit sur le cycle en cours — soit ignorées avant tout
+     * appel (marqueur `skipped` de ShopifyApi::collectionAddProducts()), soit refusées par Shopify
+     * (userError évoquant une collection automatique). Jamais compté comme un rattachement réussi.
+     * Exposé dans la réponse JSON d'ajax/sync_products_batch.php (champ
+     * `collectionsAutomaticSkipped`) et dans la sortie CRON.
+     * @since 2.6.1
+     */
+    public $collectionsAutomaticSkippedCount = 0;
+
+    /**
+     * @var int Story 66-7 (review 4 couches, LOW-5) : collections distinctes REFUSÉES par Shopify
+     * (userError évoquant une collection automatique) sur le cycle en cours — distinct de
+     * `collectionsAutomaticSkippedCount` (collections détectées automatiques AVANT tout appel).
+     * Exposé dans `collectionsAutomaticRefused` (ajax/sync_products_batch.php) et la sortie CRON.
+     * @since 2.6.1
+     */
+    public $collectionsAutomaticRefusedCount = 0;
+
+    /**
+     * @var int Re-review 66-7 (MEDIUM-N1) : collections distinctes ignorées par prudence parce que
+     * le détail de leurs conditions est illisible (refus Shopify) — ni automatiques certaines, ni
+     * refusées. Exposé dans `collectionsDetailUnreadable` et la sortie CRON.
+     * @since 2.6.1
+     */
+    public $collectionsDetailUnreadableCount = 0;
+
+    /**
+     * @var array<string,bool> IDs de collections à détail illisible déjà comptées ce cycle
+     */
+    private $collectionsDetailUnreadableIds = [];
+
+    /**
+     * @var array<string,bool> Story 66-7 : IDs de collections refusées déjà comptées ce cycle
+     */
+    private $collectionsAutomaticRefusedIds = [];
+
+    /**
+     * @var array<string,bool> Story 66-7 : IDs de collections automatiques déjà comptées ce cycle
+     * (déduplication : un même ID ne compte qu'une fois, quel que soit le nombre de lots/produits).
+     */
+    private $collectionsAutomaticSkippedIds = [];
+
+    /**
+     * @var array<string,string> Story 66-7 (T5) : classement 'smart'|'manual'|'unknown' des
+     * collections dont le mapping est 'external_managed', par process ET par boutique
+     * (clé "{storeId}_{collectionId}") — 1 appel Shopify par collection et par process.
+     */
+    private static $externalManagedKindCache = [];
+
+    /**
      * Constructor
      *
      * @param DoliDB      $db     Database handler
@@ -490,6 +542,13 @@ class ImportProducts extends CommonObject
         // compteur d'articles ACTUELLEMENT plafonnés (persistance au-delà de N cycles) sur CE
         // cycle.
         $this->stockLocationCappedCount = 0;
+        // Story 66-7 : collections automatiques non alimentées sur CE cycle.
+        $this->collectionsAutomaticSkippedCount = 0;
+        $this->collectionsAutomaticSkippedIds = [];
+        $this->collectionsAutomaticRefusedCount = 0;
+        $this->collectionsAutomaticRefusedIds = [];
+        $this->collectionsDetailUnreadableCount = 0;
+        $this->collectionsDetailUnreadableIds = [];
 
         $this->db->begin();
 
@@ -786,6 +845,23 @@ class ImportProducts extends CommonObject
                     . " consecutifs atteint - action manuelle requise cote Shopify (voir logs LOG_WARNING ci-dessus)", LOG_WARNING);
             }
 
+            // Story 66-7 : résumé visible des collections AUTOMATIQUES non alimentées (aucun produit
+            // rattaché) — lu par ajax/sync_products_batch.php et le CRON.
+            if ($this->collectionsAutomaticSkippedCount > 0) {
+                $this->log("RÉSUMÉ CYCLE COLLECTIONS AUTOMATIQUES: " . $this->collectionsAutomaticSkippedCount
+                    . " collection(s) gérée(s) par des conditions dans Shopify : le module n'y ajoute pas de produits (passez la collection en manuelle pour qu'il la remplisse, voir logs LOG_WARNING ci-dessus)", LOG_WARNING);
+            }
+
+            if ($this->collectionsDetailUnreadableCount > 0) {
+                $this->log("RÉSUMÉ CYCLE COLLECTIONS À DÉTAIL ILLISIBLE: " . $this->collectionsDetailUnreadableCount
+                    . " collection(s) ignorée(s) par prudence : Shopify refuse la lecture de leurs conditions (voir logs LOG_WARNING ci-dessus)", LOG_WARNING);
+            }
+
+            if ($this->collectionsAutomaticRefusedCount > 0) {
+                $this->log("RÉSUMÉ CYCLE COLLECTIONS REFUSÉES PAR SHOPIFY: " . $this->collectionsAutomaticRefusedCount
+                    . " collection(s) refusée(s) comme automatique(s) — ajoutez une condition ou passez la collection en manuelle (voir logs LOG_WARNING ci-dessus)", LOG_WARNING);
+            }
+
             // Story variante-sans-correspondance-sku-ignoree-en-silence (AC1/AC2/AC3) : résumé
             // visible des variantes/déclinaisons non appariées par SKU du cycle (au lieu de rester
             // invisible dans un diagnostic à "0 erreur") — lu également par
@@ -1048,10 +1124,26 @@ class ImportProducts extends CommonObject
             // exécutée) — ce check était donc toujours faux et les userErrors jamais détectées.
             // inventorySetQuantities() retourne désormais une réponse agrégée normalisée
             // exposant directement `userErrors` (fusion des 2 chemins delta/fallback).
-            if (!empty($response->userErrors)) {
+            // Re-review 66-1 : tester AUSSI `errors` (erreur de premier niveau : throttle, 401, 403…), la
+            // réponse non-objet et l'échec agrégé (`failedCount`) — comme les autres appelants. Sans cela,
+            // une réponse en erreur restait un « succès » silencieux.
+            $responseFailed = !is_object($response)
+                || !empty($response->errors)
+                || !empty($response->userErrors)
+                || (isset($response->failedCount) && (int) $response->failedCount > 0);
+            if ($responseFailed) {
                 $errors = [];
-                foreach ($response->userErrors as $error) {
-                    $errors[] = $error->field . ': ' . $error->message;
+                if (is_object($response)) {
+                    foreach ((array) ($response->userErrors ?? []) as $error) {
+                        $field = (is_object($error) && isset($error->field)) ? (is_array($error->field) ? implode('.', $error->field) : $error->field) : '';
+                        $errors[] = trim($field . ': ' . (is_object($error) && isset($error->message) ? $error->message : json_encode($error)), ': ');
+                    }
+                    foreach ((array) ($response->errors ?? []) as $error) {
+                        $errors[] = (is_object($error) && isset($error->message)) ? (string) $error->message : (is_string($error) ? $error : json_encode($error));
+                    }
+                }
+                if (empty($errors)) {
+                    $errors[] = is_object($response) ? 'échec agrégé (failedCount)' : 'réponse Shopify illisible ou vide';
                 }
                 $this->stockSyncFailedCount++;
                 $this->log("Erreurs API Shopify pour mise à jour stock (SKU: " . ($variant->sku ?? 'unknown') . "): " . implode(', ', $errors), LOG_ERR);
@@ -5246,7 +5338,7 @@ class ImportProducts extends CommonObject
      *                                   (Story 57-7) — conservé pour rétro-compatibilité de signature
      * @param object|null $product Dolibarr product — requis pour la branche 'product' (Story 57-2)
      * @return array|null Image data with content, mime_type, size, filename
-     * @version     2.6.0
+     * @version     2.6.1
      * @since 2.0.33
      */
     protected function getImageContent($image, $modulepart = 'product', $originalFile = null, $product = null)
@@ -5351,115 +5443,16 @@ class ImportProducts extends CommonObject
      */
     private function fillInventoryReferenceQuantities(array &$inventoryQuantities)
     {
-        $byLocation = [];
-        foreach ($inventoryQuantities as $index => $iq) {
-            $locationGid = (string) ($iq['location_id'] ?? '');
-            $itemGid = (string) ($iq['inventory_item_id'] ?? '');
-            if ($locationGid === '' || $itemGid === '') {
-                continue;
-            }
-            $byLocation[$locationGid][$itemGid][] = $index;
-        }
-
-        if (empty($byLocation)) {
-            return 0;
-        }
-
-        $resolved = 0;
-        foreach ($byLocation as $locationGid => $itemsToIndexes) {
-            // 🔴 Cet appel réseau NE DOIT JAMAIS faire échouer la synchronisation qui l'englobe.
-            // `executeGraphQL()` lève une exception après épuisement de ses tentatives ; sans ce
-            // catch, elle remonte jusqu'au `catch` de syncProduct(), dont le `rollback()`
-            // annulerait le mapping produit et les correspondances de variantes DÉJÀ ENREGISTRÉS
-            // — alors que la mutation correspondante a, elle, déjà été appliquée chez Shopify et
-            // n'est pas annulable. Le produit resterait sans mapping malgré un succès distant, et
-            // le cycle se répéterait indéfiniment.
-            // (HIGH relevé par la revue 3 couches du 21/09.)
-            //
-            // Hotfix 2.5.7 (review 3 couches 26/09/2026, MEDIUM) : commentaire corrigé — l'ancien
-            // texte disait « le lot repart avec ce qu'il avait, exactement comme avant ce
-            // correctif ». C'était vrai tant qu'un SEED (ProductVariant.inventoryQuantity, le
-            // TOTAL toutes localisations) était posé avant cet appel : ce seed n'existe plus
-            // (retiré par ce même hotfix). Depuis, en cas d'échec de lecture, le lot repart SANS
-            // AUCUNE valeur de référence — dropUnresolvedInventoryReferences() écarte alors ces
-            // articles au lieu de les envoyer avec une référence fausse ou inventée.
-            //
-            // Deux échecs distincts, traités différemment :
-            // - STRUCTUREL (ShopifyLocationErrorException, levée UNIQUEMENT quand l'erreur GraphQL
-            //   globale désigne réellement l'emplacement lui-même — cf.
-            //   ShopifyApi::isLocationRelatedGraphQLError()) : défaut de CONFIGURATION, jamais
-            //   résolu par un simple retry. LOG_ERR explicite + compteur dédié
-            //   ($stockSyncLocationErrorCount), une fois par appel (pas par item).
-            // - TRANSITOIRE (tout autre Throwable — réseau/timeout, ou une erreur globale non
-            //   liée à l'emplacement comme un THROTTLED épuisé) : incident probablement passager,
-            //   LOG_WARNING, retenté au prochain cycle.
-            //
-            // Hotfix 2.5.7 (re-review 27/09/2026, CRITICAL) : `catch (ShopifyLocationErrorException)`
-            // AVANT `catch (\Throwable)` — cette exception porte les quantités déjà résolues par
-            // les chunks PRÉCÉDENTS du même appel (`$e->partialResults`) : on les applique quand
-            // même ci-dessous au lieu de les perdre (ne PAS faire `continue` ici).
-            $levels = [];
-            try {
-                $levels = $this->shopifyApi->getInventoryQuantitiesAtLocation(array_keys($itemsToIndexes), $locationGid);
-            } catch (ShopifyLocationErrorException $e) {
-                $this->stockSyncLocationErrorCount++;
-                // Re-review 27/09/2026 (HIGH, second passage) : message ACTIONNABLE distinct selon
-                // la raison précise portée par l'exception — un emplacement DÉSACTIVÉ (existe,
-                // simplement inactif) n'appelle pas la même remédiation qu'un emplacement
-                // introuvable/invalide (corriger `shopify_location_id`) : choisir un AUTRE
-                // emplacement, actif celui-là, dans la configuration de la boutique.
-                if ($e->reason === 'disabled') {
-                    $this->log('fillInventoryReferenceQuantities - ERREUR STRUCTURELLE emplacement '
-                        . $locationGid . ' DESACTIVE cote Shopify : ' . $e->getMessage()
-                        . ' - choisir un emplacement ACTIF dans la configuration de la boutique '
-                        . '(retenter ne suffira pas tant qu\'aucun emplacement actif n\'est configure).', LOG_ERR);
-                } else {
-                    $this->log('fillInventoryReferenceQuantities - ERREUR STRUCTURELLE emplacement '
-                        . $locationGid . ' introuvable ou invalide cote Shopify : ' . $e->getMessage()
-                        . ' - verifier shopify_location_id dans la configuration de la boutique '
-                        . '(retenter ne suffira pas tant que la configuration est incorrecte).', LOG_ERR);
-                }
-                $levels = $e->partialResults;
-            } catch (\Throwable $e) {
-                $this->log('fillInventoryReferenceQuantities - lecture temporairement impossible pour '
-                    . 'la localisation ' . $locationGid . ' (incident reseau transitoire) : ' . $e->getMessage()
-                    . ' - les articles concernes seront ecartes ce cycle-ci et retentes au prochain.', LOG_WARNING);
-                continue;
-            }
-            foreach ($itemsToIndexes as $itemGid => $indexes) {
-                if (!array_key_exists($itemGid, $levels)) {
-                    continue;
-                }
-                foreach ($indexes as $index) {
-                    // ⚠️ CLÉ DISTINCTE, et ce n'est pas un détail. Écrire ici
-                    // `current_shopify_quantity` ferait basculer l'article vers le chemin DELTA
-                    // (`inventoryAdjustQuantities`), qui ajuste la grandeur **available**. Or on
-                    // vient de lire **on_hand**. Le delta serait calculé sur une grandeur et
-                    // appliqué à une autre : un stock faux, écrit en silence — pire que le refus
-                    // qu'on corrige.
-                    if (array_key_exists('on_hand', $levels[$itemGid])) {
-                        $inventoryQuantities[$index]['on_hand_shopify_quantity'] = (int) $levels[$itemGid]['on_hand'];
-                    }
-                    if (array_key_exists('available', $levels[$itemGid])) {
-                        // ⚠️ On ÉCRASE volontairement la valeur venue de
-                        // `ProductVariant.inventoryQuantity`. Celle-ci est un TOTAL toutes
-                        // localisations, alors que le chemin delta compare `changeFromQuantity`
-                        // à la quantité `available` DE LA LOCALISATION visée. Les deux
-                        // coïncident sur une boutique à un seul entrepôt — et divergent sur
-                        // toutes les autres, où la mutation est alors refusée.
-                        // (CRITICAL relevé par la revue 3 couches du 21/09.)
-                        $inventoryQuantities[$index]['current_shopify_quantity'] = (int) $levels[$itemGid]['available'];
-                    }
-                    $resolved++;
-                }
-            }
-        }
-
-        $this->log('fillInventoryReferenceQuantities - ' . $resolved
-            . ' article(s) dont les quantites de reference ont ete lues a la localisation visee',
-            LOG_INFO);
-
-        return $resolved;
+        // Story 66-1 (2.6.1) : le corps de cette méthode (hotfix 2.5.7) a été DÉPLACÉ À
+        // L'IDENTIQUE dans InventoryReferenceResolver::resolve(), pour que le push stock du trigger
+        // (ShopifyStockTrigger) réutilise la même lecture au lieu d'une seconde implémentation.
+        // Signature privée, valeur de retour, compteur structurel et messages de log inchangés.
+        // Le résolveur ne rappelle QUE $this->shopifyApi->getInventoryQuantitiesAtLocation().
+        $resolver = new InventoryReferenceResolver();
+        $logger = function ($message, $level) {
+            $this->log($message, $level);
+        };
+        return $resolver->resolve($inventoryQuantities, $this->shopifyApi, $this->stockSyncLocationErrorCount, $logger);
     }
 
     /**
@@ -5595,7 +5588,7 @@ class ImportProducts extends CommonObject
      *                                  fournit l'entité à utiliser pour résoudre
      *                                  `multidir_output`, à la place de l'entité contextuelle
      * @return array|null Image data with content, mime_type, size, filename or null on failure
-     * @version     2.6.0
+     * @version     2.6.1
      * @since 2.1.6
      */
     private function getImageContentFromDisk($image, $modulepart = 'product', $originalFile = null, $product = null)
@@ -7483,7 +7476,7 @@ class ImportProducts extends CommonObject
 
             if (empty($fileStatus) || empty($fileStatus->data) || empty($fileStatus->data->node)) {
                 $this->log("File status check failed on attempt " . $attempt . " for " . $fileId, LOG_WARNING);
-                sleep($sleepSeconds);
+                $this->pauseBeforeFileRetry($sleepSeconds);
                 continue;
             }
 
@@ -7503,12 +7496,40 @@ class ImportProducts extends CommonObject
             // If not ready yet, sleep and retry
             if ($attempt < $maxAttempts) {
                 $this->log("File not ready yet, waiting " . $sleepSeconds . " seconds before retry...", LOG_DEBUG);
-                sleep($sleepSeconds);
+                $this->pauseBeforeFileRetry($sleepSeconds);
             }
         }
 
         $this->log("File did not become ready after " . $maxAttempts . " attempts: " . $fileId, LOG_WARNING);
         return false;
+    }
+
+    /**
+     * Review 66-4 (HIGH) : un collectionUpdate n'est un succes que si Shopify l'a REELLEMENT applique :
+     * ni `errors` (executeGraphQL peut rendre errors[] sans data apres les retries Throttled), ni
+     * userErrors, ET une collection renvoyee. Sinon la memoire d'image serait ecrite sans image en place.
+     *
+     * @param mixed $response Reponse de executeGraphQL()
+     * @return bool
+     */
+    private function isCollectionImageUpdateApplied($response)
+    {
+        return is_object($response)
+            && empty($response->errors)
+            && empty($response->data->collectionUpdate->userErrors)
+            && !empty($response->data->collectionUpdate->collection->id);
+    }
+
+    /**
+     * Pause entre deux sondages du statut d'un fichier Shopify (couture de test, Story 66-4 : permet
+     * de simuler l'echec de waitForFileReady() sans attendre 18 s reelles).
+     *
+     * @param int $seconds Duree de la pause
+     * @return void
+     */
+    protected function pauseBeforeFileRetry($seconds)
+    {
+        sleep($seconds);
     }
 
     /**
@@ -8071,7 +8092,9 @@ class ImportProducts extends CommonObject
         $categoryDescription = $categoryData['description'] ?? '';
 
         // Check local cache first
-        $cacheKey = $categoryId . '_' . $categoryLabel;
+        // Story 66-4 : le cache est statique (partage entre boutiques dans un meme process) -> la boutique
+        // fait partie de la cle (sinon la boutique n°2 recevrait l'ID de collection de la n°1).
+        $cacheKey = (int) $this->shopifyApi->getStoreId() . '_' . $categoryId . '_' . $categoryLabel;
         if (isset(self::$collectionsCache[$cacheKey])) {
             $this->log("Using cached collection ID for: " . $categoryLabel, LOG_DEBUG);
             return self::$collectionsCache[$cacheKey];
@@ -8112,6 +8135,26 @@ class ImportProducts extends CommonObject
                     // adopte le mapping (tagging produits gardé par ailleurs via isSmartCollection dans
                     // collectionAddProducts) mais on n'écrase JAMAIS description/image ni ne force la
                     // publication d'une collection gérée par le marchand — à CHAQUE run, sans appel API.
+                    // Story 66-7 (T5) : avant 2.6.1, une collection MANUELLE portant une
+                    // CollectionConditionsSource sans condition était classée SMART à tort, et le
+                    // mapping persisté 'external_managed' — la garde ci-dessous la gelait alors à
+                    // jamais. On requalifie donc, sur PREUVE seulement ('manual' certain, jamais
+                    // sur un détail indisponible) : 1 appel par collection, par process et par
+                    // boutique. Une collection réellement automatique reste 'external_managed'.
+                    if (($mapping['sync_direction'] ?? '') === 'external_managed'
+                        && $this->requalifyExternalManagedMapping($collectionId) === 'manual') {
+                        $this->collectionsUtils->createOrUpdateMapping(
+                            $categoryId,
+                            $categoryLabel,
+                            $collectionId,
+                            'gid://shopify/Collection/' . $collectionId,
+                            $categoryLabel,
+                            'dol_to_shop'
+                        );
+                        $mapping['sync_direction'] = 'dol_to_shop';
+                        $this->log("Mapped collection " . $categoryLabel . " (ID: " . $collectionId . ") n'est plus classée automatique (aucune condition) — mapping requalifié external_managed -> dol_to_shop", LOG_INFO);
+                    }
+
                     if (($mapping['sync_direction'] ?? '') === 'external_managed') {
                         $this->log("Mapped collection " . $categoryLabel . " (ID: " . $collectionId . ") is externally managed (rules/sources) — skipping description/image/publish", LOG_DEBUG);
                         self::$collectionsCache[$cacheKey] = $collectionId;
@@ -8139,7 +8182,9 @@ class ImportProducts extends CommonObject
                     }
 
                     // Handle image upload separately using staged upload process
-                    $this->uploadCategoryImageToCollection($collectionId, $categoryId, $categoryLabel);
+                    // Story 66-4 : image === null (propriete presente) = collection sans image cote Shopify.
+                    $shopifyCollectionHasImage = property_exists($existing, 'image') ? ($existing->image !== null) : null;
+                    $this->uploadCategoryImageToCollection($collectionId, $categoryId, $categoryLabel, $shopifyCollectionHasImage);
 
                     // Publish mapped collection to configured sales channels
                     $collectionGid = 'gid://shopify/Collection/' . $collectionId;
@@ -8186,7 +8231,14 @@ class ImportProducts extends CommonObject
                 // collectionCreate()) reste modifiable normalement — pas de garde sur ce chemin.
                 // 1 appel API (isSmartCollection) volontairement limité à ce chemin d'adoption par
                 // titre, pas ajouté au chemin "déjà mappée" ci-dessus (perf du cas majoritaire).
-                $isAdoptedSmartCollection = $this->shopifyApi->isSmartCollection($collectionId);
+                // Review 4 couches 66-7 (MEDIUM-1) : à l'ADOPTION, une CollectionConditionsSource dont
+                // les conditions n'ont pas pu être lues (détail des sources refusé par Shopify) est
+                // peut-être automatique : on gèle comme avant 66-7 (external_managed), SANS en faire
+                // un classement SMART — isSmartCollection() et la règle d'ajout de produits restent
+                // inchangées, et la requalification T5 ne touche jamais un `unknown`.
+                $adoptedClassification = $this->shopifyApi->classifyCollection($collectionId);
+                $isAdoptedSmartCollection = ($adoptedClassification['kind'] === 'smart')
+                    || !empty($adoptedClassification['undetailedConditionsSource']);
 
                 if ($isAdoptedSmartCollection) {
                     // Review post-fix (Edge Case Hunter MEDIUM) : l'upload d'image est AUSSI
@@ -8381,72 +8433,119 @@ class ImportProducts extends CommonObject
     }
 
     /**
-     * Add product to collections based on Dolibarr categories
+     * Story 66-7 (T5) : classement d'une collection dont le mapping est 'external_managed',
+     * mémorisé par process et par boutique (le cache statique est partagé entre boutiques dans un
+     * même process : la boutique fait partie de la clé).
      *
-     * @param Product $dolProduct Dolibarr product object
-     * @param string $shopifyProductId Shopify product ID
-     * @return bool Success status
-     * @since 2.0.26
+     * @param string $collectionId Collection ID (legacy resource ID)
+     * @return string 'smart'|'manual'|'unknown'
      */
-    private function addProductToCollections($dolProduct, $shopifyProductId)
+    private function requalifyExternalManagedMapping($collectionId)
     {
-        // Story 53-5 (site 3c, 3/3) : gate collections export via SyncFlowPolicy (la dérivation
-        // encapsule DÉJÀ le gate SYNC_PRODUCT_COLLECTIONS + le mapping direction)
-        if (!$this->isExportFlowAllowed(SyncFlowPolicy::FLOW_COLLECTIONS)) {
-            $this->log("Collections sync is disabled or direction not allowed for export", LOG_DEBUG);
-            return true; // Not an error, just not configured
-        }
-
-        $this->log("Starting collection assignment for product: " . $dolProduct->ref . " (Shopify ID: " . $shopifyProductId . ")", LOG_INFO);
-
-        $categories = $this->getProductCategories($dolProduct);
-        
-        if (empty($categories)) {
-            $this->log("No categories found for product " . $dolProduct->ref, LOG_DEBUG);
-            return true;
-        }
-
-        // Group all collections that need this product
-        $collectionsToUpdate = [];
-        
-        foreach ($categories as $category) {
-            $collectionId = $this->getOrCreateShopifyCollection($category);
-            
-            if ($collectionId) {
-                $collectionsToUpdate[] = [
-                    'id' => $collectionId,
-                    'name' => $category['label']
-                ];
-                $this->log("Will add product to collection: " . $category['label'] . " (ID: " . $collectionId . ")", LOG_DEBUG);
-            }
-        }
-
-        if (empty($collectionsToUpdate)) {
-            $this->log("No collections to update for product " . $dolProduct->ref, LOG_DEBUG);
-            return true;
-        }
-
-        // Add product to each collection
-        $successCount = 0;
-        foreach ($collectionsToUpdate as $collection) {
+        $cacheKey = (int) $this->shopifyApi->getStoreId() . '_' . $collectionId;
+        if (!isset(self::$externalManagedKindCache[$cacheKey])) {
             try {
-                $response = $this->shopifyApi->collectionAddProducts($collection['id'], [$shopifyProductId]);
-                
-                if (!empty($response->data->collectionAddProducts->userErrors)) {
-                    $this->log("Error adding product to collection " . $collection['name'] . ": " . json_encode($response->data->collectionAddProducts->userErrors), LOG_WARNING);
-                } else {
-                    $successCount++;
-                    $this->log("Successfully added product " . $dolProduct->ref . " to collection: " . $collection['name'], LOG_INFO);
-                }
-            } catch (Exception $e) {
-                $this->log("Exception adding product to collection " . $collection['name'] . ": " . $e->getMessage(), LOG_WARNING);
+                self::$externalManagedKindCache[$cacheKey] = $this->shopifyApi->getCollectionKind($collectionId);
+            } catch (\Throwable $e) {
+                $this->log("Requalification external_managed impossible pour la collection " . $collectionId . ": " . $e->getMessage(), LOG_WARNING);
+                self::$externalManagedKindCache[$cacheKey] = 'unknown';
             }
         }
 
-        $this->log("Collection assignment completed for product " . $dolProduct->ref . ": " . $successCount . "/" . count($collectionsToUpdate) . " collections", LOG_INFO);
-        
-        // Return true if at least some collections were updated successfully
-        return $successCount > 0;
+        return self::$externalManagedKindCache[$cacheKey];
+    }
+
+    /**
+     * Story 66-7 (T3/T4) : interprète la réponse de ShopifyApi::collectionAddProducts() sans
+     * jamais prendre « aucune userError » pour un succès.
+     *
+     * - 'skipped' : marqueur `skipped` posé par collectionAddProducts() (collection automatique,
+     *   AUCUN appel émis) — WARNING, compté à part ;
+     * - 'automatic_refused' : userErrors évoquant une collection automatique — WARNING
+     *   field+message + message explicite, compté à part, pas de retry via collectionUpdate ;
+     * - 'error' : toute autre userError — WARNING field+message ;
+     * - 'added' : seul cas qui compte comme rattachement réussi.
+     *
+     * @param object $response       Réponse GraphQL (ou factice)
+     * @param string $collectionId   Collection ID
+     * @param string $collectionLabel Libellé pour le journal (nom de catégorie ou ID)
+     * @param int    $productsCount  Nombre de produits visés
+     * @return string 'added'|'skipped'|'unreadable'|'automatic_refused'|'error'
+     */
+    private function classifyCollectionAddResponse($response, $collectionId, $collectionLabel, $productsCount)
+    {
+        $payload = $response->data->collectionAddProducts ?? null;
+
+        if (!empty($payload->skipped) && $payload->skipped === ShopifyApi::COLLECTION_ADD_SKIPPED_UNREADABLE) {
+            $this->collectionsDetailUnreadableIds[(string) $collectionId] = true;
+            $this->collectionsDetailUnreadableCount = count($this->collectionsDetailUnreadableIds);
+            $this->log("Collection " . $collectionLabel . " (ID: " . $collectionId . ") ignorée : détail des conditions illisible, le module n'y ajoute pas de produits par prudence (" . $productsCount . " produit(s) NON ajouté(s))", LOG_WARNING);
+            return 'unreadable';
+        }
+
+        if (!empty($payload->skipped)) {
+            $this->registerAutomaticCollectionSkipped($collectionId);
+            $this->log("Collection " . $collectionLabel . " (ID: " . $collectionId . ") ignorée : collection gérée par des conditions dans Shopify, le module n'y ajoute pas de produits (" . $productsCount . " produit(s) NON ajouté(s)) — passez la collection en manuelle pour qu'il la remplisse", LOG_WARNING);
+            return 'skipped';
+        }
+
+        if (!empty($payload->userErrors)) {
+            $this->log("Error adding products to collection " . $collectionLabel . " (ID: " . $collectionId . "): " . json_encode($payload->userErrors), LOG_WARNING);
+            if (ShopifyApi::userErrorsIndicateSmartCollection($payload->userErrors)) {
+                $this->registerAutomaticCollectionRefused($collectionId);
+                $this->log("Collection " . $collectionLabel . " (ID: " . $collectionId . ") refusée par Shopify comme collection automatique (" . $productsCount . " produit(s) NON ajouté(s)) — ajoutez une condition ou passez la collection en manuelle", LOG_WARNING);
+                return 'automatic_refused';
+            }
+            return 'error';
+        }
+
+        return 'added';
+    }
+
+    /**
+     * Re-review finale 66-7 : bilan des collections non alimentées, pour les DEUX sorties (réponse
+     * ajax de l'écran, sortie du CRON) — une seule source, pour qu'aucune catégorie ne puisse
+     * disparaître d'une sortie sans que ça se voie. Les identifiants de collection (jamais de
+     * titre) permettent à l'écran de dédupliquer d'un lot ajax à l'autre : les ids sont remis à
+     * zéro à chaque lot, une même collection serait sinon recomptée.
+     *
+     * @return array<string,mixed>
+     * @since 2.6.1
+     */
+    public function getCollectionsReport()
+    {
+        return [
+            'collectionsAutomaticSkipped' => (int) $this->collectionsAutomaticSkippedCount,
+            'collectionsAutomaticRefused' => (int) $this->collectionsAutomaticRefusedCount,
+            'collectionsDetailUnreadable' => (int) $this->collectionsDetailUnreadableCount,
+            'collectionsAutomaticSkippedIds' => array_map('strval', array_keys($this->collectionsAutomaticSkippedIds)),
+            'collectionsAutomaticRefusedIds' => array_map('strval', array_keys($this->collectionsAutomaticRefusedIds)),
+            'collectionsDetailUnreadableIds' => array_map('strval', array_keys($this->collectionsDetailUnreadableIds)),
+        ];
+    }
+
+    /**
+     * Story 66-7 : compte une collection automatique distincte non alimentée ce cycle.
+     *
+     * @param string $collectionId Collection ID
+     * @return void
+     */
+    private function registerAutomaticCollectionSkipped($collectionId)
+    {
+        $this->collectionsAutomaticSkippedIds[(string) $collectionId] = true;
+        $this->collectionsAutomaticSkippedCount = count($this->collectionsAutomaticSkippedIds);
+    }
+
+    /**
+     * Story 66-7 (LOW-5) : compte une collection distincte refusée par Shopify ce cycle.
+     *
+     * @param string $collectionId Collection ID
+     * @return void
+     */
+    private function registerAutomaticCollectionRefused($collectionId)
+    {
+        $this->collectionsAutomaticRefusedIds[(string) $collectionId] = true;
+        $this->collectionsAutomaticRefusedCount = count($this->collectionsAutomaticRefusedIds);
     }
 
     /**
@@ -8465,6 +8564,9 @@ class ImportProducts extends CommonObject
         $this->log("Processing batch collection updates for " . count($this->pendingCollectionAssignments) . " collections", LOG_INFO);
 
         $successCount = 0;
+        $skippedCount = 0;
+        $unreadableCount = 0;
+        $errorCount = 0;
         $totalAssignments = 0;
 
         foreach ($this->pendingCollectionAssignments as $collectionId => $productIds) {
@@ -8476,19 +8578,26 @@ class ImportProducts extends CommonObject
                 $this->log("Adding " . count($uniqueProductIds) . " products to collection: " . $collectionId, LOG_INFO);
                 
                 $response = $this->shopifyApi->collectionAddProducts($collectionId, $uniqueProductIds);
-                
-                if (!empty($response->data->collectionAddProducts->userErrors)) {
-                    $this->log("Error in batch update for collection " . $collectionId . ": " . json_encode($response->data->collectionAddProducts->userErrors), LOG_WARNING);
-                } else {
+
+                // Story 66-7 : le « succès » n'est affirmé que si rien n'a été ignoré ni refusé.
+                $outcome = $this->classifyCollectionAddResponse($response, $collectionId, (string) $collectionId, count($uniqueProductIds));
+                if ($outcome === 'added') {
                     $successCount++;
                     $this->log("Successfully added " . count($uniqueProductIds) . " products to collection " . $collectionId . " in one API call", LOG_INFO);
+                } elseif ($outcome === 'error') {
+                    $errorCount++;
+                } elseif ($outcome === 'unreadable') {
+                    $unreadableCount++;
+                } else {
+                    $skippedCount++;
                 }
             } catch (Exception $e) {
+                $errorCount++;
                 $this->log("Exception in batch update for collection " . $collectionId . ": " . $e->getMessage(), LOG_WARNING);
             }
         }
 
-        $this->log("Batch collection updates completed: " . $successCount . "/" . count($this->pendingCollectionAssignments) . " collections, " . $totalAssignments . " total product assignments", LOG_INFO);
+        $this->log("Batch collection updates completed: " . $successCount . " added, " . $skippedCount . " skipped (automatic collection), " . $unreadableCount . " skipped (unreadable conditions detail), " . $errorCount . " in error / " . count($this->pendingCollectionAssignments) . " collections, " . $totalAssignments . " total product assignments", LOG_INFO);
         
         // Clear pending assignments for next execution
         $this->pendingCollectionAssignments = [];
@@ -8679,11 +8788,13 @@ class ImportProducts extends CommonObject
      * @param string $collectionId Shopify collection ID
      * @param int $categoryId Category ID (rowid)
      * @param string $categoryLabel Category label for logging
+     * @param bool|null $shopifyCollectionHasImage Story 66-4 : false = la collection n'a PAS d'image cote
+     *                  Shopify (renvoi force) ; true/null = inconnu ou presente (on se fie a la memoire)
      * @return bool Success status
      * @since 2.0.33
-     * @version     2.6.0
+     * @version     2.6.1
      */
-    private function uploadCategoryImageToCollection($collectionId, $categoryId, $categoryLabel)
+    private function uploadCategoryImageToCollection($collectionId, $categoryId, $categoryLabel, $shopifyCollectionHasImage = null)
     {
         try {
             $this->log("Starting image upload for collection " . $categoryLabel . " (ID: " . $collectionId . ")", LOG_INFO);
@@ -8714,6 +8825,21 @@ class ImportProducts extends CommonObject
             if (!$imageContent) {
                 $this->log("No image content found for category " . $categoryLabel, LOG_DEBUG);
                 return false;
+            }
+
+            // Story 66-4 : empreinte = contenu de l'image + libelle (altText). La garde est ICI, pas aux
+            // 3 sites d'appel. Memoire liee a la collection Shopify visee ; ne jamais bloquer (AC12).
+            $imageFingerprint = hash('sha256', hash('sha256', (string) $imageContent['content']) . '|' . $categoryLabel);
+            $imageState = $this->collectionsUtils->getImageSyncState($categoryId);
+            if (
+                is_array($imageState)
+                && !empty($imageState['image_sha256'])
+                && hash_equals((string) $imageState['image_sha256'], $imageFingerprint)
+                && (string) ($imageState['image_collection_id'] ?? '') === (string) $collectionId
+                && $shopifyCollectionHasImage !== false
+            ) {
+                $this->log("uploadCategoryImageToCollection - image inchangee pour la collection " . $categoryLabel . " (ID: " . $collectionId . "), aucun envoi", LOG_DEBUG);
+                return true;
             }
 
             // 1. Prepare staged upload input using the same structure as product images
@@ -8822,8 +8948,8 @@ class ImportProducts extends CommonObject
                 'variables' => $collectionUpdateVariables
             ]);
 
-            if (!empty($collectionUpdateResponse->data->collectionUpdate->userErrors)) {
-                $this->log("First attempt failed with altText, trying without altText: " . json_encode($collectionUpdateResponse->data->collectionUpdate->userErrors), LOG_WARNING);
+            if (!$this->isCollectionImageUpdateApplied($collectionUpdateResponse)) {
+                $this->log("First attempt failed with altText, trying without altText: " . json_encode($collectionUpdateResponse->data->collectionUpdate->userErrors ?? ($collectionUpdateResponse->errors ?? 'no data')), LOG_WARNING);
 
                 // Fallback: Try without altText
                 $fallbackVariables = [
@@ -8840,16 +8966,18 @@ class ImportProducts extends CommonObject
                     'variables' => $fallbackVariables
                 ]);
 
-                if (!empty($fallbackResponse->data->collectionUpdate->userErrors)) {
-                    $this->log("Fallback also failed to update collection with image: " . json_encode($fallbackResponse->data->collectionUpdate->userErrors), LOG_ERR);
+                if (!$this->isCollectionImageUpdateApplied($fallbackResponse)) {
+                    $this->log("Fallback also failed to update collection with image: " . json_encode($fallbackResponse->data->collectionUpdate->userErrors ?? ($fallbackResponse->errors ?? 'no data')), LOG_ERR);
                     return false;
                 } else {
                     $this->log("Successfully updated collection " . $collectionId . " with image (fallback method)", LOG_INFO);
+                    $this->collectionsUtils->setImageSyncState($categoryId, $collectionId, $imageFingerprint);
                     return true;
                 }
             }
 
             $this->log("Successfully updated collection " . $collectionId . " with new image", LOG_INFO);
+            $this->collectionsUtils->setImageSyncState($categoryId, $collectionId, $imageFingerprint);
             return true;
 
         } catch (Exception $e) {

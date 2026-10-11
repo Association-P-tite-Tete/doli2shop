@@ -8,7 +8,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.4.5
  * @link        https://doli2shop.ptitetete.org
  */
@@ -38,16 +38,37 @@ require_once dirname(__FILE__) . '/shopifystocktrigger.class.php';
  *     transaction métier Dolibarr. Claim atomique (pending → processing, pattern
  *     WebhookManager::processEvent()), retry borné + dead-letter (pattern
  *     DOLI2SHOP_WEBHOOK_MAX_TRIES), puis délègue le push réel à
- *     ShopifyStockTrigger::updateShopifyStock() — INCHANGÉE, seule primitive qui gère déjà le
- *     multi-boutiques (Epic 47), le plancher 0 et la résolution d'inventaire.
+ *     ShopifyStockTrigger::updateShopifyStockBatch() (Story 66-1, 2.6.1 — le cas n=1 est
+ *     updateShopifyStock()), seule primitive qui gère le multi-boutiques (Epic 47), le plancher 0,
+ *     la résolution d'inventaire et la LECTURE de la quantité Shopify à la localisation visée.
  *
  * Design : une ligne de file = un (fk_product, entity), JAMAIS une (fk_product, fk_store) — le
- * drainage appelle updateShopifyStock($fk_product) qui fait elle-même le fan-out vers TOUTES les
+ * drainage appelle updateShopifyStockBatch() qui fait lui-même le fan-out vers TOUTES les
  * boutiques mappées de l'entité. Ceci évite toute duplication de la logique multi-boutiques dans
  * cette classe.
  */
 class StockPushQueueService
 {
+    /**
+     * Items réclamés puis poussés ensemble (Story 66-1, review HIGH-1). Doit rester petit devant le
+     * délai de reprise des items bloqués (DOLI2SHOP_STOCK_PUSH_QUEUE_STUCK_TIMEOUT_MIN, 5 min).
+     */
+    const DRAIN_SUBLOT_SIZE = 25;
+
+    /** Budget de temps d'un drainage, strictement sous le délai de reprise des items bloqués (300 s). */
+    const DRAIN_TIME_BUDGET_SECONDS = 180;
+
+    /**
+     * Âge maximal (secondes) pendant lequel un item peut être réessayé SANS consommer d'essai
+     * (incident transitoire, erreur de configuration de boutique). Au-delà, chaque tentative consomme un
+     * essai et l'item finit en dead-letter. Re-review 66-1 (HIGH-A, MEDIUM-1) : sans cette borne, un
+     * échec que l'on croit passager mais qui est permanent boucle sans fin, un appel API par cycle.
+     * Aucune colonne n'existe pour dater le début de la période d'échec (`date_creation` = tout premier
+     * enfilage du produit, `tms` est réécrit à chaque claim) : la date de début est portée par un marqueur
+     * en tête de `last_error` (« [depuis AAAA-MM-JJ hh:mm:ss] »), sans nouvelle colonne ni migration.
+     */
+    const FREE_RETRY_MAX_AGE_SECONDS = 86400;
+
     use LoggerTrait;
 
     /** @var DoliDB Gestionnaire de base de données */
@@ -95,6 +116,10 @@ class StockPushQueueService
         $sql .= " ON DUPLICATE KEY UPDATE";
         $sql .= " status = 0,";
         $sql .= " tries = 0,";
+        // Re-review 66-1 (MEDIUM-1) : un réarmement ouvre une NOUVELLE période d'échec. Sans vider
+        // last_error, le marqueur « [depuis …] » d'une ancienne panne rendrait l'item « trop vieux » et il
+        // repartirait en dead-letter en 5 cycles sur une simple coupure.
+        $sql .= " last_error = NULL,";
         $sql .= " tms = NOW()";
 
         $resql = $this->db->query($sql);
@@ -111,11 +136,11 @@ class StockPushQueueService
      * Draine la file d'attente (appelée par le CRON, JAMAIS depuis une requête web) : récupère
      * un lot de marqueurs pending, les claim atomiquement (pattern WebhookManager::processEvent(),
      * status 0→3), puis pousse le stock COURANT de chaque produit via
-     * ShopifyStockTrigger::updateShopifyStock() (relit la valeur en base à cet instant précis,
+     * ShopifyStockTrigger::updateShopifyStockBatch() (relit la valeur en base à cet instant précis,
      * jamais un snapshot pris à l'enqueue).
      *
      * @param int $limit Nombre max de marqueurs traités par passage
-     * @return array{claimed:int,pushed:int,errors:int,deadLetter:int,raced:int,recoalesced:int,skipped:bool}
+     * @return array{claimed:int,pushed:int,errors:int,deadLetter:int,raced:int,recoalesced:int,skipped:bool,timeBudgetReached:bool,deferred:int}
      */
     public function drainQueue($limit = 100)
     {
@@ -129,6 +154,8 @@ class StockPushQueueService
             'raced' => 0,
             'recoalesced' => 0,
             'skipped' => false,
+            'timeBudgetReached' => false,
+            'deferred' => 0,
         );
 
         // Re-vérification de la direction de sync AU DRAINAGE (pas seulement à l'enqueue) : un
@@ -155,7 +182,7 @@ class StockPushQueueService
             $maxTries = 5;
         }
 
-        $sql = "SELECT rowid, fk_product, tries FROM " . MAIN_DB_PREFIX . "doli2shop_stock_queue";
+        $sql = "SELECT rowid, fk_product, tries, last_error FROM " . MAIN_DB_PREFIX . "doli2shop_stock_queue";
         $sql .= " WHERE status = 0"; // pending
         $sql .= " AND tries < " . (int) $maxTries;
         $sql .= " AND entity = " . (int) $this->entity;
@@ -174,34 +201,85 @@ class StockPushQueueService
                 'rowid' => (int) $obj->rowid,
                 'fk_product' => (int) $obj->fk_product,
                 'tries' => (int) $obj->tries,
+                'last_error' => isset($obj->last_error) ? (string) $obj->last_error : '',
             );
         }
         $this->db->free($resql);
 
-        foreach ($items as $item) {
-            $this->drainOneItem($item, $maxTries, $result);
+        // Story 66-1 (2.6.1) : claim atomique de CHAQUE item (inchangé, un par un), puis UN appel de push
+        // par SOUS-LOT réclamé — le trigger regroupe par (boutique, emplacement) : une lecture et une
+        // écriture par boutique et par lot au lieu de deux appels par produit. Statut terminal par rowid
+        // (markDone / markRetry / markDeadLetter, gardés `status = 3`) INCHANGÉ.
+        //
+        // Review 66-1 (HIGH-1) : on ne réclame JAMAIS plus d'items qu'on ne peut traiter avant que
+        // recoverStuckItems() (5 min par défaut) ne les juge abandonnés. Réclamer les 100 d'un coup puis
+        // pousser en série (throttle Shopify, rejeux) laissait les derniers items en status 3 assez
+        // longtemps pour être remis en pending par un second drainage → double push, et markDone du
+        // second worker sur le claim du premier. Donc : sous-lots de DRAIN_SUBLOT_SIZE (claim → push →
+        // statut terminal, puis sous-lot suivant) ET budget de temps : au-delà de
+        // DRAIN_TIME_BUDGET_SECONDS le drainage s'arrête, les items non réclamés restent pending et
+        // repartent au cycle suivant.
+        $startedAt = $this->monotonicNow();
+        foreach (array_chunk($items, self::DRAIN_SUBLOT_SIZE) as $sublot) {
+            if ($this->monotonicNow() - $startedAt > self::DRAIN_TIME_BUDGET_SECONDS) {
+                $result['timeBudgetReached'] = true;
+                $this->log('drainQueue() - Budget de temps (' . self::DRAIN_TIME_BUDGET_SECONDS . ' s) atteint : les items restants repartent au prochain cycle', LOG_WARNING);
+                break;
+            }
+
+            $claimed = array();
+            foreach ($sublot as $item) {
+                if ($this->claimItem($item, $result)) {
+                    $claimed[] = $item;
+                }
+            }
+
+            if (empty($claimed)) {
+                continue;
+            }
+
+            $remaining = max(0.0, self::DRAIN_TIME_BUDGET_SECONDS - ($this->monotonicNow() - $startedAt));
+            $outcomes = $this->pushClaimedItems($claimed, $remaining);
+            foreach ($claimed as $item) {
+                $this->finalizeItem($item, $maxTries, $outcomes[$item['fk_product']], $result);
+            }
         }
 
         return $result;
     }
 
     /**
-     * Traite un item de la file : claim atomique, push via la primitive existante, mise à jour
-     * du statut (done / pending pour retry / dead_letter). Jamais d'exception non catchée
-     * n'interrompt le lot : un item en échec ne bloque jamais les suivants.
+     * Horloge monotone du drainage (mockable en test pour simuler un drainage lent).
      *
-     * @param array $item     ['rowid'=>int,'fk_product'=>int,'tries'=>int]
-     * @param int   $maxTries Borne de tentatives avant dead-letter
-     * @param array $result   [IN/OUT] compteurs cumulés
-     * @return void
+     * @return float Secondes
      */
-    private function drainOneItem(array $item, $maxTries, array &$result)
+    protected function monotonicNow()
+    {
+        return microtime(true);
+    }
+
+    /**
+     * Horodatage Unix courant (mockable en test : âge des échecs réessayés sans consommer d'essai).
+     *
+     * @return int
+     */
+    protected function nowTimestamp()
+    {
+        return time();
+    }
+
+    /**
+     * Claim atomique d'un item (pattern WebhookManager::processEvent(), status 0→3) : empêche le
+     * traitement concurrent par un autre worker (course CRON qui se chevauche).
+     *
+     * @param array $item   ['rowid'=>int,'fk_product'=>int,'tries'=>int]
+     * @param array $result [IN/OUT] compteurs cumulés
+     * @return bool true si CE worker a réclamé l'item
+     */
+    private function claimItem(array $item, array &$result)
     {
         $rowid = $item['rowid'];
-        $dolibarrProductId = $item['fk_product'];
 
-        // Claim atomique (pattern WebhookManager::processEvent(), status 0→3) : empêche le
-        // traitement concurrent par un autre worker (course CRON qui se chevauche).
         $sqlClaim = "UPDATE " . MAIN_DB_PREFIX . "doli2shop_stock_queue";
         // tms explicitement repositionné (et pas seulement via ON UPDATE CURRENT_TIMESTAMP) :
         // recoverStuckItems() mesure l'ancienneté du claim sur cette colonne, cette détection ne
@@ -213,29 +291,84 @@ class StockPushQueueService
         if (!$resClaim || $this->db->affected_rows($resClaim) == 0) {
             $this->log('drainOneItem() - Item rowid=' . $rowid . ' déjà claim par un autre worker, skip', LOG_DEBUG);
             $result['raced']++;
-            return;
+            return false;
         }
 
         $result['claimed']++;
+        return true;
+    }
 
-        $success = false;
-        $errorMessage = null;
+    /**
+     * Pousse le stock COURANT des produits réclamés via ShopifyStockTrigger::updateShopifyStockBatch()
+     * (un seul chemin de code avec le recalage et l'API). Jamais d'exception : en cas d'exception
+     * imprévue du lot entier, chaque item est marqué en échec avec le message.
+     *
+     * @param array $claimed Items réclamés
+     * @param float|null $remainingSeconds Budget de temps restant du drainage : les lots non traités à l'expiration
+     *                          reviennent en `deferred` et repassent en pending SANS consommer d'essai
+     * @return array<int,array{code:int,stock:int|null,errors:string[]}> Résultat par fk_product
+     */
+    private function pushClaimedItems(array $claimed, $remainingSeconds = null)
+    {
+        $productIds = array();
+        foreach ($claimed as $item) {
+            $productIds[] = $item['fk_product'];
+        }
+
         try {
             $trigger = $this->createStockTrigger();
-            $pushedStock = null;
             // bypassApiResolutionCap=true : un item de file mérite une résolution complète (même
             // rationale que StockRecalageService::processBatch(), pas un skip silencieux sur
             // plafond partagé par requête HTTP — le worker CRON est un contexte dédié borné par
             // $limit, pas une requête web à N lignes concurrentes).
-            $pushResult = $trigger->updateShopifyStock($dolibarrProductId, $pushedStock, true);
-            $success = ($pushResult === 0 && empty($trigger->errors));
-            if (!$success) {
-                $errorMessage = !empty($trigger->errors) ? implode('; ', $trigger->errors) : 'erreur non détaillée';
-            }
+            $outcomes = $trigger->updateShopifyStockBatch($productIds, true, $remainingSeconds);
         } catch (\Throwable $e) {
-            $success = false;
-            $errorMessage = 'Exception: ' . $e->getMessage();
-            $this->log('drainOneItem() - Exception produit ID ' . $dolibarrProductId . ': ' . $e->getMessage(), LOG_ERR);
+            $this->log('drainQueue() - Exception lors du push du lot (' . count($productIds) . ' produit(s)): ' . $e->getMessage(), LOG_ERR);
+            $outcomes = array();
+            foreach ($productIds as $productId) {
+                $outcomes[$productId] = array('code' => -1, 'stock' => null, 'errors' => array('Exception: ' . $e->getMessage()));
+            }
+        }
+
+        foreach ($productIds as $productId) {
+            if (!isset($outcomes[$productId])) {
+                $outcomes[$productId] = array('code' => -1, 'stock' => null, 'errors' => array('résultat de push absent pour ce produit'));
+            }
+        }
+
+        return $outcomes;
+    }
+
+    /**
+     * Mise à jour du statut d'un item après son push : done / pending pour retry / dead_letter.
+     *
+     * @param array $item     ['rowid'=>int,'fk_product'=>int,'tries'=>int]
+     * @param int   $maxTries Borne de tentatives avant dead-letter
+     * @param array $outcome  Résultat du produit (code, stock, errors)
+     * @param array $result   [IN/OUT] compteurs cumulés
+     * @return void
+     */
+    private function finalizeItem(array $item, $maxTries, array $outcome, array &$result)
+    {
+        $rowid = $item['rowid'];
+        $dolibarrProductId = $item['fk_product'];
+
+        // Re-review 66-1 (MEDIUM-2) : lot non traité faute de temps -> retour en pending, AUCUN essai consommé,
+        // last_error inchangé. Le prochain cycle le reprend.
+        if (!empty($outcome['deferred'])) {
+            $marked = $this->markTerminalStatus($rowid, "status = 0", 'StockPushQueueService::markDeferred');
+            $result['deferred']++;
+            $result['timeBudgetReached'] = true;
+            if (!$marked) {
+                $result['recoalesced']++;
+            }
+            return;
+        }
+
+        $success = ($outcome['code'] === 0 && empty($outcome['errors']));
+        $errorMessage = null;
+        if (!$success) {
+            $errorMessage = !empty($outcome['errors']) ? implode('; ', $outcome['errors']) : 'erreur non détaillée';
         }
 
         if ($success) {
@@ -245,7 +378,40 @@ class StockPushQueueService
                 $result['recoalesced']++;
             }
             $this->logAction(ActionLogger::RESULT_SUCCESS, $dolibarrProductId, 'Push stock asynchrone OK (produit ID ' . $dolibarrProductId . ')');
+            if (!empty($outcome['warnings'])) {
+                // Une boutique a réussi, une autre est mal configurée : jamais silencieux.
+                $this->logAction(ActionLogger::RESULT_ERROR, $dolibarrProductId, 'Push stock OK sur au moins une boutique, configuration à corriger sur une autre : ' . implode('; ', $outcome['warnings']));
+            }
             return;
+        }
+
+        // Review 66-1 (MEDIUM-b/c) : un incident TRANSITOIRE (Shopify throttlé, 5xx, réseau) ou une erreur
+        // de CONFIGURATION de boutique (emplacement absent/désactivé) ne consomme PAS les essais : une
+        // panne Shopify de 25 minutes ne doit pas envoyer toute la file en dead-letter (backoff complet :
+        // hors périmètre). L'item reste pending avec son last_error explicite.
+        //
+        // BORNE D'ÂGE (re-review 66-1, HIGH-A / MEDIUM-1) : ce répit est limité à FREE_RETRY_MAX_AGE_SECONDS
+        // depuis le début de la période d'échec (marqueur en tête de last_error). Passé ce délai, chaque
+        // tentative consomme un essai -> dead-letter avec le dernier message explicite. Le marqueur
+        // d'origine est CONSERVÉ pour que la bascule soit définitive.
+        $since = $this->parseFailureEpisodeStart(isset($item['last_error']) ? $item['last_error'] : '');
+        $freeRetry = isset($outcome['consumeTry']) && $outcome['consumeTry'] === false;
+        if ($freeRetry) {
+            $now = $this->nowTimestamp();
+            if ($since === null) {
+                $since = $now;
+            }
+            $errorMessage = '[depuis ' . date('Y-m-d H:i:s', $since) . '] ' . $errorMessage;
+            if (($now - $since) <= self::FREE_RETRY_MAX_AGE_SECONDS) {
+                $marked = $this->markRetry($rowid, $item['tries'], $errorMessage);
+                $result['errors']++;
+                if (!$marked) {
+                    $result['recoalesced']++;
+                }
+                $this->logAction(ActionLogger::RESULT_ERROR, $dolibarrProductId, 'Push stock asynchrone échoué sans consommer d\'essai (incident transitoire ou configuration de boutique) : ' . $errorMessage);
+                return;
+            }
+            $errorMessage .= ' (échec persistant depuis plus de ' . (int) (self::FREE_RETRY_MAX_AGE_SECONDS / 3600) . ' h : les essais sont désormais consommés)';
         }
 
         $newTries = $item['tries'] + 1;
@@ -264,6 +430,22 @@ class StockPushQueueService
             }
             $this->logAction(ActionLogger::RESULT_ERROR, $dolibarrProductId, 'Push stock asynchrone échoué (tentative ' . $newTries . '/' . $maxTries . ') : ' . $errorMessage);
         }
+    }
+
+    /**
+     * Date de début de la période d'échec portée par le marqueur « [depuis AAAA-MM-JJ hh:mm:ss] » en tête
+     * de last_error.
+     *
+     * @param string $lastError last_error de l'item
+     * @return int|null Horodatage Unix, ou null s'il n'y a pas de marqueur
+     */
+    private function parseFailureEpisodeStart($lastError)
+    {
+        if (preg_match('/^\[depuis (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]/', (string) $lastError, $matches)) {
+            $timestamp = strtotime($matches[1]);
+            return $timestamp === false ? null : $timestamp;
+        }
+        return null;
     }
 
     /**
@@ -343,9 +525,11 @@ class StockPushQueueService
      */
     private function markDone($rowid)
     {
+        // last_error = NULL : un succès clôt la période d'échec (le marqueur « depuis » d'un épisode
+        // précédent ne doit pas faire croire à un échec ancien lors du prochain).
         return $this->markTerminalStatus(
             $rowid,
-            "status = 1, date_traitement = NOW(), tries = tries + 1",
+            "status = 1, date_traitement = NOW(), tries = tries + 1, last_error = NULL",
             'StockPushQueueService::markDone'
         );
     }
@@ -541,9 +725,9 @@ class StockPushQueueService
      * ignorés silencieusement (affected_rows reflète uniquement ceux réellement
      * relancés).
      *
-     * `last_error` n'est JAMAIS vidé (cohérent avec enqueue()) : il reste affiché
-     * comme "dernière erreur connue", pas "erreur actuelle" (Résultat Validate
-     * point 6).
+     * `last_error` est VIDÉ à la relance, comme à chaque réarmement par enqueue() (re-review 66-1,
+     * MEDIUM-1) : il porte le marqueur de début de période d'échec, qui ne doit pas survivre à un
+     * réarmement. (Auparavant conservé comme « dernière erreur connue », Résultat Validate point 6.)
      *
      * @param array $rowids Rowids à relancer (assainis : entiers positifs uniquement)
      * @return int Nombre d'items réellement relancés, -1 en cas d'erreur SQL
@@ -559,7 +743,8 @@ class StockPushQueueService
         }
 
         $sql = "UPDATE " . MAIN_DB_PREFIX . "doli2shop_stock_queue";
-        $sql .= " SET status = 0, tries = 0, date_traitement = NOW()";
+        // last_error = NULL : relance manuelle = nouvelle période d'échec (re-review 66-1, MEDIUM-1).
+        $sql .= " SET status = 0, tries = 0, last_error = NULL, date_traitement = NOW()";
         $sql .= " WHERE rowid IN (" . implode(',', $safeIds) . ")";
         $sql .= " AND entity = " . (int) $this->entity;
         $sql .= " AND status = 2"; // uniquement les items encore en dead-letter (garde CRITICAL 52-4)

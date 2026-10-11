@@ -13,13 +13,18 @@
  * jamais sur un fichier qui ne matche pas le motif du module (AC4 : les photos du client ne sont
  * jamais concernées).
  *
+ * Story 68-4 (2.6.1) : un fichier n'est proposé QUE s'il a au moins un jumeau de contenu identique
+ * (empreinte SHA-256) dans le même produit — deux photos différentes ne sont jamais proposées ;
+ * rien n'est coché par défaut ; apply() revérifie le contenu côté serveur et supprime par
+ * dol_delete_file() (ligne d'index ecm_files comprise).
+ *
  * @package     ShopifyIntegration
  * @subpackage  Class
  * @category    class
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.5.3
  * @link        https://doli2shop.ptitetete.org
  */
@@ -31,6 +36,7 @@ if (!defined('DOL_DOCUMENT_ROOT') && !defined('DOLIBARR_INC_FOR_MODULES')) {
 }
 
 dol_include_once('/core/lib/functions.lib.php');
+dol_include_once('/core/lib/files.lib.php');
 dol_include_once('/product/class/product.class.php');
 require_once dirname(__FILE__) . '/LoggerTrait.php';
 
@@ -58,6 +64,9 @@ class ImageDuplicatesCleanupService
     /** @var int */
     private $entity;
 
+    /** @var array<string,string|null> Empreintes déjà calculées dans cette requête (clé chemin|taille|mtime) */
+    private $fingerprintCache = [];
+
     /**
      * @param DoliDB $db Database handler
      * @param int $entity Entité Dolibarr courante
@@ -70,9 +79,13 @@ class ImageDuplicatesCleanupService
 
     /**
      * Aperçu (dry-run, aucune écriture) : pour chaque produit Dolibarr mappé Shopify (parent,
-     * pas variante) de cette entité, liste les fichiers legacy en double dans son répertoire
-     * d'images. Le fichier le plus récent (mtime) est proposé comme conservé — c'est celui du
-     * dernier passage de synchronisation réussi, les autres sont des copies antérieures.
+     * pas variante) de cette entité, liste les groupes de fichiers legacy de CONTENU IDENTIQUE
+     * (empreinte SHA-256) dans son répertoire d'images. Un fichier legacy dont le contenu est
+     * unique n'est jamais proposé. Dans chaque groupe (>= 2 fichiers), le fichier conservé est :
+     * (1) celui référencé dans doli2shop_product_images, sinon (2) celui dont la ligne ecm_files a
+     * la position la plus basse, sinon (3) le plus récent (mtime), sinon (4) l'ordre alphabétique.
+     *
+     * Une entrée de rapport par groupe (un produit peut en avoir plusieurs).
      *
      * @return array<int,array{fk_product:int,ref:string,keep:array{filename:string,size:int,mtime:int},toDelete:array<int,array{filename:string,size:int,mtime:int}>}>
      */
@@ -94,52 +107,195 @@ class ImageDuplicatesCleanupService
             $legacyFiles = $this->findLegacyFiles($dir, $product->ref);
 
             if (count($legacyFiles) < 2) {
-                // Pas de doublon : 0 ou 1 seul fichier legacy pour ce produit — rien à nettoyer.
+                // Pas de doublon possible : 0 ou 1 seul fichier legacy pour ce produit.
                 continue;
             }
 
-            usort($legacyFiles, function ($a, $b) {
-                return $b['mtime'] <=> $a['mtime'];
-            });
+            $mapped = $this->getMappedFilenames((int) $fkProduct);
 
-            $keep = array_shift($legacyFiles);
+            foreach ($this->groupByContent($dir, $legacyFiles) as $group) {
+                $filenames = array_map(function ($file) {
+                    return $file['filename'];
+                }, $group);
 
-            $report[] = [
-                'fk_product' => (int) $fkProduct,
-                'ref' => $product->ref,
-                'keep' => $keep,
-                'toDelete' => $legacyFiles,
-            ];
+                $positions = $this->getEcmPositions($product, $filenames);
+
+                usort($group, function ($a, $b) use ($mapped, $positions) {
+                    $aMapped = isset($mapped[$a['filename']]) ? 0 : 1;
+                    $bMapped = isset($mapped[$b['filename']]) ? 0 : 1;
+                    if ($aMapped !== $bMapped) {
+                        return $aMapped <=> $bMapped;
+                    }
+
+                    $aPos = isset($positions[$a['filename']]) ? $positions[$a['filename']] : PHP_INT_MAX;
+                    $bPos = isset($positions[$b['filename']]) ? $positions[$b['filename']] : PHP_INT_MAX;
+                    if ($aPos !== $bPos) {
+                        return $aPos <=> $bPos;
+                    }
+
+                    if ($a['mtime'] !== $b['mtime']) {
+                        return $b['mtime'] <=> $a['mtime'];
+                    }
+
+                    return strcmp($a['filename'], $b['filename']);
+                });
+
+                $keep = array_shift($group);
+
+                $report[] = [
+                    'fk_product' => (int) $fkProduct,
+                    'ref' => $product->ref,
+                    'keep' => $keep,
+                    'toDelete' => $group,
+                ];
+            }
         }
 
         return $report;
     }
 
     /**
-     * Applique la suppression d'un sous-ensemble de fichiers explicitement confirmés (jamais
-     * "tout" implicitement — chaque entrée doit venir d'un aperçu précédent). Chaque fichier est
-     * revérifié CONTRE le motif legacy et la ref du produit juste avant suppression, indépendamment
-     * de ce que scan() avait renvoyé (défense en profondeur AC4/AC5).
+     * Regroupe des fichiers par contenu identique. Pré-filtre par taille : seuls les fichiers dont
+     * la taille coïncide avec celle d'au moins un autre sont hachés (hash_file sha256).
      *
-     * HIGH (revue coordinateur, prouvé par exécution du code réel) : la protection "on garde le
-     * fichier le plus récent" n'existait auparavant QUE dans l'affichage de scan() (aucune case à
-     * cocher générée pour cette ligne) — rien côté serveur n'empêchait une requête POST altérée
-     * de soumettre CE fichier aussi, et de faire disparaître irréversiblement la dernière photo
-     * réelle d'un produit. Garantie ajoutée, vérifiée par PRODUIT et indépendamment de ce qu'un
-     * formulaire a soumis : si supprimer tous les fichiers éligibles d'un produit ne laisserait
-     * AUCUN fichier sur son disque, la suppression est refusée EN BLOC pour ce produit (jamais
-     * une suppression partielle qui laisserait passer "presque tout").
+     * @param string $dir Répertoire disque du produit
+     * @param array<int,array{filename:string,size:int,mtime:int}> $files
+     * @return array<int,array<int,array{filename:string,size:int,mtime:int}>> Groupes de >= 2 fichiers
+     */
+    private function groupByContent($dir, array $files)
+    {
+        $bySize = [];
+        foreach ($files as $file) {
+            $bySize[$file['size']][] = $file;
+        }
+
+        $byHash = [];
+        foreach ($bySize as $sameSize) {
+            if (count($sameSize) < 2) {
+                continue;
+            }
+            foreach ($sameSize as $file) {
+                $hash = $this->fingerprint(rtrim($dir, '/') . '/' . $file['filename']);
+                if ($hash === null) {
+                    continue;
+                }
+                $byHash[$hash][] = $file;
+            }
+        }
+
+        $groups = [];
+        foreach ($byHash as $group) {
+            if (count($group) >= 2) {
+                $groups[] = $group;
+            }
+        }
+
+        return $groups;
+    }
+
+    /**
+     * @param string $path Chemin absolu
+     * @return string|null Empreinte SHA-256 du contenu, null si illisible
+     */
+    private function fingerprint($path)
+    {
+        $cacheKey = $path . '|' . @filesize($path) . '|' . @filemtime($path);
+        if (array_key_exists($cacheKey, $this->fingerprintCache)) {
+            return $this->fingerprintCache[$cacheKey];
+        }
+
+        $hash = @hash_file('sha256', $path);
+
+        return $this->fingerprintCache[$cacheKey] = (is_string($hash) ? $hash : null);
+    }
+
+    /**
+     * @param int $fkProduct Produit Dolibarr
+     * @return array<string,bool> Noms de fichiers référencés dans doli2shop_product_images
+     */
+    private function getMappedFilenames($fkProduct)
+    {
+        $names = [];
+
+        $sql = "SELECT filename FROM " . MAIN_DB_PREFIX . "doli2shop_product_images";
+        $sql .= " WHERE entity = " . (int) $this->entity;
+        $sql .= " AND fk_product = " . (int) $fkProduct;
+
+        $result = $this->db->query($sql);
+
+        if ($result) {
+            while ($obj = $this->db->fetch_object($result)) {
+                $names[(string) $obj->filename] = true;
+            }
+        }
+
+        return $names;
+    }
+
+    /**
+     * Positions de l'index Dolibarr (llx_ecm_files) des fichiers donnés. Index absent ou vide :
+     * tableau vide (le choix du fichier conservé retombe alors sur mtime), jamais d'échec.
+     *
+     * @param Product $product Produit Dolibarr
+     * @param string[] $filenames Noms de fichiers
+     * @return array<string,int> nom de fichier => position
+     */
+    private function getEcmPositions($product, array $filenames)
+    {
+        $positions = [];
+
+        if (empty($filenames)) {
+            return $positions;
+        }
+
+        $entity = !empty($product->entity) ? (int) $product->entity : $this->entity;
+        $refDir = 'produit/' . $product->ref;
+
+        $quoted = [];
+        foreach ($filenames as $filename) {
+            $quoted[] = "'" . $this->db->escape($filename) . "'";
+        }
+
+        $sql = "SELECT filename, position FROM " . MAIN_DB_PREFIX . "ecm_files";
+        $sql .= " WHERE entity = " . $entity;
+        $sql .= " AND (filepath = '" . $this->db->escape($refDir) . "'";
+        $sql .= " OR filepath = '" . $this->db->escape($entity . '/' . $refDir) . "')";
+        $sql .= " AND filename IN (" . implode(',', $quoted) . ")";
+
+        $result = $this->db->query($sql);
+
+        if ($result) {
+            while ($obj = $this->db->fetch_object($result)) {
+                if ($obj->position !== null && $obj->position !== '') {
+                    $positions[(string) $obj->filename] = (int) $obj->position;
+                }
+            }
+        }
+
+        return $positions;
+    }
+
+    /**
+     * Applique la suppression d'un sous-ensemble de fichiers explicitement confirmés (jamais
+     * "tout" implicitement). Chaque fichier est revérifié CÔTÉ SERVEUR, indépendamment de ce
+     * qu'un aperçu ou un formulaire (périmé, forgé) a pu soumettre :
+     *  - motif legacy + ref du produit (AC4) et présence sur disque ;
+     *  - CONTENU (story 68-4) : un fichier n'est supprimé que s'il existe, sur disque, au moins
+     *    un autre fichier de même empreinte SHA-256 qui ne figure PAS dans la sélection du
+     *    produit — une photo distincte est donc refusée, et un groupe identique entièrement
+     *    coché est refusé en bloc (au plus n-1 membres supprimés) ;
+     *  - filet : au moins 1 fichier survit par produit.
+     * Suppression par dol_delete_file() (retire aussi la ligne d'index ecm_files).
      *
      * @param array<int,array{fk_product:int,filename:string}> $selection Fichiers à supprimer
-     * @return array{deleted:int,errors:string[]}
+     * @return array{deleted:int,errors:string[],nothingSelected:bool,lockBusy:bool}
      */
     public function apply(array $selection)
     {
         $deleted = 0;
         $errors = [];
+        $lockBusy = false;
 
-        // Regroupement par produit : la garantie "au moins un fichier survit" se vérifie PAR
-        // PRODUIT, indépendamment des autres produits présents dans la même sélection.
         $filenamesByProduct = [];
         foreach ($selection as $item) {
             $fkProduct = isset($item['fk_product']) ? (int) $item['fk_product'] : 0;
@@ -152,7 +308,14 @@ class ImageDuplicatesCleanupService
             $filenamesByProduct[$fkProduct][] = $filename;
         }
 
+        $mappedParentIds = $filenamesByProduct ? $this->getMappedParentProductIds() : [];
+
         foreach ($filenamesByProduct as $fkProduct => $filenames) {
+            if (!in_array((int) $fkProduct, $mappedParentIds, true)) {
+                $errors[] = "Produit $fkProduct ignoré (n'est pas un produit parent mappé Shopify de cette entité)";
+                continue;
+            }
+
             $product = new Product($this->db);
             if ($product->fetch($fkProduct) <= 0) {
                 $errors[] = "Produit $fkProduct introuvable";
@@ -161,56 +324,249 @@ class ImageDuplicatesCleanupService
 
             $dir = $this->getProductImageDir($product);
 
-            // Toutes provenances confondues (hors thumbs/) — c'est CE compte, pas seulement les
-            // fichiers "legacy", qui détermine combien il en restera réellement après suppression.
-            $allFilesOnDisk = $this->listAllImageFiles($dir);
-
-            $eligibleFilenames = [];
-            foreach ($filenames as $filename) {
-                if (!preg_match(self::LEGACY_UNIQID_PATTERN, $filename, $matches) || $matches[1] !== $product->ref) {
-                    // AC4 : ne supprime jamais un fichier qui ne correspond pas EXACTEMENT au
-                    // motif du module pour CE produit — même si la sélection venait d'un
-                    // formulaire soumis.
-                    $errors[] = "Fichier $filename ignoré (ne correspond pas au motif déposé par le module pour ce produit $fkProduct)";
-                    continue;
-                }
-
-                if (!in_array($filename, $allFilesOnDisk, true)) {
-                    $errors[] = "Fichier $filename déjà absent (produit $fkProduct)";
-                    continue;
-                }
-
-                $eligibleFilenames[] = $filename;
+            // Verrou exclusif NON bloquant par dossier produit : deux requêtes concurrentes visant
+            // chacune un des deux jumeaux ne doivent pas supprimer les deux. Verrou déjà tenu =>
+            // refus propre, aucune suppression.
+            $lockPath = self::lockPathForDir($dir);
+            if (is_link($lockPath)) {
+                $errors[] = "Produit $fkProduct : fichier de verrou refusé (lien symbolique), suppression non effectuée";
+                continue;
             }
-
-            $eligibleFilenames = array_values(array_unique($eligibleFilenames));
-
-            if (empty($eligibleFilenames)) {
+            $previousUmask = umask(0177);
+            $lockHandle = @fopen($lockPath, 'c');
+            umask($previousUmask);
+            if ($lockHandle === false) {
+                $errors[] = "Produit $fkProduct : verrou indisponible, suppression non effectuée";
+                continue;
+            }
+            if (!flock($lockHandle, LOCK_EX | LOCK_NB)) {
+                fclose($lockHandle);
+                $lockBusy = true;
+                $errors[] = "Produit $fkProduct : un nettoyage est déjà en cours pour ce produit, suppression non effectuée";
                 continue;
             }
 
-            $remainingCount = count($allFilesOnDisk) - count($eligibleFilenames);
+            try {
+                $mappedFilenames = $this->getMappedFilenames((int) $fkProduct);
 
-            if ($remainingCount < 1) {
-                $errors[] = "Produit $fkProduct : suppression refusée (laisserait 0 fichier sur "
-                    . "disque — au moins 1 photo doit toujours survivre par produit)";
-                continue;
-            }
+                // Toutes provenances confondues (hors thumbs/).
+                $allFilesOnDisk = $this->listAllImageFiles($dir);
 
-            foreach ($eligibleFilenames as $filename) {
-                $filePath = rtrim($dir, '/') . '/' . $filename;
+                $eligibleFilenames = [];
+                foreach ($filenames as $filename) {
+                    if (!preg_match(self::LEGACY_UNIQID_PATTERN, $filename, $matches) || $matches[1] !== $product->ref) {
+                        $errors[] = "Fichier $filename ignoré (ne correspond pas au motif déposé par le module pour ce produit $fkProduct)";
+                        continue;
+                    }
 
-                if (@unlink($filePath)) {
-                    $deleted++;
-                    $this->deleteThumbs($dir, $filename);
-                    $this->log("ImageDuplicatesCleanupService::apply - Fichier legacy supprimé: $filePath", LOG_INFO);
-                } else {
-                    $errors[] = "Échec de suppression de $filename (produit $fkProduct)";
+                    if (isset($mappedFilenames[$filename])) {
+                        $errors[] = "Fichier $filename refusé (produit $fkProduct) : référencé par la synchronisation Shopify";
+                        continue;
+                    }
+
+                    if (!in_array($filename, $allFilesOnDisk, true)) {
+                        $errors[] = "Fichier $filename déjà absent (produit $fkProduct)";
+                        continue;
+                    }
+
+                    $eligibleFilenames[] = $filename;
                 }
+
+                $eligibleFilenames = array_values(array_unique($eligibleFilenames));
+
+                foreach ($eligibleFilenames as $filename) {
+                    $filePath = rtrim($dir, '/') . '/' . $filename;
+
+                    clearstatcache();
+
+                    // Revérification juste avant CHAQUE suppression, sur l'état courant du disque :
+                    // un jumeau identique doit exister, hors sélection.
+                    $currentFiles = $this->listAllImageFiles($dir);
+                    $survivors = array_values(array_diff($currentFiles, $eligibleFilenames));
+
+                    if (!in_array($filename, $currentFiles, true)) {
+                        $errors[] = "Fichier $filename déjà absent (produit $fkProduct)";
+                        continue;
+                    }
+
+                    if (!$this->hasSurvivingTwin($dir, $filename, $survivors)) {
+                        $errors[] = "Fichier $filename refusé (produit $fkProduct) : aucune copie identique ne subsisterait — "
+                            . "une photo de contenu distinct n'est jamais supprimée";
+                        continue;
+                    }
+
+                    if (count($currentFiles) - 1 < 1) {
+                        $errors[] = "Produit $fkProduct : suppression refusée (laisserait 0 fichier sur "
+                            . "disque — au moins 1 photo doit toujours survivre par produit)";
+                        continue;
+                    }
+
+                    // disableglob=1 : un nom contenant * ou ? ne vise jamais plusieurs fichiers.
+                    if (dol_delete_file($filePath, 1) && !file_exists($filePath)) {
+                        $deleted++;
+                        $this->deleteThumbs($dir, $filename);
+                        $this->log("ImageDuplicatesCleanupService::apply - Fichier legacy supprimé: $filePath", LOG_INFO);
+                    } else {
+                        $errors[] = "Échec de suppression de $filename (produit $fkProduct)";
+                    }
+                }
+            } finally {
+                flock($lockHandle, LOCK_UN);
+                fclose($lockHandle);
             }
         }
 
-        return ['deleted' => $deleted, 'errors' => $errors];
+        return ['deleted' => $deleted, 'errors' => $errors, 'nothingSelected' => empty($filenamesByProduct), 'lockBusy' => $lockBusy];
+    }
+
+    /**
+     * Chemin du fichier de verrou d'un dossier produit (répertoire temporaire, jamais le dossier photos).
+     *
+     * @param string $dir Répertoire disque du produit
+     * @return string
+     */
+    public static function lockPathForDir($dir)
+    {
+        return sys_get_temp_dir() . '/d2s_imgdup_' . md5($dir) . '.lock';
+    }
+
+    /**
+     * @param string $dir Répertoire disque du produit
+     * @param string $filename Fichier candidat à la suppression
+     * @param string[] $survivors Fichiers du produit qui resteraient sur disque
+     * @return bool true si l'un des survivants a exactement le même contenu
+     */
+    private function hasSurvivingTwin($dir, $filename, array $survivors)
+    {
+        $path = rtrim($dir, '/') . '/' . $filename;
+        $size = @filesize($path);
+        $hash = $this->fingerprint($path);
+
+        if ($hash === null || $size === false) {
+            return false;
+        }
+
+        foreach ($survivors as $survivor) {
+            $survivorPath = rtrim($dir, '/') . '/' . $survivor;
+            if (@filesize($survivorPath) !== $size) {
+                continue;
+            }
+            if ($this->fingerprint($survivorPath) === $hash) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Rendu HTML du formulaire d'aperçu (extrait de la page pour être testable). Aucune case
+     * cochée par défaut ; la confirmation n'est jamais construite dans un onclick : le message
+     * (avec __COUNT__) voyage dans data-confirm (dol_escape_htmltag) et un script compte les
+     * cases cochées au submit (refus à 0 case).
+     *
+     * @param array $report Résultat de scan()
+     * @param object $langs Translate
+     * @param string $token Jeton CSRF
+     * @return string HTML ('' si rapport vide)
+     */
+    public static function renderPreviewForm(array $report, $langs, $token)
+    {
+        if (empty($report)) {
+            return '';
+        }
+
+        $html = '<form method="POST" id="d2s-imgdup-form" action="' . dol_escape_htmltag($_SERVER['PHP_SELF'] ?? '') . '"';
+        $html .= ' data-confirm="' . dol_escape_htmltag($langs->trans('ImageDuplicatesCleanupApplyConfirm', '__COUNT__')) . '"';
+        $html .= ' data-nothing="' . dol_escape_htmltag($langs->trans('ImageDuplicatesCleanupNothingSelected')) . '">';
+        $html .= '<input type="hidden" name="token" value="' . dol_escape_htmltag($token) . '">';
+        $html .= '<input type="hidden" name="action" value="apply">';
+
+        $html .= '<table class="noborder centpercent">';
+        $html .= '<tr class="liste_titre">';
+        $html .= '<th></th>';
+        foreach (array('ImageDuplicatesCleanupColProduct', 'ImageDuplicatesCleanupColFile', 'ImageDuplicatesCleanupColSize', 'ImageDuplicatesCleanupColDate', 'ImageDuplicatesCleanupColAction') as $columnKey) {
+            $html .= '<th>' . dol_escape_htmltag($langs->trans($columnKey)) . '</th>';
+        }
+        $html .= '</tr>';
+
+        foreach ($report as $productReport) {
+            $fkProduct = (int) $productReport['fk_product'];
+            $rowspan = 1 + count($productReport['toDelete']);
+
+            $html .= '<tr class="oddeven">';
+            $html .= '<td rowspan="' . $rowspan . '"></td>';
+            $html .= '<td rowspan="' . $rowspan . '">' . dol_escape_htmltag($productReport['ref']) . ' (#' . $fkProduct . ')</td>';
+            $html .= '<td>' . dol_escape_htmltag($productReport['keep']['filename']) . '</td>';
+            $html .= '<td>' . dol_print_size($productReport['keep']['size']) . '</td>';
+            $html .= '<td>' . dol_print_date($productReport['keep']['mtime'], 'dayhour') . '</td>';
+            $html .= '<td><span class="badge badge-status4">' . dol_escape_htmltag($langs->trans('ImageDuplicatesCleanupKept')) . '</span></td>';
+            $html .= '</tr>';
+
+            foreach ($productReport['toDelete'] as $fileInfo) {
+                $checkboxValue = $fkProduct . '|' . $fileInfo['filename'];
+
+                $html .= '<tr class="oddeven">';
+                $html .= '<td>' . dol_escape_htmltag($fileInfo['filename']) . '</td>';
+                $html .= '<td>' . dol_print_size($fileInfo['size']) . '</td>';
+                $html .= '<td>' . dol_print_date($fileInfo['mtime'], 'dayhour') . '</td>';
+                $html .= '<td><input type="checkbox" name="delete[]" value="' . dol_escape_htmltag($checkboxValue) . '"></td>';
+                $html .= '</tr>';
+            }
+        }
+
+        $html .= '</table>';
+
+        $html .= '<div class="tabsAction">';
+        $html .= '<button type="submit" class="butAction">';
+        $html .= '<i class="fa fa-trash"></i> ' . dol_escape_htmltag($langs->trans('ImageDuplicatesCleanupApplyButton'));
+        $html .= '</button>';
+        $html .= '</div>';
+        $html .= '</form>';
+
+        $html .= '<script>(function () {'
+            . 'var f = document.getElementById("d2s-imgdup-form");'
+            . 'if (!f) { return; }'
+            . 'f.addEventListener("submit", function (e) {'
+            . 'var n = f.querySelectorAll(\'input[name="delete[]"]:checked\').length;'
+            . 'if (n === 0) { alert(f.getAttribute("data-nothing")); e.preventDefault(); return; }'
+            . 'if (!confirm(f.getAttribute("data-confirm").replace("__COUNT__", n))) { e.preventDefault(); }'
+            . '});'
+            . '})();</script>';
+
+        return $html;
+    }
+
+    /**
+     * Rendu HTML du résultat d'une application (succès, erreurs, ou avertissement « rien
+     * sélectionné »).
+     *
+     * @param array{deleted:int,errors:string[],nothingSelected?:bool} $applyResult Résultat de apply()
+     * @param object $langs Translate
+     * @return string HTML
+     */
+    public static function renderApplyResult(array $applyResult, $langs)
+    {
+        $html = '';
+
+        if (!empty($applyResult['nothingSelected'])) {
+            $html .= '<div class="warning">' . dol_escape_htmltag($langs->trans('ImageDuplicatesCleanupNothingSelected')) . '</div>';
+        }
+        if (!empty($applyResult['lockBusy'])) {
+            $html .= '<div class="warning">' . dol_escape_htmltag($langs->trans('ImageDuplicatesCleanupLockBusy')) . '</div>';
+        }
+        if (!empty($applyResult['deleted'])) {
+            $html .= '<div class="ok">' . dol_escape_htmltag($langs->trans('ImageDuplicatesCleanupApplied', (string) $applyResult['deleted'])) . '</div>';
+        }
+        if (!empty($applyResult['errors'])) {
+            $html .= '<div class="error"><strong>' . dol_escape_htmltag($langs->trans('ImageDuplicatesCleanupErrors')) . '</strong><ul>';
+            foreach ($applyResult['errors'] as $errorMessage) {
+                $html .= '<li>' . dol_escape_htmltag($errorMessage) . '</li>';
+            }
+            $html .= '</ul></div>';
+        }
+
+        return $html;
     }
 
     /**

@@ -8,7 +8,7 @@
  * @package     ShopifyIntegration
  * @subpackage  Class
  * @category    class
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.0.0
  * @author      P'tite Tête <doli2shop@ptitetete.com>
  * @copyright   2022-2025 Robert Steinbacher<robert.steinbacher@xivtech.de>
@@ -82,6 +82,19 @@ class ShopifyApi
     const TOKEN_EXPIRY_MARGIN_SECONDS = 120;
 
     /**
+     * Story 66-7 : valeur du marqueur `skipped` posé sur la réponse factice de
+     * collectionAddProducts() quand la collection est automatique (aucun appel Shopify émis).
+     */
+    const COLLECTION_ADD_SKIPPED_SMART = 'smart_collection';
+
+    /**
+     * Re-review 66-7 (MEDIUM-N1) : valeur du marqueur `skipped` quand la collection porte une
+     * `CollectionConditionsSource` dont les conditions n'ont pas pu être lues (détail refusé par
+     * Shopify) : peut-être à conditions, donc par prudence aucun produit n'y est ajouté.
+     */
+    const COLLECTION_ADD_SKIPPED_UNREADABLE = 'unreadable_detail';
+
+    /**
      * Seuil (secondes) avant expiration à partir duquel un refresh proactif est déclenché
      * (AC6 : "moins de 5 minutes de l'échéance").
      *
@@ -124,6 +137,27 @@ class ShopifyApi
      * @var array<string,bool> hostname boutique => true si `sources` indisponible
      */
     private static $sourcesFieldUnsupported = [];
+
+    /**
+     * Story 66-7 : mémorise, par boutique et par process, que le DÉTAIL des sources
+     * (`... on CollectionConditionsSource { inclusion { conditions { __typename } } }`) a été
+     * refusé par Shopify (champ/type inconnu pour la version d'API ou le scope). Le détail
+     * rejoué ensuite est `sources { __typename }` seul, et le classement SMART des
+     * `CollectionConditionsSource` devient INDÉTERMINÉ (traité MANUAL, jamais SMART par défaut).
+     * Même scoping par hostname que self::$sourcesFieldUnsupported (cron multi-boutiques).
+     *
+     * @var array<string,bool> hostname boutique => true si le détail des sources est indisponible
+     */
+    private static $sourcesDetailUnsupported = [];
+
+    /**
+     * Re-review 66-7 (LOW-N2) : mémorise, par boutique et par process, que Shopify refuse
+     * seulement `exclusion { conditions }` : le niveau intermédiaire `inclusion` (détail sans
+     * exclusion) est alors demandé d'emblée, sans perdre la lecture de l'inclusion.
+     *
+     * @var array<string,bool> hostname boutique => true si `exclusion` est indisponible
+     */
+    private static $sourcesExclusionUnsupported = [];
 
     /**
      * Clé de scoping boutique pour self::$sourcesFieldUnsupported.
@@ -2190,6 +2224,18 @@ class ShopifyApi
         foreach ($paths as $field => $pathData) {
             $resp = $pathData['response'];
             if ($resp === null) {
+                // Story 67-12 / re-review 66-1 (MEDIUM-2) : une réponse null N'EST PAS toujours « sous-lot non
+                // exécuté ». Si des articles ont été envoyés (sous-lot non vide) et que la réponse est null,
+                // c'est un corps illisible ou vide (passerelle 5xx, HTML) : l'ancien `continue` en faisait un
+                // SUCCÈS SILENCIEUX (item marqué traité sans que rien n'ait été poussé). Échec TRANSITOIRE.
+                if (!empty($pathData['items'])) {
+                    $topErrors[] = (object) [
+                        'message' => 'Réponse Shopify illisible ou vide pour ' . $field . ' (passerelle indisponible ?)',
+                        'extensions' => (object) ['code' => 'SERVICE_UNAVAILABLE'],
+                    ];
+                    $failedFields[] = $field;
+                    $retryableQuantities = array_merge($retryableQuantities, $pathData['items']);
+                }
                 continue;
             }
             $pathFailed = false;
@@ -4028,14 +4074,25 @@ class ShopifyApi
      *
      * @param  array<int,string> $inventoryItemGids Identifiants GraphQL d'articles d'inventaire
      * @param  string            $locationGid       Identifiant GraphQL de la localisation
+     * @param  array|null        $unresolvedTransient [OUT] id => message, pour les articles non résolus À CAUSE d'une
+     *                                                erreur GraphQL TRANSITOIRE de leur chunk (throttle, 5xx) (@since 2.6.1)
+     * @param  array|null        $unresolvedPersistent [OUT] id => message, pour ceux dont le chunk est en erreur NON
+     *                                                transitoire (401, 403, ACCESS_DENIED, schéma, inconnue) (@since 2.6.1)
      * @return array<string,int> Quantité on_hand par identifiant ; les articles sans niveau de
      *                           stock à cette localisation sont ABSENTS du tableau (et non
      *                           ramenés à zéro, ce qui serait la même erreur qu'avant)
      * @since  2.5.5
      */
-    public function getInventoryQuantitiesAtLocation(array $inventoryItemGids, $locationGid)
+    public function getInventoryQuantitiesAtLocation(array $inventoryItemGids, $locationGid, &$unresolvedTransient = null, &$unresolvedPersistent = null)
     {
         $result = [];
+        // Re-review 66-1 (HIGH-A) : idem, mais pour une erreur de chunk NON transitoire (401, 403,
+        // ACCESS_DENIED, schema, inconnue) : id => message. Jamais rejoue sans fin.
+        $unresolvedPersistent = [];
+        // Review 66-1 (MEDIUM-d) : articles d'un chunk dont la requête est revenue EN ERREUR (throttle,
+        // erreur de champ, 5xx décodé) sans qu'ils aient pu être résolus — INCIDENT PASSAGER, à ne
+        // jamais confondre avec « non activé à cet emplacement ». id => message d'erreur.
+        $unresolvedTransient = [];
 
         $inventoryItemGids = array_values(array_unique(array_filter($inventoryItemGids)));
         if (empty($inventoryItemGids) || empty($locationGid)) {
@@ -4186,6 +4243,15 @@ class ShopifyApi
             }
 
             if (empty($response->data->nodes) || !is_array($response->data->nodes)) {
+                if ($messageText !== '') {
+                    foreach ($chunk as $chunkItemGid) {
+                        if (self::isTransientGraphQLErrors($response->errors ?? null)) {
+                            $unresolvedTransient[$chunkItemGid] = $messageText;
+                        } else {
+                            $unresolvedPersistent[$chunkItemGid] = $messageText;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -4200,7 +4266,7 @@ class ShopifyApi
                     // que l'article n'est pas activé/stocké à cet emplacement dans Shopify. C'est
                     // un défaut STRUCTUREL (configuration produit côté Shopify), pas un incident
                     // réseau : message actionnable, distinct du cas générique.
-                    if (!empty($node->id)) {
+                    if (!empty($node->id) && $messageText === '') {
                         $this->log("ShopifyApi::getInventoryQuantitiesAtLocation - l'article " . $node->id
                             . " n'est pas active a l'emplacement " . $locationGid . " dans Shopify "
                             . '(aucune donnee de niveau de stock retournee pour cette localisation).', LOG_WARNING);
@@ -4213,12 +4279,83 @@ class ShopifyApi
                     }
                 }
             }
+
+            // Chunk en erreur PARTIELLE : les articles qu'il n'a pas pu résoudre sont transitoires SEULEMENT
+            // si l'erreur l'est (throttle) ; un 401/403/ACCESS_DENIED/erreur de schéma est PERSISTANT.
+            if ($messageText !== '') {
+                foreach ($chunk as $chunkItemGid) {
+                    if (!array_key_exists($chunkItemGid, $result)) {
+                        if (self::isTransientGraphQLErrors($response->errors ?? null)) {
+                            $unresolvedTransient[$chunkItemGid] = $messageText;
+                        } else {
+                            $unresolvedPersistent[$chunkItemGid] = $messageText;
+                        }
+                    }
+                }
+            }
         }
 
         $this->log('ShopifyApi::getInventoryQuantitiesAtLocation - ' . count($result)
             . ' article(s) resolu(s) sur ' . count($inventoryItemGids) . ' demande(s)', LOG_DEBUG);
 
         return $result;
+    }
+
+    /**
+     * Re-review 66-1 (HIGH-A) : une erreur GraphQL de premier niveau est-elle TRANSITOIRE ?
+     *
+     * Transitoire = UNIQUEMENT le throttle (message « Throttled » ou extensions.code THROTTLED) et les
+     * erreurs serveur déclarées (INTERNAL_SERVER_ERROR, SERVICE_UNAVAILABLE, TIMEOUT). Tout le reste —
+     * 401 (jeton révoqué), 403 (scope manquant), ACCESS_DENIED, erreur de schéma, erreur inconnue — est
+     * PERSISTANT : le rejouer sans fin ferait un appel API par cycle sans jamais rien résoudre.
+     * TOUTES les erreurs doivent être transitoires : une seule erreur persistante suffit à classer le lot.
+     *
+     * @param  mixed $errors `errors` d'une réponse GraphQL (tableau d'objets, objet, chaîne, ou null)
+     * @return bool
+     * @since  2.6.1
+     */
+    public static function isTransientGraphQLErrors($errors)
+    {
+        if ($errors === null || $errors === '' || $errors === array()) {
+            return false;
+        }
+        if (is_string($errors) || is_object($errors)) {
+            $errors = array($errors);
+        }
+        if (!is_array($errors)) {
+            return false;
+        }
+        foreach ($errors as $error) {
+            $transient = false;
+            if (is_string($error)) {
+                $transient = (bool) preg_match('/throttled/i', $error);
+            } elseif (is_object($error)) {
+                $message = isset($error->message) ? (string) $error->message : '';
+                $code = (isset($error->extensions) && is_object($error->extensions) && isset($error->extensions->code))
+                    ? strtoupper((string) $error->extensions->code) : '';
+                $transient = preg_match('/throttled/i', $message)
+                    || in_array($code, array('THROTTLED', 'INTERNAL_SERVER_ERROR', 'SERVICE_UNAVAILABLE', 'TIMEOUT'), true);
+            }
+            if (!$transient) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Re-review 66-1 (HIGH-A) : le message d'une EXCEPTION d'appel est-il celui d'un incident
+     * réseau/délai (passager) ? `executeGraphQL()` ne lève qu'après épuisement de ses tentatives réseau
+     * (« GraphQL API error: … ») ou sur une configuration absente (« Shopify API configuration
+     * missing », « client is not initialized » : PERSISTANT). Tout message non reconnu est persistant.
+     *
+     * @param  string $message Message de l'exception
+     * @return bool
+     * @since  2.6.1
+     */
+    public static function isTransientFailureMessage($message)
+    {
+        return (bool) preg_match('/GraphQL API error|cURL error|timed out|timeout|connection (refused|reset|closed)|could not resolve host|network/i', (string) $message);
     }
 
     /**
@@ -5517,10 +5654,26 @@ GRAPHQL;
     }
 
     /**
+     * Vrai si la dernière résolution d'identifiant produit s'est arrêtée sur une erreur GraphQL
+     * (et non sur une absence de résultat) : permet à getProductRawJson() de ne pas annoncer
+     * « cherché par SKU, titre et ID » alors qu'une recherche n'a pas pu avoir lieu.
+     *
+     * @var bool
+     */
+    private $productResolveGraphQlFailed = false;
+
+    /**
      * Résout l'identifiant produit fourni par l'admin vers un gid GraphQL Shopify.
      *
      * Accepte : gid (`gid://shopify/Product/123`), ID numérique, SKU de variante, ou titre produit.
-     * Recherche par SKU d'abord (le plus discriminant), puis par titre (cf. conventions Doli2Shop).
+     *
+     * Ordre pour un identifiant NON numérique : SKU de variante, puis titre.
+     * Ordre pour un identifiant ENTIÈREMENT numérique (66-2) : SKU de variante EXACT (comparaison
+     * stricte de chaînes, zéros de tête conservés), puis titre, puis — seulement si l'identifiant ne
+     * commence pas par « 0 » (un ID Shopify ne commence jamais par 0) — gid produit par ID. Un SKU
+     * numérique n'est donc jamais pris pour un identifiant ; en cas de collision SKU/ID, le SKU gagne.
+     * La longueur n'est jamais un critère (un SKU peut être un EAN de 13 chiffres).
+     * Une erreur GraphQL sur une recherche renvoie null (pas de repli silencieux sur l'ID).
      *
      * @param string $identifier gid / ID numérique / SKU variante / titre produit
      * @return string|null gid produit ou null si introuvable/erreur
@@ -5528,6 +5681,7 @@ GRAPHQL;
      */
     public function resolveProductGid($identifier)
     {
+        $this->productResolveGraphQlFailed = false;
         $identifier = trim((string) $identifier);
         if ($identifier === '') {
             return null;
@@ -5538,10 +5692,7 @@ GRAPHQL;
             return $identifier;
         }
 
-        // ID numérique pur → gid produit
-        if (ctype_digit($identifier)) {
-            return 'gid://shopify/Product/' . $identifier;
-        }
+        $isNumeric = ctype_digit($identifier);
 
         $query = <<<GRAPHQL
 query resolveProduct(\$query: String!) {
@@ -5554,13 +5705,73 @@ GRAPHQL;
         // Échapper pour la SYNTAXE de recherche Shopify (guillemets / backslash) puis encadrer
         // de guillemets : neutralise les opérateurs (AND/OR, parenthèses, ':') dans l'identifiant.
         $safe = str_replace(array('\\', '"'), array('\\\\', '\\"'), $identifier);
+
+        if ($isNumeric) {
+            // 1) SKU de variante EXACT : products(query:) ne renvoie que l'id, donc impossible de
+            //    distinguer « 00513 » de « 513 » ; productVariants renvoie le sku à comparer.
+            $variantQuery = <<<GRAPHQL
+query resolveProductByNumericSku(\$query: String!, \$after: String) {
+  productVariants(first: 50, after: \$after, query: \$query) {
+    edges { node { id sku product { id } } }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+GRAPHQL;
+            // Le filtre sku: de Shopify peut être tokenisé (« 42285-XL » contient « 42285 ») : la variante
+            // exacte peut se trouver au-delà de la première page. Pagination pageInfo/cursor, arrêt dès
+            // la variante exacte, plafond de pages.
+            $maxVariantPages = 5;
+            $afterCursor = null;
+            for ($variantPage = 1; $variantPage <= $maxVariantPages; $variantPage++) {
+                $response = $this->executeGraphQL(['query' => $variantQuery, 'variables' => ['query' => 'sku:"' . $safe . '"', 'after' => $afterCursor]]);
+                if (!$this->isUsableGraphQlResponse($response)) {
+                    return $this->failProductResolve($response);
+                }
+                $variantConnection = isset($response->data->productVariants) ? $response->data->productVariants : null;
+                $variantEdges = isset($variantConnection->edges) && is_array($variantConnection->edges) ? $variantConnection->edges : array();
+                foreach ($variantEdges as $variantEdge) {
+                    $variantNode = isset($variantEdge->node) ? $variantEdge->node : null;
+                    if ($variantNode && isset($variantNode->sku) && (string) $variantNode->sku === $identifier
+                        && !empty($variantNode->product->id)) {
+                        return $variantNode->product->id;
+                    }
+                }
+                $hasNextPage = !empty($variantConnection->pageInfo->hasNextPage) && !empty($variantConnection->pageInfo->endCursor);
+                if (!$hasNextPage) {
+                    break;
+                }
+                if ($variantPage === $maxVariantPages) {
+                    $this->log("resolveProductGid - Plafond de $maxVariantPages pages de variantes atteint pour la recherche SKU '$identifier' : recherche interrompue", LOG_WARNING);
+                    break;
+                }
+                $afterCursor = $variantConnection->pageInfo->endCursor;
+            }
+
+            // 2) Titre
+            $response = $this->executeGraphQL(['query' => $query, 'variables' => ['query' => 'title:"' . $safe . '"']]);
+            if (!$this->isUsableGraphQlResponse($response)) {
+                return $this->failProductResolve($response);
+            }
+            if (!empty($response->data->products->edges[0]->node->id)) {
+                return $response->data->products->edges[0]->node->id;
+            }
+
+            // 3) Dernier recours : ID produit (jamais si zéro initial : ce n'est pas un ID Shopify).
+            //    L'existence est vérifiée par le product(id:) de getProductRawJson().
+            if ($identifier[0] !== '0') {
+                return 'gid://shopify/Product/' . $identifier;
+            }
+
+            $this->log("resolveProductGid - Aucun produit trouvé pour '$identifier'", LOG_WARNING);
+            return null;
+        }
+
         // 1) Recherche par SKU de variante, puis 2) par titre
         foreach (array('sku:"' . $safe . '"', 'title:"' . $safe . '"') as $searchQuery) {
             $response = $this->executeGraphQL(['query' => $query, 'variables' => ['query' => $searchQuery]]);
 
-            if (isset($response->errors)) {
-                $this->log("resolveProductGid - GraphQL error: " . json_encode($response->errors), LOG_ERR);
-                return null;
+            if (!$this->isUsableGraphQlResponse($response)) {
+                return $this->failProductResolve($response);
             }
 
             if (!empty($response->data->products->edges[0]->node->id)) {
@@ -5570,6 +5781,63 @@ GRAPHQL;
 
         $this->log("resolveProductGid - Aucun produit trouvé pour '$identifier'", LOG_WARNING);
         return null;
+    }
+
+    /**
+     * Réponse GraphQL exploitable : objet, sans `errors`, avec un nœud `data`.
+     *
+     * @param mixed $response Réponse de executeGraphQL()
+     * @return bool
+     */
+    private function isUsableGraphQlResponse($response)
+    {
+        return is_object($response) && !isset($response->errors) && isset($response->data) && is_object($response->data);
+    }
+
+    /**
+     * Échec technique de résolution (erreur GraphQL, réponse nulle ou sans data) : drapeau + log + null.
+     *
+     * @param mixed $response Réponse reçue
+     * @return null
+     */
+    private function failProductResolve($response)
+    {
+        $this->productResolveGraphQlFailed = true;
+        $detail = is_object($response) && isset($response->errors) ? json_encode($response->errors) : 'réponse vide ou sans data';
+        $this->log("resolveProductGid - GraphQL error: " . $detail, LOG_ERR);
+        return null;
+    }
+
+    /**
+     * Message d'échec pour un identifiant entièrement numérique (SKU, titre puis ID cherchés).
+     *
+     * @param string $identifier Identifiant saisi (chiffres uniquement, donc sans risque d'affichage)
+     * @return string
+     */
+    private function numericProductNotFoundMessage($identifier)
+    {
+        return $this->translateProductExportMessage(
+            'ProductJsonExportNotFoundNumeric',
+            "No product matches \"$identifier\" (searched as variant SKU, title, then product ID).",
+            $identifier
+        );
+    }
+
+    /**
+     * Message traduit via $langs (clé de langue), repli anglais si $langs est absent.
+     *
+     * @param string $langKey  Clé de langue
+     * @param string $fallback Message anglais de repli
+     * @param string $argument Argument %s optionnel
+     * @return string
+     */
+    private function translateProductExportMessage($langKey, $fallback, $argument = '')
+    {
+        global $langs;
+        if (is_object($langs) && method_exists($langs, 'trans')) {
+            return $langs->trans($langKey, $argument);
+        }
+        return $fallback;
     }
 
     /**
@@ -5585,8 +5853,13 @@ GRAPHQL;
     public function getProductRawJson($identifier)
     {
         $productGid = $this->resolveProductGid($identifier);
+        $numericIdentifier = ctype_digit(trim((string) $identifier));
         if (empty($productGid)) {
-            $this->error = "Produit introuvable pour l'identifiant fourni";
+            $this->error = ($numericIdentifier && !$this->productResolveGraphQlFailed)
+                ? $this->numericProductNotFoundMessage(trim((string) $identifier))
+                : ($this->productResolveGraphQlFailed
+                    ? $this->translateProductExportMessage('ProductJsonExportResolveError', 'GraphQL error while resolving the product identifier.')
+                    : $this->translateProductExportMessage('ProductJsonExportIdentifierNotFound', 'No product found for the given identifier.'));
             return null;
         }
 
@@ -5655,7 +5928,9 @@ GRAPHQL;
         }
 
         if (empty($response->data->product)) {
-            $this->error = "Produit $productGid introuvable côté Shopify";
+            $this->error = $numericIdentifier
+                ? $this->numericProductNotFoundMessage(trim((string) $identifier))
+                : "Produit $productGid introuvable côté Shopify";
             $this->log("getProductRawJson - Réponse vide pour $productGid", LOG_WARNING);
             return null;
         }
@@ -5774,21 +6049,24 @@ GRAPHQL;
     /**
      * Get collection details including type (SMART or MANUAL)
      *
-     * Story 51-2 (T2) : lit également `sources { __typename }` (champ standard de l'API
-     * Admin GraphQL 2026-07, scope read_products, cf. Dev Notes de la story — TRANCHÉ VALIDATE)
-     * en complément de `ruleSet` (déprécié en écriture mais toujours lisible). Nécessaire pour
-     * détecter correctement les collections créées nativement avec le nouveau modèle
-     * `Collection.sources` (sans `ruleSet`), sous peine de faux négatif dans isSmartCollection().
+     * Story 51-2 (T2) : lit `ruleSet` ET `sources` (nouveau modèle `Collection.sources`).
+     * Story 66-7 : lit en plus le DÉTAIL des sources, `... on CollectionConditionsSource {
+     * inclusion { conditions { __typename } } exclusion { conditions { __typename } } }` : une collection MANUELLE à laquelle un produit
+     * a été ajouté à la main porte une `CollectionConditionsSource` dont `inclusion.conditions`
+     * est VIDE et `ruleSet` null (preuve T0 du 06/10/2026) — la seule présence du type de source
+     * ne distingue donc rien.
      *
-     * Garde-fou : si Shopify répond avec une erreur de champ inconnu (undefinedField) sur
-     * `sources` — scope read_products non accordé à l'app installée, ou régression future du
-     * schéma — la requête est rejouée sans `sources`, en dégradant proprement sur la détection
-     * `ruleSet` seule (comportement historique). Aucune exception ne doit remonter à l'appelant.
+     * Trois niveaux de requête, du plus riche au plus pauvre, avec repli MÉMORISÉ PAR BOUTIQUE :
+     *  - `detail`  : ruleSet + sources + inclusion.conditions + exclusion.conditions ;
+     *  - `sources` : ruleSet + sources { __typename } (détail refusé par Shopify) ;
+     *  - `none`    : ruleSet seul (champ `sources` indisponible, story 51-2).
+     * L'objet retourné porte `detailLevel` (propriété locale, non Shopify) pour que
+     * getCollectionKind() sache ce qui a réellement été lu. Aucune exception ne remonte.
      *
      * @param string $collectionId The collection ID (legacy resource ID)
      * @return object|null Collection details or null if not found
      * @since 2.0.31
-     * @version     2.6.0 Story 51-2 : ajout lecture `sources` + fallback undefinedField
+     * @version     2.6.1 Story 66-7 : détail des sources (inclusion.conditions) + repli par boutique
      */
     public function getCollectionDetails($collectionId)
     {
@@ -5796,95 +6074,209 @@ GRAPHQL;
             'id' => 'gid://shopify/Collection/' . $collectionId
         ];
 
-        $queryWithoutSources = 'query getCollectionDetails($id: ID!) {
-            collection(id: $id) {
-                id
-                title
-                handle
-                legacyResourceId
-                ruleSet {
-                    appliedDisjunctively
-                    rules {
-                        column
-                        condition
-                        relation
-                    }
-                }
-                sortOrder
-            }
-        }';
+        $storeKey = $this->sourcesFieldScopeKey();
 
-        // Story 51-2 (Code Review MEDIUM) : si l'indisponibilité de `sources` a déjà été
-        // constatée sur ce process POUR CETTE BOUTIQUE (cf. self::$sourcesFieldUnsupported,
-        // clé par hostname), ne pas rejouer une requête AVEC `sources` vouée à échouer de
-        // nouveau — interroger directement sans, en une seule requête réseau (au lieu de deux).
-        if (!empty(self::$sourcesFieldUnsupported[$this->sourcesFieldScopeKey()])) {
-            try {
-                $response = $this->executeGraphQL(['query' => $queryWithoutSources, 'variables' => $variables]);
-            } catch (Exception $e) {
-                $this->log(__METHOD__ . " - Exception GraphQL sans sources: " . $e->getMessage(), LOG_ERR);
-                return null;
-            }
-
-            return !empty($response->data->collection) ? $response->data->collection : null;
+        if (!empty(self::$sourcesFieldUnsupported[$storeKey])) {
+            $level = 'none';
+        } elseif (!empty(self::$sourcesDetailUnsupported[$storeKey])) {
+            $level = 'sources';
+        } elseif (!empty(self::$sourcesExclusionUnsupported[$storeKey])) {
+            $level = 'inclusion';
+        } else {
+            $level = 'detail';
         }
-
-        $queryWithSources = 'query getCollectionDetails($id: ID!) {
-            collection(id: $id) {
-                id
-                title
-                handle
-                legacyResourceId
-                ruleSet {
-                    appliedDisjunctively
-                    rules {
-                        column
-                        condition
-                        relation
-                    }
-                }
-                sources {
-                    __typename
-                }
-                sortOrder
-            }
-        }';
 
         $response = null;
-        try {
-            $response = $this->executeGraphQL(['query' => $queryWithSources, 'variables' => $variables]);
-        } catch (Exception $e) {
-            // Garde-fou bon marché : ne jamais laisser une exception remonter jusqu'à l'appelant
-            // (collectionAddProducts() via isSmartCollection()). Contrairement au cas
-            // undefinedField ci-dessous, une exception réseau/config ici n'est PAS rejouée sans
-            // `sources` (Code Review LOW — l'ancien commentaire "retente sans sources" était
-            // trompeur : aucun retry n'a lieu dans cette branche) : on abandonne et on retourne
-            // null, ce qui fait traiter la collection comme MANUAL par isSmartCollection()
-            // (repli documenté dans les Dev Notes de la story 51-2).
-            $this->log(__METHOD__ . " - Exception GraphQL avec sources: " . $e->getMessage() . " — abandon, retour null (traité comme collection manuelle)", LOG_WARNING);
-            return null;
-        }
-
-        if ($this->isUndefinedFieldError($response, 'sources')) {
-            // Mémorisation par process ET par boutique (Code Review MEDIUM + post-fix HIGH) :
-            // évite de rejouer la requête avec `sources` aux appels suivants de
-            // getCollectionDetails() sur ce même process, sans impacter les autres boutiques.
-            self::$sourcesFieldUnsupported[$this->sourcesFieldScopeKey()] = true;
-            $this->log(__METHOD__ . " - Champ 'sources' indisponible (scope read_products manquant ou régression schéma) — repli sur ruleSet seul pour le reste du process (boutique " . $this->sourcesFieldScopeKey() . ")", LOG_WARNING);
-
+        // Au plus 4 requêtes (detail -> inclusion -> sources -> none), chaque niveau n'étant rejoué qu'une fois.
+        for ($attempt = 0; $attempt < 4; $attempt++) {
             try {
-                $response = $this->executeGraphQL(['query' => $queryWithoutSources, 'variables' => $variables]);
+                $response = $this->executeGraphQL([
+                    'query' => $this->buildCollectionDetailsQuery($level),
+                    'variables' => $variables
+                ]);
             } catch (Exception $e) {
-                $this->log(__METHOD__ . " - Exception GraphQL sans sources: " . $e->getMessage(), LOG_ERR);
+                // Jamais d'exception jusqu'à l'appelant : null = collection traitée MANUAL
+                // (repli 51-2), aucun retry sur une exception réseau/config.
+                $this->log(__METHOD__ . " - Exception GraphQL (niveau " . $level . "): " . $e->getMessage() . " — abandon, retour null (traité comme collection manuelle)", LOG_WARNING);
                 return null;
             }
+
+            if ($level !== 'none' && $this->isUndefinedFieldError($response, 'sources')) {
+                // Mémorisation par process ET par boutique (51-2) — jamais globale.
+                self::$sourcesFieldUnsupported[$storeKey] = true;
+                $this->log(__METHOD__ . " - Champ 'sources' indisponible (scope read_products manquant ou régression schéma) — repli sur ruleSet seul pour le reste du process (boutique " . $storeKey . ")", LOG_WARNING);
+                $level = 'none';
+                continue;
+            }
+
+            if ($level === 'detail' && $this->isSourcesDetailError($response) && $this->isExclusionOnlyDetailError($response)) {
+                // Re-review LOW-N2 : seul `exclusion` est refusé, l'inclusion reste lisible.
+                self::$sourcesExclusionUnsupported[$storeKey] = true;
+                $this->log(__METHOD__ . " - Détail d'exclusion (exclusion.conditions) refusé par Shopify — repli sur inclusion.conditions seule pour le reste du process (boutique " . $storeKey . ") : une inclusion sans condition restera 'unknown' (ni gel certain ni requalification), jamais manuelle certaine", LOG_WARNING);
+                $level = 'inclusion';
+                continue;
+            }
+
+            if (($level === 'detail' || $level === 'inclusion') && $this->isSourcesDetailError($response)) {
+                self::$sourcesDetailUnsupported[$storeKey] = true;
+                $this->log(__METHOD__ . " - Détail des sources (inclusion.conditions) refusé par Shopify — repli sur sources { __typename } seul pour le reste du process (boutique " . $storeKey . ") : une CollectionConditionsSource sans détail est classée 'unknown' (adoption gelée, aucun produit ajouté par prudence), jamais manuelle certaine ni automatique par défaut", LOG_WARNING);
+                $level = 'sources';
+                continue;
+            }
+
+            break;
         }
 
         if (!empty($response->data->collection)) {
-            return $response->data->collection;
+            $collection = $response->data->collection;
+            $collection->detailLevel = $level;
+            return $collection;
         }
 
         return null;
+    }
+
+    /**
+     * Requête getCollectionDetails() au niveau de détail demandé ('detail'|'sources'|'none').
+     *
+     * @param string $level Niveau de détail
+     * @return string Requête GraphQL
+     * @since 2.6.1
+     */
+    private function buildCollectionDetailsQuery($level)
+    {
+        $sourcesBlock = '';
+        if ($level === 'inclusion') {
+            $sourcesBlock = 'sources {
+                    __typename
+                    ... on CollectionConditionsSource {
+                        inclusion {
+                            conditions {
+                                __typename
+                            }
+                        }
+                    }
+                }';
+        } elseif ($level === 'detail') {
+            $sourcesBlock = 'sources {
+                    __typename
+                    ... on CollectionConditionsSource {
+                        inclusion {
+                            conditions {
+                                __typename
+                            }
+                        }
+                        exclusion {
+                            conditions {
+                                __typename
+                            }
+                        }
+                    }
+                }';
+        } elseif ($level === 'sources') {
+            $sourcesBlock = 'sources {
+                    __typename
+                }';
+        }
+
+        return 'query getCollectionDetails($id: ID!) {
+            collection(id: $id) {
+                id
+                title
+                handle
+                legacyResourceId
+                ruleSet {
+                    appliedDisjunctively
+                    rules {
+                        column
+                        condition
+                        relation
+                    }
+                }
+                ' . $sourcesBlock . '
+                sortOrder
+            }
+        }';
+    }
+
+    /**
+     * Story 66-7 : la réponse porte-t-elle un refus GraphQL visant le DÉTAIL des sources
+     * (`inclusion`, `conditions`, fragment `CollectionConditionsSource`) ? Champ/type inconnu,
+     * sélection invalide ou argument refusé, pour la version d'API ou le scope de la boutique.
+     * Une erreur sans rapport (throttle, interne) ne déclenche PAS de repli mémorisé.
+     *
+     * @param object|null $response Réponse GraphQL décodée
+     * @return bool True si le détail des sources est refusé
+     * @since 2.6.1
+     */
+    private function isSourcesDetailError($response)
+    {
+        if (empty($response) || empty($response->errors) || !is_array($response->errors)) {
+            return false;
+        }
+
+        $detailTokens = ['inclusion', 'exclusion', 'conditions', 'CollectionConditionsSource'];
+        $schemaCodes = ['undefinedfield', 'undefinedtype', 'selectionmismatch', 'argumentnotaccepted', 'argumentliteralsincompatible', 'invalidtype'];
+
+        foreach ($response->errors as $gqlError) {
+            $code = strtolower((string) ($gqlError->extensions->code ?? ''));
+            $message = (string) ($gqlError->message ?? '');
+            $fieldName = (string) ($gqlError->extensions->fieldName ?? '');
+            $typeName = (string) ($gqlError->extensions->typeName ?? '');
+
+            if (in_array($fieldName, $detailTokens, true) || in_array($typeName, $detailTokens, true)) {
+                return true;
+            }
+
+            $isSchemaError = in_array($code, $schemaCodes, true)
+                || stripos($message, "doesn't exist on type") !== false
+                || stripos($message, 'Selections can\'t be made') !== false;
+
+            if ($isSchemaError) {
+                foreach ($detailTokens as $token) {
+                    if (stripos($message, $token) !== false) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Re-review 66-7 (LOW-N2) : le refus de détail ne vise-t-il QUE `exclusion` ? Chaque erreur
+     * de détail doit désigner `exclusion` (fieldName/typeName, ou message citant « exclusion » et
+     * pas « inclusion »). Un refus mixte ou portant sur l'inclusion descend au niveau `sources`.
+     *
+     * @param object|null $response Réponse GraphQL décodée
+     * @return bool True si seules des erreurs sur `exclusion` sont présentes
+     * @since 2.6.1
+     */
+    private function isExclusionOnlyDetailError($response)
+    {
+        if (empty($response) || empty($response->errors) || !is_array($response->errors)) {
+            return false;
+        }
+
+        $found = false;
+        foreach ($response->errors as $gqlError) {
+            $single = (object) ['errors' => [$gqlError]];
+            if (!$this->isSourcesDetailError($single)) {
+                continue;
+            }
+            $found = true;
+            $message = (string) ($gqlError->message ?? '');
+            $fieldName = (string) ($gqlError->extensions->fieldName ?? '');
+            $typeName = (string) ($gqlError->extensions->typeName ?? '');
+            $isExclusion = $fieldName === 'exclusion' || $typeName === 'exclusion'
+                || (stripos($message, 'exclusion') !== false && stripos($message, 'inclusion') === false);
+            if (!$isExclusion) {
+                return false;
+            }
+        }
+
+        return $found;
     }
 
     /**
@@ -5939,48 +6331,152 @@ GRAPHQL;
     }
 
     /**
-     * Check if collection is a Smart Collection (automatic)
+     * Classe une collection : 'smart' (automatique), 'manual' (certain) ou 'unknown'
+     * (information absente ou insuffisante — collection introuvable, exception, détail refusé).
      *
-     * Story 51-2 (T2.3) : la collection est considérée SMART si `ruleSet.rules` est non vide
-     * (comportement historique, branche principale) OU si `sources` contient au moins un
-     * élément `CollectionConditionsSource`/`CollectionSubCollectionsSource` (nouveau modèle
-     * `Collection.sources`, sans `ruleSet`). Repli MANUAL en cas d'incertitude — cf. Dev Notes
-     * de la story 51-2 (« Pourquoi le repli par défaut est MANUAL, pas SMART ») : un faux
-     * négatif est rattrapé sans casser le flux (userErrors logués par collectionAddProducts()),
-     * alors qu'un faux positif bloquerait silencieusement l'ajout de produits sur la majorité
-     * des collections manuelles du parc installé.
+     * Story 66-7 — critère tranché par la preuve T0 (réponses GraphQL réelles du 06/10/2026) :
+     * SMART ssi `ruleSet.rules` non vide OU au moins une entrée dans `inclusion.conditions` OU
+     * dans `exclusion.conditions` d'une `CollectionConditionsSource` OU une
+     * `CollectionSubCollectionsSource`. Une `CollectionConditionsSource` à conditions VIDES (des
+     * deux côtés) est une collection MANUELLE (sélection à la main) — c'était le faux positif qui
+     * laissait des collections vides chez un client. Une collection qui n'a QUE des conditions
+     * d'exclusion est automatique (review 4 couches, LOW-2) : jamais 'manual' certain.
+     *
+     * 'manual' n'est retourné que sur preuve (détail lu au niveau `detail`, ou `sources` sans
+     * aucune source) : la requalification de mappings (T5) ne doit jamais s'appuyer sur un
+     * défaut. Tout le reste est 'unknown'.
      *
      * @param string $collectionId The collection ID (legacy resource ID)
-     * @return bool True if Smart Collection, false if Manual Collection
-     * @since 2.0.31
-     * @version     2.6.0 Story 51-2 : tolérance `sources` (CollectionConditionsSource/CollectionSubCollectionsSource)
+     * @return string 'smart'|'manual'|'unknown'
+     * @since 2.6.1
      */
-    public function isSmartCollection($collectionId)
+    public function getCollectionKind($collectionId)
+    {
+        $classification = $this->classifyCollection($collectionId);
+
+        return $classification['kind'];
+    }
+
+    /**
+     * Classement détaillé d'une collection : `kind` (voir getCollectionKind()) et
+     * `undetailedConditionsSource` — true si une `CollectionConditionsSource` figure dans la
+     * réponse SANS que ses conditions aient pu être lues (détail des sources refusé par Shopify).
+     * Une telle collection est peut-être automatique : l'adoption par titre doit alors rester
+     * prudente (review 4 couches, MEDIUM-1), alors que l'ajout de produits garde sa règle
+     * (unknown = tentative d'ajout, userErrors rattrapées).
+     *
+     * @param string $collectionId The collection ID (legacy resource ID)
+     * @return array{kind:string,undetailedConditionsSource:bool}
+     * @since 2.6.1
+     */
+    public function classifyCollection($collectionId)
     {
         $collection = $this->getCollectionDetails($collectionId);
 
         if (!$collection) {
             $this->log(__METHOD__ . " - Collection not found: " . $collectionId, LOG_WARNING);
-            return false; // Default to manual if not found
+            return ['kind' => 'unknown', 'undetailedConditionsSource' => false];
         }
 
-        // Smart collections have ruleSet defined, Manual collections don't (comportement historique)
-        $isSmartCollection = !empty($collection->ruleSet) && !empty($collection->ruleSet->rules);
+        $level = $collection->detailLevel ?? 'none';
+        $rulesCount = (!empty($collection->ruleSet) && !empty($collection->ruleSet->rules) && is_array($collection->ruleSet->rules))
+            ? count($collection->ruleSet->rules) : 0;
 
-        // Story 51-2 : complément — nouveau modèle Collection.sources sans ruleSet
-        if (!$isSmartCollection && !empty($collection->sources) && is_array($collection->sources)) {
-            foreach ($collection->sources as $source) {
-                $typename = $source->__typename ?? '';
-                if ($typename === 'CollectionConditionsSource' || $typename === 'CollectionSubCollectionsSource') {
-                    $isSmartCollection = true;
-                    break;
+        $sourceTypes = [];
+        $conditionsCounts = [];
+        $hasSubCollections = false;
+        $hasConditions = false;
+        $conditionsDetailMissing = false;
+        $sourcesList = (!empty($collection->sources) && is_array($collection->sources)) ? $collection->sources : [];
+
+        foreach ($sourcesList as $source) {
+            $typename = (string) ($source->__typename ?? '');
+            $sourceTypes[] = $typename;
+            if ($typename === 'CollectionSubCollectionsSource') {
+                $hasSubCollections = true;
+            } elseif ($typename === 'CollectionConditionsSource') {
+                $inclusion = $source->inclusion->conditions ?? null;
+                $exclusion = $source->exclusion->conditions ?? null;
+                $inclusionCount = is_array($inclusion) ? count($inclusion) : null;
+                $exclusionCount = is_array($exclusion) ? count($exclusion) : null;
+                if (($inclusionCount !== null && $inclusionCount > 0) || ($exclusionCount !== null && $exclusionCount > 0)) {
+                    $hasConditions = true;
+                } elseif ($inclusionCount === null || $exclusionCount === null) {
+                    $conditionsDetailMissing = true;
                 }
+                $conditionsCounts[] = ($inclusionCount === null ? 'n/a' : $inclusionCount) . '/' . ($exclusionCount === null ? 'n/a' : $exclusionCount);
             }
         }
 
-        $this->log(__METHOD__ . " - Collection " . $collectionId . " type: " . ($isSmartCollection ? "SMART (automatic)" : "MANUAL"), LOG_INFO);
+        if ($rulesCount > 0 || $hasConditions || $hasSubCollections) {
+            $kind = 'smart';
+        } elseif ($level === 'detail' && !$conditionsDetailMissing) {
+            $kind = 'manual';
+        } elseif (($level === 'sources' || $level === 'inclusion') && empty($sourcesList)) {
+            $kind = 'manual';
+        } else {
+            $kind = 'unknown';
+        }
+
+        // Journal DEBUG du détail des sources : types, nombre de conditions (inclusion/exclusion),
+        // ruleSet — IDs seulement (ni titre ni valeur de condition).
+        $this->log(__METHOD__ . " - Collection " . $collectionId . " sources: [" . implode(',', $sourceTypes) . "] conditions (incl/excl): [" . implode(',', $conditionsCounts) . "] ruleSet.rules: " . $rulesCount . " ruleSet present: " . (!empty($collection->ruleSet) ? 'yes' : 'no') . " detail: " . $level . " => " . $kind, LOG_DEBUG);
+
+        return ['kind' => $kind, 'undetailedConditionsSource' => ($kind === 'unknown' && $conditionsDetailMissing)];
+    }
+
+    /**
+     * Check if collection is a Smart Collection (automatic)
+     *
+     * Story 51-2 : repli MANUAL en cas d'incertitude. Story 66-7 : critère affiné, voir
+     * getCollectionKind() — seul 'smart' retourne true ; 'manual' ET 'unknown' retournent false
+     * (un faux négatif est rattrapé par les userErrors de collectionAddProducts(), un faux
+     * positif bloquait silencieusement l'ajout des produits).
+     *
+     * @param string $collectionId The collection ID (legacy resource ID)
+     * @return bool True if Smart Collection, false if Manual Collection
+     * @since 2.0.31
+     * @version     2.6.1 Story 66-7 : CollectionConditionsSource sans condition = MANUAL
+     */
+    public function isSmartCollection($collectionId)
+    {
+        $kind = $this->getCollectionKind($collectionId);
+        $isSmartCollection = ($kind === 'smart');
+
+        $this->log(__METHOD__ . " - Collection " . $collectionId . " type: " . ($isSmartCollection ? "SMART (automatic)" : "MANUAL" . ($kind === 'unknown' ? " (default, detail unavailable)" : "")), LOG_INFO);
 
         return $isSmartCollection;
+    }
+
+    /**
+     * Story 66-7 : une liste de userErrors de collectionAddProducts() désigne-t-elle une collection
+     * automatique ? Le texte exact n'est pas documenté par Shopify : détection limitée aux
+     * formulations de refus d'ajout à une collection automatique — le message doit parler d'une
+     * « collection » ET la qualifier de smart / automated / automatic / rule-based. Les mots
+     * génériques « condition » et « rule » seuls sont exclus (review 4 couches, LOW-1) : un
+     * userError sans rapport (« condition not met », « rule violated ») ne doit pas être présenté
+     * au client comme « collection automatique ». Indice de journalisation et de message, JAMAIS
+     * un classement à persister.
+     *
+     * @param mixed $userErrors userErrors décodées (array d'objets) ou null
+     * @return bool True si un message évoque une collection automatique
+     * @since 2.6.1
+     */
+    public static function userErrorsIndicateSmartCollection($userErrors)
+    {
+        if (empty($userErrors) || !is_array($userErrors)) {
+            return false;
+        }
+
+        foreach ($userErrors as $userError) {
+            $message = (string) (is_object($userError) ? ($userError->message ?? '') : (is_array($userError) ? ($userError['message'] ?? '') : ''));
+            if (preg_match('/\bcollections?\b/i', $message)
+                && preg_match('/\b(smart|automated|automatic|automatically|rule[- ]based)\b/i', $message)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -5996,14 +6492,41 @@ GRAPHQL;
     {
         $this->log(__METHOD__ . " - Adding " . count($productIds) . " products to collection: " . $collectionId, LOG_INFO);
 
-        // Check if this is a Smart Collection first
-        if ($this->isSmartCollection($collectionId)) {
-            $this->log(__METHOD__ . " - Collection " . $collectionId . " is a Smart Collection - skipping manual product addition", LOG_INFO);
-            
-            // Return a mock successful response to avoid breaking calling code
+        // Check if this is a Smart Collection first. Re-review 66-7 (MEDIUM-N1) : on classe UNE fois,
+        // et une CollectionConditionsSource sans détail lisible bloque aussi l'ajout (prudence :
+        // Shopify accepte l'ajout manuel sur une collection à conditions, ce que le module ne veut pas).
+        $classification = $this->classifyCollection($collectionId);
+        $isSmartCollection = ($classification['kind'] === 'smart');
+        $this->log(__METHOD__ . " - Collection " . $collectionId . " type: " . ($isSmartCollection ? "SMART (automatic)" : "MANUAL" . ($classification['kind'] === 'unknown' ? " (default, detail unavailable)" : "")), LOG_INFO);
+
+        if (!$isSmartCollection && !empty($classification['undetailedConditionsSource'])) {
+            $this->log(__METHOD__ . " - Collection " . $collectionId . " : source de conditions dont le détail est illisible (Shopify refuse la lecture des conditions) — peut-être gérée par des conditions, par prudence aucun produit n'est ajouté (" . count($productIds) . " product(s) NOT added)", LOG_WARNING);
+
             return (object) [
                 'data' => (object) [
                     'collectionAddProducts' => (object) [
+                        'skipped' => self::COLLECTION_ADD_SKIPPED_UNREADABLE,
+                        'collection' => (object) [
+                            'id' => 'gid://shopify/Collection/' . $collectionId,
+                            'title' => 'Conditions unreadable (not fed)',
+                            'productsCount' => (object) ['count' => 'unknown']
+                        ],
+                        'userErrors' => []
+                    ]
+                ]
+            ];
+        }
+
+        if ($isSmartCollection) {
+            $this->log(__METHOD__ . " - Collection " . $collectionId . " is a Smart Collection - skipping manual product addition (" . count($productIds) . " product(s) NOT added)", LOG_WARNING);
+
+            // Réponse factice SANS userError pour ne pas casser les appelants, mais portant un
+            // marqueur explicite `skipped` (story 66-7) : rien n'a été envoyé à Shopify, les
+            // appelants ne doivent JAMAIS le compter comme un ajout réussi.
+            return (object) [
+                'data' => (object) [
+                    'collectionAddProducts' => (object) [
+                        'skipped' => self::COLLECTION_ADD_SKIPPED_SMART,
                         'collection' => (object) [
                             'id' => 'gid://shopify/Collection/' . $collectionId,
                             'title' => 'Smart Collection (managed automatically)',
@@ -6076,7 +6599,12 @@ GRAPHQL;
         $response = $this->executeGraphQL(['query' => $mutation, 'variables' => $variables]);
 
         if (!empty($response->data->collectionAddProducts->userErrors)) {
-            $this->log(__METHOD__ . " - Error adding products to collection: " . json_encode($response->data->collectionAddProducts->userErrors), LOG_ERR);
+            $this->log(__METHOD__ . " - Error adding products to collection " . $collectionId . ": " . json_encode($response->data->collectionAddProducts->userErrors), LOG_ERR);
+            if (self::userErrorsIndicateSmartCollection($response->data->collectionAddProducts->userErrors)) {
+                // Story 66-7 : message explicite, sans retry via collectionUpdate ni persistance
+                // d'un classement SMART sur le seul texte d'un message.
+                $this->log(__METHOD__ . " - Collection " . $collectionId . " : Shopify refuse l'ajout manuel (collection probablement automatique) — ajoutez une condition ou passez la collection en manuelle", LOG_WARNING);
+            }
         } else {
             $this->log(__METHOD__ . " - Products added successfully to collection. Total products: " . ($response->data->collectionAddProducts->collection->productsCount->count ?? 'Unknown'), LOG_INFO);
         }
@@ -6302,6 +6830,9 @@ GRAPHQL;
                 updatedAt
                 productsCount {
                     count
+                }
+                image {
+                    id
                 }
             }
         }';

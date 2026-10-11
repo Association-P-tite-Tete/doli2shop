@@ -120,7 +120,7 @@ llxHeader('', $langs->trans($page_name));
 doli2shopShowLicenseWarningBanner();
 
 // === DÉBUT ISOLATION CSS v2.1.3 ===
-print '<div class=\"doli2shop-page\">';
+print '<div class="doli2shop-page">';
 print load_fiche_titre($langs->trans($page_name), '', 'shopify@doli2shop');
 
 // Onglets — story dix-ecrans-atteignables-par-aucun-lien (Validate 09/09/2026, réserve 1) : cette

@@ -20,7 +20,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.5.3
  * @link        https://doli2shop.ptitetete.org
  */
@@ -107,7 +107,8 @@ if ($action === 'apply') {
     if (!empty($selection)) {
         $applyResult = $imageDuplicatesCleanupService->apply($selection);
     } else {
-        $applyResult = array('deleted' => 0, 'errors' => array());
+        // Story 68-4 : un envoi sans case cochée affiche un avertissement au lieu de ne rien dire.
+        $applyResult = array('deleted' => 0, 'errors' => array(), 'nothingSelected' => true);
     }
 }
 
@@ -138,73 +139,15 @@ print '</div>';
 print '</div>';
 
 if ($applyResult !== null) {
-    if ($applyResult['deleted'] > 0) {
-        print '<div class="ok" style="margin: 10px 0;">' . dol_escape_htmltag($langs->trans("ImageDuplicatesCleanupApplied", (string) $applyResult['deleted'])) . '</div>';
-    }
-    if (!empty($applyResult['errors'])) {
-        print '<div class="error" style="margin: 10px 0;">';
-        print '<strong>' . $langs->trans("ImageDuplicatesCleanupErrors") . '</strong><ul>';
-        foreach ($applyResult['errors'] as $errorMessage) {
-            print '<li>' . dol_escape_htmltag($errorMessage) . '</li>';
-        }
-        print '</ul></div>';
-    }
+    print ImageDuplicatesCleanupService::renderApplyResult($applyResult, $langs);
 }
 
 if (empty($scanReport)) {
     print '<div class="opacitymedium">' . dol_escape_htmltag($langs->trans("ImageDuplicatesCleanupNoCandidates")) . '</div>';
 } else {
-    print '<form method="POST" action="' . dol_escape_htmltag($_SERVER['PHP_SELF']) . '">';
-    print '<input type="hidden" name="token" value="' . newToken() . '">';
-    print '<input type="hidden" name="action" value="apply">';
-
-    print '<table class="noborder centpercent">';
-    print '<tr class="liste_titre">';
-    print '<th></th>';
-    print '<th>' . $langs->trans("ImageDuplicatesCleanupColProduct") . '</th>';
-    print '<th>' . $langs->trans("ImageDuplicatesCleanupColFile") . '</th>';
-    print '<th>' . $langs->trans("ImageDuplicatesCleanupColSize") . '</th>';
-    print '<th>' . $langs->trans("ImageDuplicatesCleanupColDate") . '</th>';
-    print '<th>' . $langs->trans("ImageDuplicatesCleanupColAction") . '</th>';
-    print '</tr>';
-
-    $totalCandidates = 0;
-
-    foreach ($scanReport as $productReport) {
-        $fkProduct = $productReport['fk_product'];
-        $ref = $productReport['ref'];
-
-        print '<tr class="oddeven">';
-        print '<td rowspan="' . (1 + count($productReport['toDelete'])) . '"></td>';
-        print '<td rowspan="' . (1 + count($productReport['toDelete'])) . '">' . dol_escape_htmltag($ref) . ' (#' . $fkProduct . ')</td>';
-        print '<td>' . dol_escape_htmltag($productReport['keep']['filename']) . '</td>';
-        print '<td>' . dol_print_size($productReport['keep']['size']) . '</td>';
-        print '<td>' . dol_print_date($productReport['keep']['mtime'], 'dayhour') . '</td>';
-        print '<td><span class="badge badge-status4">' . $langs->trans("ImageDuplicatesCleanupKept") . '</span></td>';
-        print '</tr>';
-
-        foreach ($productReport['toDelete'] as $fileInfo) {
-            $totalCandidates++;
-            $checkboxValue = $fkProduct . '|' . $fileInfo['filename'];
-
-            print '<tr class="oddeven">';
-            print '<td>' . dol_escape_htmltag($fileInfo['filename']) . '</td>';
-            print '<td>' . dol_print_size($fileInfo['size']) . '</td>';
-            print '<td>' . dol_print_date($fileInfo['mtime'], 'dayhour') . '</td>';
-            print '<td><input type="checkbox" name="delete[]" value="' . dol_escape_htmltag($checkboxValue) . '" checked="checked"></td>';
-            print '</tr>';
-        }
-    }
-
-    print '</table>';
-
-    print '<div style="margin-top: 12px;">';
-    print '<button type="submit" class="butAction" onclick="return confirm(' . json_encode($langs->trans("ImageDuplicatesCleanupApplyConfirm", (string) $totalCandidates)) . ');">';
-    print '<i class="fa fa-trash"></i> ' . $langs->trans("ImageDuplicatesCleanupApplyButton");
-    print '</button>';
-    print '</div>';
-
-    print '</form>';
+    // Story 68-4 : rendu extrait dans le service (testable) — rien coché par défaut, confirmation
+    // via data-confirm + script (jamais d'onclick construit en PHP).
+    print ImageDuplicatesCleanupService::renderPreviewForm($scanReport, $langs, newToken());
 }
 
 print '</div>'; // fin .doli2shop-page

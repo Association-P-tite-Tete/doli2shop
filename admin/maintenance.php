@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.0.23
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -46,11 +46,18 @@ if (!$res) {
 
 // Include compatibility functions for older Dolibarr versions (verifToken(), Hotfix 2.4.6)
 require_once dirname(__FILE__) . '/../lib/compatibility.lib.php';
+// Story 68-1 : la lib doit être chargée AVANT le premier appel de l'une de ses fonctions
+// (doli2shopShowLicenseWarningBanner() est définie là) — sinon erreur fatale à l'ouverture.
+dol_include_once('/doli2shop/lib/doli2shop.lib.php');
 
 // Access control
 if (!$user->admin) {
     accessforbidden();
 }
+
+// Langues : doivent être chargées AVANT le premier trans() (titre, lien retour) et llxHeader().
+// 'admin' porte BackToModuleList ; sans 'doli2shop@doli2shop', les clés s'affichent brutes.
+$langs->loadLangs(array("admin", "doli2shop@doli2shop"));
 
 // Page setup
 $page_name = "MaintenanceTools";
@@ -60,12 +67,8 @@ llxHeader('', $langs->trans($page_name), '', '', 0, 0, '', '', '', 'mod-doli2sho
 // écrans d'administration, pas seulement les deux onglets historiques.
 doli2shopShowLicenseWarningBanner();
 
-// Libraries
-
 // === DÉBUT ISOLATION CSS v2.1.3 ===
-print '<div class=\"doli2shop-page\">';
-dol_include_once('/doli2shop/class/importproducts.class.php');
-dol_include_once('/doli2shop/lib/doli2shop.lib.php');
+print '<div class="doli2shop-page">';
 
 // Parameters
 $action = GETPOST('action', 'aZ09');
@@ -93,22 +96,9 @@ print load_fiche_titre($title, $linkback, 'title_setup');
 $maintenanceHead = doli2shopAdminPrepareHead();
 print dol_get_fiche_head($maintenanceHead, 'maintenance', $langs->trans("Doli2Shop"), -1, 'doli2shop@doli2shop');
 
-// Module configuration check
-try {
-    $importProducts = new ImportProducts($db);
-    $config = $importProducts->getConfig();
-    if (empty($config->shopify_store_hostname)) {
-        dol_htmloutput_errors("Module not configured. Please configure the module first.");
-        llxFooter();
-        exit;
-    }
-} catch (Exception $e) {
-    // Log detailed error for administrators, show generic message to users
-    dol_syslog("Maintenance: Error loading module configuration: " . $e->getMessage(), LOG_ERR);
-    dol_htmloutput_errors($langs->trans("ErrorLoadingConfiguration"));
-    llxFooter();
-    exit;
-}
+// Pas de contrôle de configuration ici (story 68-1) : l'onglet n'est atteignable que si la
+// configuration est complète (doli2shopAdminPrepareHead()), et le diagnostic ne lit que
+// llx_doli2shop_products via $db.
 
 // Actions
 if ($action == 'diagnostic') {

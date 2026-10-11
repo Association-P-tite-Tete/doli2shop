@@ -24,7 +24,7 @@
  * @author     P'tite Tête
  * @copyright  2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license    GPL v3+
- * @version     2.6.0
+ * @version     2.6.1
  * @since      2.5.5
  * @link       https://doli2shop.ptitetete.org
  */
@@ -191,12 +191,86 @@ class ModuleLogFile
             // n'atteint jamais export(), le fichier n'est jamais créé, et rien ne le signale.
             // (Défaut livré en 2.5.5, trouvé par la session Hierdocs en implémentant la règle
             // commune ; corrigé ici.)
-            dol_syslog($line, (int) $level, 0, self::FILENAME_SUFFIX, 'file');
+            self::callRestrictedHandler($line, (int) $level);
 
             return true;
-        } catch (Exception $e) {
-            // Un journal ne doit JAMAIS faire échouer ce qu'il observe.
+        } catch (\Throwable $e) {
+            // Un journal ne doit JAMAIS faire échouer ce qu'il observe — `Throwable` et non
+            // `Exception` : en PHP 8, un TypeError/Error passerait outre.
             return false;
+        }
+    }
+
+    /**
+     * Appelle `dol_syslog()` restreint au gestionnaire fichier, en relevant `SYSLOG_LEVEL` si besoin.
+     *
+     * 🔴 `dol_syslog()` du cœur sort AVANT tout gestionnaire si
+     * `$level > getDolGlobalInt('SYSLOG_LEVEL')` (18 `:1826`, 23 `:2746`, 24 `:2779`). Sans
+     * relèvement, `DOLI2SHOP_LOG_FILE_LEVEL` ne peut jamais être plus verbeux que `SYSLOG_LEVEL`
+     * (et une constante ABSENTE vaut 0 : plus rien n'est écrit, même un WARNING). On relève donc
+     * `SYSLOG_LEVEL` à `$level` pour CET appel seulement ; la restriction `'file'` + le suffixe
+     * garantissent que seul notre fichier reçoit la ligne (le journal général n'est pas touché).
+     *
+     * ⚠️ Avant la boucle des gestionnaires, le cœur alimente aussi, sans tenir compte de la
+     * restriction : `$conf->logbuffer` (debugbar, ou `?logtohtml=1` + `MAIN_ENABLE_LOG_TO_HTML`) et
+     * un `print` HTML (`MAIN_ENABLE_LOG_INLINE_HTML` + `?log=1`). Ces deux paramètres sont choisis
+     * par l'APPELANT, anonyme sur le webhook : le relèvement leur ferait franchir des lignes
+     * DEBUG (fuite, et sortie parasite avant `http_response_code()`). Pendant le relèvement, on
+     * force donc l'inline à 0 et on ramène `logbuffer` à son état d'avant. Si aucun relèvement
+     * n'est nécessaire, le comportement du cœur est strictement inchangé.
+     *
+     * ⚠️ Restauration EXACTE : `property_exists()` et non `isset()` (une valeur `null` serait
+     * prise pour une absence), puis `unset()` si la constante était absente — réaffecter 0 ou ''
+     * n'est pas équivalent (`empty`, `isset`, liste des constantes de l'admin).
+     * Le relèvement ne couvre pas `isModEnabled('syslog')` : Syslog désactivé = aucun journal,
+     * dédié compris (limite documentée, non contournée).
+     *
+     * @param  string $line  Ligne déjà préfixée
+     * @param  int    $level Niveau syslog
+     * @return void
+     */
+    private static function callRestrictedHandler($line, $level)
+    {
+        global $conf;
+
+        if ($level <= getDolGlobalInt('SYSLOG_LEVEL')) {
+            dol_syslog($line, $level, 0, self::FILENAME_SUFFIX, 'file');
+            return;
+        }
+
+        $hadLevel = property_exists($conf->global, 'SYSLOG_LEVEL');
+        $previousLevel = $hadLevel ? $conf->global->SYSLOG_LEVEL : null;
+        $hadInline = property_exists($conf->global, 'MAIN_ENABLE_LOG_INLINE_HTML');
+        $previousInline = $hadInline ? $conf->global->MAIN_ENABLE_LOG_INLINE_HTML : null;
+        $hadBuffer = property_exists($conf, 'logbuffer');
+        $previousBuffer = $hadBuffer ? $conf->logbuffer : null;
+        $bufferLength = is_array($previousBuffer) ? count($previousBuffer) : 0;
+
+        try {
+            $conf->global->SYSLOG_LEVEL = $level;
+            $conf->global->MAIN_ENABLE_LOG_INLINE_HTML = 0;
+
+            dol_syslog($line, $level, 0, self::FILENAME_SUFFIX, 'file');
+        } finally {
+            if ($hadLevel) {
+                $conf->global->SYSLOG_LEVEL = $previousLevel;
+            } else {
+                unset($conf->global->SYSLOG_LEVEL);
+            }
+            if ($hadInline) {
+                $conf->global->MAIN_ENABLE_LOG_INLINE_HTML = $previousInline;
+            } else {
+                unset($conf->global->MAIN_ENABLE_LOG_INLINE_HTML);
+            }
+            if ($hadBuffer) {
+                if (is_array($conf->logbuffer) && is_array($previousBuffer)) {
+                    array_splice($conf->logbuffer, $bufferLength);
+                } else {
+                    $conf->logbuffer = $previousBuffer;
+                }
+            } else {
+                unset($conf->logbuffer);
+            }
         }
     }
 

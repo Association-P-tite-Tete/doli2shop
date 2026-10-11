@@ -686,7 +686,6 @@ PaymentsSyncRequiresOrders=La sincronizzazione dei pagamenti richiede la sincron
 ShippingSyncRequiresOrders=La sincronizzazione delle spedizioni richiede la sincronizzazione degli ordini
 
 # Maintenance v2.1.6
-ErrorLoadingConfiguration=Errore durante il caricamento della configurazione del modulo
 
 # Diagnostic v2.1.6
 CronDuplicatesCleanedSuccess=%s CRON duplicato/i rimosso/i con successo
@@ -797,7 +796,6 @@ SetupGuide=Guida alla configurazione
 # Step 3 - Orders
 
 # Step 4 - Mappings
-OrderStatusMapping=Mappatura stati ordine
 
 # Step 5 - CRON
 
@@ -1395,6 +1393,9 @@ ProductJsonExportIdentifierHint=Es. uno SKU di variante, un titolo di prodotto o
 ProductJsonExportFetch=Recupera il JSON
 ProductJsonExportNoIdentifier=Inserisci uno SKU, un titolo o un identificatore di prodotto.
 ProductJsonExportNotFound=Prodotto non trovato su Shopify.
+ProductJsonExportNotFoundNumeric=Nessun prodotto corrisponde a "%s" (cercato come SKU di variante, titolo e poi ID prodotto).
+ProductJsonExportResolveError=Errore Shopify durante la risoluzione dell'identificatore del prodotto. Riprovare tra poco.
+ProductJsonExportIdentifierNotFound=Nessun prodotto trovato per l'identificatore indicato.
 ProductJsonExportResultFor=JSON del prodotto
 ProductJsonExportDownload=Scarica il JSON
 ProductJsonExportCopy=Copia
@@ -1789,37 +1790,14 @@ CANCELLED=Annullato
 EXPIRED=Scaduto
 FULFILLED=Spedito
 FULFILLMENT_NOT_REQUIRED=Spedizione non richiesta
-IN_PROGRESS=In corso
-ON_HOLD=In sospeso
-OPEN=Aperto
 PAID=Pagato
 PARTIALLY_FULFILLED=Parzialmente spedito
 PARTIALLY_PAID=Parzialmente pagato
 PARTIALLY_REFUNDED=Parzialmente rimborsato
 PENDING=In attesa
 REFUNDED=Rimborsato
-SCHEDULED=Programmato
-SUCCESS=Riuscito
 UNFULFILLED=Non spedito
 VOIDED=Annullato (pagamento)
-ERROR=Errore
-AddOrderStatusMapping=Aggiungi mappatura stato ordine
-ConfirmRestoreDefaultMappings=Confermi il ripristino delle mappature predefinite? Questa azione eliminerà le mappature personalizzate.
-DefaultMapping=Mappatura predefinita
-DefaultMappingsRestoredCount=%s mappatura(e) predefinita(e) ripristinata(e)
-DolibarrOrderStatus=Stato ordine Dolibarr
-DolibarrToShopifyStatusMapping=Mappatura stati da Dolibarr a Shopify
-MappingDescription=Descrizione della mappatura
-MappingPriority=Priorità della mappatura
-NoOrderStatusMappingDefined=Nessuna mappatura stato ordine definita
-OrderStatusMappingDesc=Configura come gli stati degli ordini Shopify e Dolibarr vengono associati automaticamente.
-OrderStatusMappingSaved=Mappatura stato ordine salvata
-RestoreDefaultMappings=Ripristina mappature predefinite
-ShopifyFinancialStatus=Stato finanziario Shopify
-ShopifyFulfillmentStatus=Stato di spedizione Shopify
-ShopifyToDolibarrStatusMapping=Mappatura stati da Shopify a Dolibarr
-StatusMappingExplanation=Queste mappature determinano automaticamente quale stato Dolibarr applicare in base agli stati finanziario e di spedizione restituiti da Shopify.
-StatusOrderSentPartially=Spedito parzialmente
 TotalMappings=Mappature totali
 ValidMappings=Mappature valide
 
@@ -2215,8 +2193,8 @@ DiagLocationTruncated=Posizioni aggiuntive non mostrate
 # --- 2.5.3 : pulizia dei duplicati di foto importate (Story import-images-duplique) ---
 ImageDuplicatesCleanupTab=Foto duplicate
 ImageDuplicatesCleanupTitle=Pulizia dei duplicati di foto importate
-ImageDuplicatesCleanupIntro=Prima della correzione del 07/09/2026, ogni sincronizzazione Shopify (in particolare il webhook «products/update») ricopiava tutte le foto del prodotto con un nome generato casualmente (uniqid()): nessuna poteva riconoscere il file depositato dalla sincronizzazione precedente. Questo strumento individua questi duplicati e consente di eliminarli dopo un'anteprima.
-ImageDuplicatesCleanupWarning=Vengono proposti solo i file corrispondenti ESATTAMENTE al modello depositato dal modulo (riferimento prodotto + identificatore casuale). Le foto caricate manualmente da voi non sono mai interessate. Il file più recente di ciascun prodotto viene conservato, i precedenti vengono proposti per l'eliminazione.
+ImageDuplicatesCleanupIntro=Prima della correzione del 07/09/2026, ogni sincronizzazione Shopify (in particolare il webhook «products/update») ricopiava tutte le foto del prodotto con un nome generato casualmente (uniqid()): nessuna poteva riconoscere il file depositato dalla sincronizzazione precedente. Questo strumento individua le copie con contenuto strettamente identico e consente di eliminarle dopo un'anteprima. Dopo una pulizia, le foto dei prodotti interessati vengono rinviate una sola volta a Shopify, senza creare media aggiuntivi. Una copia ricompressa o riesportata non è strettamente identica: non viene proposta.
+ImageDuplicatesCleanupWarning=Vengono proposti solo i file corrispondenti ESATTAMENTE al modello depositato dal modulo (riferimento prodotto + identificatore casuale) E con almeno una copia di contenuto strettamente identico. Una foto diversa non viene mai proposta, e le foto caricate manualmente da voi non sono mai interessate. Per ogni gruppo di copie identiche viene conservata una copia (quella usata dal modulo, altrimenti la prima foto del prodotto, altrimenti la più recente); le altre vengono proposte per l'eliminazione. Nulla è selezionato per impostazione predefinita: selezionate le copie da eliminare.
 ImageDuplicatesCleanupNoCandidates=Nessun duplicato rilevato — nulla da pulire.
 ImageDuplicatesCleanupColProduct=Prodotto
 ImageDuplicatesCleanupColFile=File
@@ -2225,7 +2203,9 @@ ImageDuplicatesCleanupColDate=Data
 ImageDuplicatesCleanupColAction=Azione
 ImageDuplicatesCleanupKept=Conservato
 ImageDuplicatesCleanupApplyButton=Elimina i duplicati selezionati
-ImageDuplicatesCleanupApplyConfirm=Questa azione eliminerà definitivamente fino a %s file duplicato/i (e le relative miniature). Continuare?
+ImageDuplicatesCleanupApplyConfirm=Questa azione eliminerà definitivamente %s file selezionato/i (e le relative miniature). Continuare?
+ImageDuplicatesCleanupNothingSelected=Nessuna copia è selezionata: selezionate almeno un file da eliminare.
+ImageDuplicatesCleanupLockBusy=Una pulizia è già in corso per uno di questi prodotti: non è stato eliminato nulla per esso. Riprovare tra un istante.
 ImageDuplicatesCleanupApplied=%s file eliminato/i con successo.
 ImageDuplicatesCleanupErrors=Errori riscontrati:
 
@@ -2267,3 +2247,12 @@ UnderpriceAuditReasonMatchesNote=Importo conforme — nessuna azione
 UnderpriceAuditReasonUnderpricedDraft=Bozza non fatturata — correzione possibile direttamente nell'ordine (nessuna azione automatica)
 UnderpriceAuditReasonUnderpricedCanceled=Ordine annullato — mai fatturato, nessuna regolarizzazione necessaria
 UnderpriceAuditReasonUnderpricedCommitted=Ordine fatturato/pagato — segnalato, trattamento tramite nota di credito AL DI FUORI DELLO STRUMENTO
+
+# Story 66-6 — Collegamento cliente Shopify <-> soggetto terzo (scheda, sola lettura)
+ShopifyCustomerLink=Cliente Shopify
+ShopifyCustomerLinkStore=negozio
+ShopifyCustomerEmailMandatoryCause=L'opzione Dolibarr SOCIETE_EMAIL_MANDATORY (Impostazioni > Soggetti terzi) richiede un indirizzo e-mail per ogni soggetto, ma questo cliente Shopify non ne ha (ordine con solo telefono): disattivare l'opzione o inserire l'e-mail del cliente in Shopify.
+ShopifyOrderNoCustomerIdentity=L'ordine %s non ha alcuna identità cliente (nessuna e-mail, nessun ID cliente Shopify, nessun nome, telefono o indirizzo) — verificare l'accesso « Protected customer data » dell'app Shopify, poi riprodurre l'evento
+SyncReportCollectionsAutomaticSkipped=%s raccolta/e gestita/e da condizioni in Shopify: il modulo non vi aggiunge prodotti — impostate la raccolta su manuale se volete che il modulo la riempia
+SyncReportCollectionsAutomaticRefused=%s raccolta/e rifiutata/e da Shopify (messaggio che indica una raccolta automatica): nessun prodotto ha potuto essere associato — aggiungete una condizione o impostate la raccolta su manuale in Shopify
+SyncReportCollectionsDetailUnreadable=%s raccolta/e ignorata/e per precauzione: Shopify rifiuta la lettura delle loro condizioni, il modulo non può sapere se sono gestite da condizioni e non vi aggiunge prodotti

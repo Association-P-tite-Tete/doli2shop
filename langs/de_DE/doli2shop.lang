@@ -686,7 +686,6 @@ PaymentsSyncRequiresOrders=Die Zahlungssynchronisierung erfordert die Bestellsyn
 ShippingSyncRequiresOrders=Die Versandsynchronisierung erfordert die Bestellsynchronisierung
 
 # Maintenance v2.1.6
-ErrorLoadingConfiguration=Fehler beim Laden der Modulkonfiguration
 
 # Diagnostic v2.1.6
 CronDuplicatesCleanedSuccess=%s doppelte(n) CRON(s) erfolgreich entfernt
@@ -794,7 +793,6 @@ SetupGuide=Einrichtungsanleitung
 # Step 3 - Orders
 
 # Step 4 - Mappings
-OrderStatusMapping=Bestellstatus-Zuordnung
 
 # Step 5 - CRON
 
@@ -1393,6 +1391,9 @@ ProductJsonExportIdentifierHint=Z. B. eine Varianten-SKU, ein Produkttitel oder 
 ProductJsonExportFetch=JSON abrufen
 ProductJsonExportNoIdentifier=Bitte geben Sie eine Produkt-SKU, einen Titel oder eine Kennung ein.
 ProductJsonExportNotFound=Produkt bei Shopify nicht gefunden.
+ProductJsonExportNotFoundNumeric=Kein Produkt entspricht "%s" (gesucht als Varianten-SKU, Titel, dann Produkt-ID).
+ProductJsonExportResolveError=Shopify-Fehler beim Auflösen der Produktkennung. Bitte versuchen Sie es gleich erneut.
+ProductJsonExportIdentifierNotFound=Kein Produkt für die angegebene Kennung gefunden.
 ProductJsonExportResultFor=Produkt-JSON
 ProductJsonExportDownload=JSON herunterladen
 ProductJsonExportCopy=Kopieren
@@ -1788,37 +1789,14 @@ CANCELLED=Storniert
 EXPIRED=Abgelaufen
 FULFILLED=Versendet
 FULFILLMENT_NOT_REQUIRED=Versand nicht erforderlich
-IN_PROGRESS=In Bearbeitung
-ON_HOLD=Angehalten
-OPEN=Offen
 PAID=Bezahlt
 PARTIALLY_FULFILLED=Teilweise versendet
 PARTIALLY_PAID=Teilweise bezahlt
 PARTIALLY_REFUNDED=Teilweise erstattet
 PENDING=Ausstehend
 REFUNDED=Erstattet
-SCHEDULED=Geplant
-SUCCESS=Erfolgreich
 UNFULFILLED=Nicht versendet
 VOIDED=Storniert (Zahlung)
-ERROR=Fehler
-AddOrderStatusMapping=Bestellstatus-Zuordnung hinzufügen
-ConfirmRestoreDefaultMappings=Möchten Sie die Standardzuordnungen wirklich wiederherstellen? Dadurch werden Ihre benutzerdefinierten Zuordnungen gelöscht.
-DefaultMapping=Standardzuordnung
-DefaultMappingsRestoredCount=%s Standardzuordnung(en) wiederhergestellt
-DolibarrOrderStatus=Dolibarr-Bestellstatus
-DolibarrToShopifyStatusMapping=Statuszuordnung Dolibarr zu Shopify
-MappingDescription=Zuordnungsbeschreibung
-MappingPriority=Zuordnungspriorität
-NoOrderStatusMappingDefined=Keine Bestellstatus-Zuordnung definiert
-OrderStatusMappingDesc=Konfigurieren Sie, wie Shopify- und Dolibarr-Bestellstatus automatisch einander zugeordnet werden.
-OrderStatusMappingSaved=Bestellstatus-Zuordnung gespeichert
-RestoreDefaultMappings=Standardzuordnungen wiederherstellen
-ShopifyFinancialStatus=Shopify-Zahlungsstatus
-ShopifyFulfillmentStatus=Shopify-Versandstatus
-ShopifyToDolibarrStatusMapping=Statuszuordnung Shopify zu Dolibarr
-StatusMappingExplanation=Diese Zuordnungen bestimmen automatisch, welcher Dolibarr-Status anhand des von Shopify zurückgegebenen Zahlungs- und Versandstatus angewendet wird.
-StatusOrderSentPartially=Teilweise versandt
 TotalMappings=Zuordnungen insgesamt
 ValidMappings=Gültige Zuordnungen
 
@@ -2214,8 +2192,8 @@ DiagLocationTruncated=Weitere Orte werden nicht angezeigt
 # --- 2.5.3 : Bereinigung doppelter importierter Fotos (Story import-images-duplique) ---
 ImageDuplicatesCleanupTab=Doppelte Fotos
 ImageDuplicatesCleanupTitle=Bereinigung doppelter importierter Fotos
-ImageDuplicatesCleanupIntro=Vor der Korrektur vom 07.09.2026 kopierte jede Shopify-Synchronisierung (insbesondere der Webhook „products/update") alle Fotos des Produkts unter einem zufällig generierten Namen (uniqid()) erneut — keine konnte die von der vorherigen Synchronisierung abgelegte Datei erkennen. Dieses Werkzeug erkennt diese Duplikate und ermöglicht deren Löschung nach einer Vorschau.
-ImageDuplicatesCleanupWarning=Es werden nur Dateien vorgeschlagen, die EXAKT dem vom Modul abgelegten Muster entsprechen (Produktreferenz + Zufallskennung). Von Ihnen selbst hochgeladene Fotos sind niemals betroffen. Die aktuellste Datei jedes Produkts wird behalten, ältere werden zur Löschung vorgeschlagen.
+ImageDuplicatesCleanupIntro=Vor der Korrektur vom 07.09.2026 kopierte jede Shopify-Synchronisierung (insbesondere der Webhook „products/update") alle Fotos des Produkts unter einem zufällig generierten Namen (uniqid()) erneut — keine konnte die von der vorherigen Synchronisierung abgelegte Datei erkennen. Dieses Werkzeug erkennt Kopien mit streng identischem Inhalt und ermöglicht deren Löschung nach einer Vorschau. Nach einer Bereinigung werden die Fotos der betroffenen Produkte einmalig erneut an Shopify gesendet, ohne zusätzliche Medien zu erzeugen. Eine neu komprimierte oder neu exportierte Kopie ist nicht streng identisch und wird nicht vorgeschlagen.
+ImageDuplicatesCleanupWarning=Es werden nur Dateien vorgeschlagen, die EXAKT dem vom Modul abgelegten Muster entsprechen (Produktreferenz + Zufallskennung) UND mindestens eine Kopie mit streng identischem Inhalt haben. Ein anderes Foto wird nie vorgeschlagen, und von Ihnen selbst hochgeladene Fotos sind niemals betroffen. Pro Gruppe identischer Kopien wird eine Kopie behalten (die vom Modul verwendete, sonst das erste Foto des Produkts, sonst die aktuellste); die übrigen werden zur Löschung vorgeschlagen. Standardmäßig ist nichts angekreuzt: Kreuzen Sie die zu löschenden Kopien an.
 ImageDuplicatesCleanupNoCandidates=Keine Duplikate erkannt — nichts zu bereinigen.
 ImageDuplicatesCleanupColProduct=Produkt
 ImageDuplicatesCleanupColFile=Datei
@@ -2224,7 +2202,9 @@ ImageDuplicatesCleanupColDate=Datum
 ImageDuplicatesCleanupColAction=Aktion
 ImageDuplicatesCleanupKept=Behalten
 ImageDuplicatesCleanupApplyButton=Ausgewählte Duplikate löschen
-ImageDuplicatesCleanupApplyConfirm=Dadurch werden bis zu %s doppelte Datei(en) (und ihre Miniaturansichten) endgültig gelöscht. Fortfahren?
+ImageDuplicatesCleanupApplyConfirm=Dadurch werden %s ausgewählte Datei(en) (und ihre Miniaturansichten) endgültig gelöscht. Fortfahren?
+ImageDuplicatesCleanupNothingSelected=Keine Kopie ist angekreuzt: Kreuzen Sie mindestens eine zu löschende Datei an.
+ImageDuplicatesCleanupLockBusy=Für eines dieser Produkte läuft bereits eine Bereinigung: dafür wurde nichts gelöscht. Bitte versuchen Sie es gleich erneut.
 ImageDuplicatesCleanupApplied=%s Datei(en) erfolgreich gelöscht.
 ImageDuplicatesCleanupErrors=Aufgetretene Fehler:
 
@@ -2266,3 +2246,12 @@ UnderpriceAuditReasonMatchesNote=Betrag stimmt überein — keine Maßnahme
 UnderpriceAuditReasonUnderpricedDraft=Entwurf, nicht fakturiert — direkte Korrektur in der Bestellung möglich (keine automatische Maßnahme)
 UnderpriceAuditReasonUnderpricedCanceled=Stornierte Bestellung — nie fakturiert, keine Regulierung erforderlich
 UnderpriceAuditReasonUnderpricedCommitted=Fakturierte/bezahlte Bestellung — markiert, Behandlung per Gutschrift AUSSERHALB DES WERKZEUGS
+
+# Story 66-6 — Verknüpfung Shopify-Kunde <-> Geschäftspartner (Partnerkarte, nur Lesen)
+ShopifyCustomerLink=Shopify-Kunde
+ShopifyCustomerLinkStore=Shop
+ShopifyCustomerEmailMandatoryCause=Die Dolibarr-Option SOCIETE_EMAIL_MANDATORY (Einstellungen > Geschäftspartner) verlangt eine E-Mail für jeden Geschäftspartner, dieser Shopify-Kunde hat jedoch keine (Bestellung nur mit Telefonnummer): Option deaktivieren oder die E-Mail des Kunden in Shopify erfassen.
+ShopifyOrderNoCustomerIdentity=Bestellung %s hat keine Kundenidentität (keine E-Mail, keine Shopify-Kunden-ID, kein Name, kein Telefon, keine Adresse) — Zugriff „Protected customer data“ der Shopify-App prüfen, dann das Ereignis erneut abspielen
+SyncReportCollectionsAutomaticSkipped=%s in Shopify durch Bedingungen gesteuerte Kollektion(en): das Modul fügt dort keine Produkte hinzu — stellen Sie die Kollektion auf manuell um, wenn das Modul sie befüllen soll
+SyncReportCollectionsAutomaticRefused=%s Kollektion(en) von Shopify abgelehnt (Meldung weist auf eine automatische Kollektion hin): es konnte kein Produkt zugeordnet werden — fügen Sie eine Bedingung hinzu oder stellen Sie die Kollektion in Shopify auf manuell um
+SyncReportCollectionsDetailUnreadable=%s Kollektion(en) vorsorglich übersprungen: Shopify verweigert das Lesen ihrer Bedingungen, das Modul kann nicht feststellen, ob sie durch Bedingungen gesteuert werden, und fügt keine Produkte hinzu

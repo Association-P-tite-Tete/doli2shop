@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.0.26
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -163,6 +163,74 @@ class CollectionsUtils
             return $this->db->fetch_array($result);
         }
         return false;
+    }
+
+    /**
+     * Story 66-4 : etat de l'image de collection deja envoyee a Shopify (empreinte + collection visee).
+     *
+     * Ne leve jamais : toute erreur SQL = null (l'appelant renvoie alors l'image, comportement
+     * historique). Filtre entity ; ignore les mappings supprimes.
+     *
+     * @param int $dolibarrCategoryId Dolibarr category ID
+     * @return array|null ['image_sha256' => ?string, 'image_collection_id' => ?string] ou null
+     * @since 2.6.1
+     */
+    public function getImageSyncState($dolibarrCategoryId)
+    {
+        try {
+            $sql = "SELECT image_sha256, image_collection_id FROM " . MAIN_DB_PREFIX . "doli2shop_collections";
+            $sql .= " WHERE dolibarr_category_id = " . (int) $dolibarrCategoryId;
+            $sql .= " AND entity = " . (int) $this->entity;
+            $sql .= " AND sync_status != 'deleted'";
+
+            $result = $this->db->query($sql);
+            if (!$result) {
+                $this->log("CollectionsUtils::getImageSyncState - SQL read failed for category " . (int) $dolibarrCategoryId, LOG_WARNING);
+                return null;
+            }
+            if (!$this->db->num_rows($result)) {
+                return null;
+            }
+            $row = $this->db->fetch_array($result);
+            return is_array($row) ? $row : null;
+        } catch (\Throwable $e) {
+            $this->log("CollectionsUtils::getImageSyncState - " . $e->getMessage(), LOG_WARNING);
+            return null;
+        }
+    }
+
+    /**
+     * Story 66-4 : memorise l'image envoyee. A appeler UNIQUEMENT apres succes de collectionUpdate.
+     * La ligne visee est celle de la categorie ET de la collection Shopify (createOrUpdateMapping peut
+     * renvoyer l'ID de categorie au lieu du rowid : on ne s'appuie pas dessus). Ne leve jamais.
+     *
+     * @param int    $dolibarrCategoryId Dolibarr category ID
+     * @param string $shopifyCollectionId Collection Shopify a laquelle l'image vient d'etre appliquee
+     * @param string $imageSha256         Empreinte (contenu + libelle)
+     * @return bool true si la requete a abouti
+     * @since 2.6.1
+     */
+    public function setImageSyncState($dolibarrCategoryId, $shopifyCollectionId, $imageSha256)
+    {
+        try {
+            $sql = "UPDATE " . MAIN_DB_PREFIX . "doli2shop_collections SET";
+            $sql .= " image_sha256 = '" . $this->db->escape($imageSha256) . "'";
+            $sql .= ", image_collection_id = '" . $this->db->escape((string) $shopifyCollectionId) . "'";
+            $sql .= ", image_synced_at = NOW()";
+            $sql .= " WHERE dolibarr_category_id = " . (int) $dolibarrCategoryId;
+            $sql .= " AND entity = " . (int) $this->entity;
+            $sql .= " AND shopify_collection_id = '" . $this->db->escape((string) $shopifyCollectionId) . "'";
+            $sql .= " AND sync_status != 'deleted'";
+
+            if (!$this->db->query($sql)) {
+                $this->log("CollectionsUtils::setImageSyncState - SQL write failed for category " . (int) $dolibarrCategoryId, LOG_WARNING);
+                return false;
+            }
+            return true;
+        } catch (\Throwable $e) {
+            $this->log("CollectionsUtils::setImageSyncState - " . $e->getMessage(), LOG_WARNING);
+            return false;
+        }
     }
 
     /**

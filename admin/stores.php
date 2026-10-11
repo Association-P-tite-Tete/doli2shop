@@ -13,7 +13,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.2.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -99,49 +99,42 @@ if ($action == 'update' && !empty($_POST) && verifToken()) {
     // la section postée (update() n'agit que sur les clés présentes) → pas d'écrasement croisé.
     // Chaque sous-onglet poste STRICTEMENT sa propre section. Pas de chemin « section vide » :
     // l'ancien formulaire global n'existe plus, et un POST sans section connue ne doit RIEN
-    // écrire (sinon GETPOST('fk_categorie') = 0 effacerait la catégorie — review 48-2 M1).
+    // écrire (sinon un champ absent lu à 0 effacerait la catégorie — review 48-2 M1).
     $updateSection = GETPOST('update_section', 'aZ09');
-    $data = array();
 
-    if ($updateSection === 'connection') {
-        $data['label']  = GETPOST('label', 'alphanohtml');
-        $data['active'] = GETPOST('active', 'int') ? 1 : 0;
-    } elseif ($updateSection === 'shipping') {
-        $data['location_id'] = GETPOST('location_id', 'alphanohtml');
-    } elseif ($updateSection === 'categories') {
-        // catégorie produit liée éditable (0 = aucune → NULL) — Story 48-3
-        $postCategorie = GETPOST('fk_categorie', 'int');
-        $data['fk_categorie'] = $postCategorie > 0 ? (int) $postCategorie : null;
-        // Catégories commande/facture/devis — Story 49-5
-        $postCategorieOrder    = GETPOST('fk_categorie_order',    'int');
-        $postCategorieInvoice  = GETPOST('fk_categorie_invoice',  'int');
-        $postCategorieProposal = GETPOST('fk_categorie_proposal', 'int');
-        $data['fk_categorie_order']    = $postCategorieOrder    > 0 ? (int) $postCategorieOrder    : null;
-        $data['fk_categorie_invoice']  = $postCategorieInvoice  > 0 ? (int) $postCategorieInvoice  : null;
-        $data['fk_categorie_proposal'] = $postCategorieProposal > 0 ? (int) $postCategorieProposal : null;
+    // Story 68-3 : la construction de $data est une fonction PURE (lib/doli2shop.lib.php). Chaque
+    // formulaire a SA section (connection, shipping, categories_product, categories_documents) et
+    // un champ n'est écrit que si sa CLÉ est présente dans le POST (array_key_exists, pas GETPOST
+    // qui confond absent et 0) : enregistrer la catégorie produit n'efface plus les tags documents.
+    // Les champs texte sont assainis ici, à la frontière ; $_POST n'est lu que pour la PRÉSENCE.
+    $postedFields = $_POST;
+    if (array_key_exists('label', $postedFields)) {
+        $postedFields['label'] = GETPOST('label', 'alphanohtml');
     }
+    if (array_key_exists('location_id', $postedFields)) {
+        $postedFields['location_id'] = GETPOST('location_id', 'alphanohtml');
+    }
+    $applied  = doli2shopApplyStoreSectionUpdate($storeService, (int) $storeId, $updateSection, $postedFields);
+    $data     = $applied['data'];
+    $oldStore = $applied['oldStore'];
+    $result   = $applied['result'];
 
     if (empty($data)) {
         setEventMessages($langs->trans("StoreUpdateError"), null, 'errors');
     } else {
-        // Story 49-5 : capturer l'ancien label AVANT l'update (pour renommage catégories)
-        $oldStore   = $storeService->fetch((int) $storeId);
-        $oldLabel   = ($oldStore !== null) ? (string) $oldStore->label : '';
-
-        $result = $storeService->update((int) $storeId, $data);
         if ($result >= 0) {
             setEventMessages($langs->trans("StoreUpdated"), null, 'mesgs');
 
             // Story 49-5 AC-3 : renommage automatique des catégories si le label a changé
-            if ($updateSection === 'connection' && isset($data['label']) && $data['label'] !== $oldLabel && $oldStore !== null) {
+            if ($applied['renameCategories']) {
                 $nbRenamed = doli2shopRenameStoreCategories($db, $oldStore, $data['label']);
                 if ($nbRenamed > 0) {
                     setEventMessages(sprintf($langs->trans("StoreCategoriesRenamed"), $nbRenamed), null, 'mesgs');
                 }
             }
 
-            // Revenir sur la fiche au bon sous-onglet ($updateSection est forcément l'une des 3 ici)
-            header('Location: '.$_SERVER["PHP_SELF"].'?action=edit&store_id='.(int) $storeId.'&subtab='.$updateSection);
+            // Revenir sur la fiche au bon sous-onglet (table section -> sous-onglet, Story 68-3)
+            header('Location: '.$_SERVER["PHP_SELF"].'?action=edit&store_id='.(int) $storeId.'&subtab='.doli2shopStoreSectionToSubtab($updateSection));
             exit;
         } else {
             setEventMessages($langs->trans("StoreUpdateError"), null, 'errors');
@@ -680,7 +673,7 @@ if ($action == 'edit' && $storeId > 0) {
             print ' <span class="opacitymedium">('.$langs->trans("StoreDomainFromOAuth").')</span></td></tr>';
             $checkedActive = ((int) $editStore->active === 1) ? ' checked' : '';
             print '<tr><td>'.$langs->trans("StoreActive").'</td>';
-            print '<td><input type="checkbox" name="active" value="1"'.$checkedActive.'></td></tr>';
+            print '<td><input type="hidden" name="active" value="0"><input type="checkbox" name="active" value="1"'.$checkedActive.'></td></tr>';
             print '</table>';
             print '<div class="center" style="margin-top:8px;">';
             print '<input type="submit" class="button" value="'.$langs->transnoentities("Save").'">';
@@ -710,7 +703,7 @@ if ($action == 'edit' && $storeId > 0) {
             print '<form method="post" action="'.dol_escape_htmltag($_SERVER["PHP_SELF"]).'">';
             print '<input type="hidden" name="token" value="'.newToken().'">';
             print '<input type="hidden" name="action" value="update">';
-            print '<input type="hidden" name="update_section" value="categories">';
+            print '<input type="hidden" name="update_section" value="categories_product">';
             print '<input type="hidden" name="store_id" value="'.(int) $storeId.'">';
             print '<table class="border centpercent">';
             print '<tr><td class="titlefield">'.$langs->trans("StoreLinkedProductCategory").'</td><td>';
@@ -729,9 +722,8 @@ if ($action == 'edit' && $storeId > 0) {
             print '<form method="post" action="'.dol_escape_htmltag($_SERVER["PHP_SELF"]).'">';
             print '<input type="hidden" name="token" value="'.newToken().'">';
             print '<input type="hidden" name="action" value="update">';
-            print '<input type="hidden" name="update_section" value="categories">';
+            print '<input type="hidden" name="update_section" value="categories_documents">';
             print '<input type="hidden" name="store_id" value="'.(int) $storeId.'">';
-            print '<input type="hidden" name="fk_categorie" value="'.(int) ($editStore->fk_categorie ?? 0).'">';
             print '<table class="noborder centpercent">';
             print '<tr class="oddeven"><td class="titlefield">'.$langs->trans("StoreOrderCategory").'</td><td>';
             print $formStore->select_all_categories(Categorie::TYPE_ORDER, (int) ($editStore->fk_categorie_order ?? 0), 'fk_categorie_order', 0, 0, 0);

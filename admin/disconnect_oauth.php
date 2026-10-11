@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.1.6
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -81,7 +81,7 @@ if (!verifToken()) {
  * confirmation ci-dessous), et REVALIDÉ ici à chaque requête (réserve n°5) : $_SESSION n'est
  * jamais utilisée comme source de vérité entre la page de confirmation et l'action réelle.
  */
-$requestedStoreId = GETPOST('store_id', 'int');
+$requestedStoreId = GETPOSTINT('store_id');
 $storeService = new StoreService($db);
 $allStores = $storeService->getAll();
 $targetStore = doli2shopResolveOAuthDisconnectStore($allStores, $requestedStoreId);

@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.2.1
  * @link        https://doli2shop.ptitetete.org
  */

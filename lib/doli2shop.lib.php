@@ -11,7 +11,7 @@
  * @copyright   2022-2025 Thomas Meigen<info@meigensmartsolutions.de>
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       1.0.0
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -371,7 +371,7 @@ function doli2shopStoreSwitchDroppedParams()
  * @param  DoliDB $db Connexion base de données
  * @return void
  * @since  2.3.10
- * @version     2.6.0
+ * @version     2.6.1
  */
 function doli2shopRenderAdminTopBar($db)
 {
@@ -598,17 +598,6 @@ function doli2shopAdminPrepareHead()
         $head[$h][0] = dol_buildpath("/doli2shop/admin/setup.php", 1) . '?tab=orders' . $storeParam;
         $head[$h][1] = $langs->trans("OrderConfiguration");
         $head[$h][2] = 'orders';
-        $h++;
-
-        // Mappage des statuts de commande — écran existant, fonctionnalité VIVANTE (consommée en
-        // production par le mappeur de statuts) mais jusqu'ici atteignable par aucun lien (story
-        // dix-ecrans-atteignables-par-aucun-lien, AC2). Placé juste après "Configuration des
-        // commandes" : même famille fonctionnelle. Séquencement imposé par le Validate du
-        // 09/09/2026 : ce rebranchement n'a pu avancer qu'une fois le bouton "Restaurer les
-        // valeurs par défaut" réparé (story restaurer-les-correspondances-de-statut-vide-les-tables).
-        $head[$h][0] = dol_buildpath("/doli2shop/admin/orderstatusmapping.php", 1) . ($storeParam ? '?' . ltrim($storeParam, '&') : '');
-        $head[$h][1] = $langs->trans("OrderStatusMapping");
-        $head[$h][2] = 'orderstatusmapping';
         $h++;
 
         // Story 22.4: Shipping and Payment tabs removed — content merged into Orders tab
@@ -1574,7 +1563,7 @@ function doli2shopGetGenuinelyExpiredStatuses(): array
  *
  * @param array|null $payload Payload (déjà déplié) de get-license-by-shop
  * @return array Clés : state, titleKey, badgeKey, noteKey, badgeClass, cardClass
- * @version 2.6.0
+ * @version     2.6.1
  * @since   2.6.0
  */
 function doli2shopResolveLicenseDisplayState($payload)
@@ -1631,7 +1620,7 @@ function doli2shopResolveLicenseDisplayState($payload)
  * @param string      $shopDomain       Domaine boutique (xxx.myshopify.com)
  * @param string|null $officialEndpoint Surcharge réservée aux tests ; null = constante par défaut
  * @return string URL absolue https, ou '' si indisponible
- * @version 2.6.0
+ * @version     2.6.1
  * @since   2.6.0
  */
 function doli2shopBuildLinkSerialUrl($shopDomain, $officialEndpoint = null)
@@ -1655,7 +1644,7 @@ function doli2shopBuildLinkSerialUrl($shopDomain, $officialEndpoint = null)
  * @param array $displayState Résultat de doli2shopResolveLicenseDisplayState()
  * @param bool  $isValid      Champ `valid` du payload
  * @return array Clés : cardClass, titleKey, badgeClass, badgeKey, noteKey, showSourceBadge, showPlan, showLicenseDetails, showRelinkAction
- * @version 2.6.0
+ * @version     2.6.1
  * @since   2.6.0
  */
 function doli2shopResolveLicenseCardLayout($displayState, $isValid)
@@ -1886,6 +1875,255 @@ function doli2shop_mask_name($name)
 }
 
 /**
+ * Mask a phone number for GDPR-compliant logging (Story 66-6, AC12).
+ *
+ * Garde uniquement les 2 derniers chiffres : "06 12 34 56 78" -> "******78". Un numéro sans
+ * chiffre (ou vide) devient "***". Jamais l'indicatif pays ni le début du numéro.
+ *
+ * @param  string $phone Numéro brut
+ * @return string Numéro masqué
+ * @since  2.6.1
+ */
+function doli2shop_mask_phone($phone)
+{
+    $digits = preg_replace('/\D+/', '', (string) $phone);
+    if ($digits === null || strlen($digits) < 3) {
+        return '***';
+    }
+    return str_repeat('*', strlen($digits) - 2) . substr($digits, -2);
+}
+
+/**
+ * Table bornée des indicatifs téléphoniques gérés par doli2shop_normalize_phone() (Story 66-6).
+ * Pas de libphonenumber (paquet DoliStore contraint < 2 Mo) : 19 pays, indicatif et présence d'un
+ * zéro de tronc national (ce zéro disparaît en format international : 06... -> +33 6...).
+ * L'Italie conserve son zéro (il fait partie du numéro).
+ *
+ * @return array<string,array{0:string,1:bool}> code pays ISO -> [indicatif, zéro de tronc]
+ * @since  2.6.1
+ */
+function doli2shop_phone_country_table()
+{
+    return array(
+        'FR' => array('33', true),  'BE' => array('32', true),  'CH' => array('41', true),
+        'LU' => array('352', false), 'DE' => array('49', true),  'ES' => array('34', false),
+        'IT' => array('39', false), 'NL' => array('31', true),  'PT' => array('351', false),
+        'GB' => array('44', true),  'IE' => array('353', true), 'AT' => array('43', true),
+        'US' => array('1', false),  'CA' => array('1', false),  'PL' => array('48', false),
+        'DK' => array('45', false), 'SE' => array('46', true),  'NO' => array('47', false),
+        'FI' => array('358', true),
+    );
+}
+
+/**
+ * Normalise un numéro de téléphone en clé de comparaison de type E.164 (Story 66-6, AC6).
+ *
+ * Retire espaces, points, tirets, parenthèses, barres. "+33 6 12 34 56 78", "0033612345678" et
+ * "06 12 34 56 78" (pays FR) donnent la même clé "+33612345678". Un numéro national dont le pays
+ * est inconnu (absent de la table), ou trop court pour être fiable, donne '' = NON COMPARABLE :
+ * l'appelant ne rapproche alors RIEN (en cas de doute, on crée un tiers, jamais un faux rattachement).
+ * Un numéro international d'indicatif hors table est comparé tel quel (chiffres seuls).
+ *
+ * @param  string $raw           Numéro brut (texte libre)
+ * @param  string $countryCodeV2 Code pays ISO 3166-1 alpha-2 du client (sert aux numéros nationaux)
+ * @return string Clé "+<indicatif><numéro national>" ou '' si non comparable
+ * @since  2.6.1
+ */
+function doli2shop_normalize_phone($raw, $countryCodeV2 = '')
+{
+    $raw = trim((string) $raw);
+    if ($raw === '') {
+        return '';
+    }
+    $hasPlus = (strpos($raw, '+') === 0);
+    $digits = preg_replace('/\D+/', '', $raw);
+    if ($digits === null || $digits === '') {
+        return '';
+    }
+    $international = $hasPlus;
+    if (!$hasPlus && strpos($digits, '00') === 0) {
+        $international = true;
+        $digits = substr($digits, 2);
+    }
+
+    $table = doli2shop_phone_country_table();
+
+    if ($international) {
+        $dial = '';
+        foreach (array(3, 2, 1) as $len) {
+            $candidate = substr($digits, 0, $len);
+            foreach ($table as $entry) {
+                if ($entry[0] === $candidate) {
+                    $dial = $candidate;
+                    break 2;
+                }
+            }
+        }
+        if ($dial === '') {
+            return (strlen($digits) >= 8) ? '+' . $digits : '';
+        }
+        $national = substr($digits, strlen($dial));
+        $trunk = false;
+        foreach ($table as $entry) {
+            if ($entry[0] === $dial && $entry[1]) {
+                $trunk = true;
+            }
+        }
+        if ($trunk && strpos($national, '0') === 0) {
+            $national = substr($national, 1);
+        }
+    } else {
+        $country = strtoupper(trim((string) $countryCodeV2));
+        if ($country === '' || !isset($table[$country])) {
+            return '';
+        }
+        $dial = $table[$country][0];
+        $national = $digits;
+        if ($table[$country][1] && strpos($national, '0') === 0) {
+            $national = substr($national, 1);
+        }
+    }
+
+    if (strlen($national) < 6) {
+        return '';
+    }
+    return '+' . $dial . $national;
+}
+
+/**
+ * Suffixe de chiffres (9 derniers) d'une clé téléphone, pour le préfiltre SQL `LIKE '%…'` (AC6).
+ *
+ * @param  string $phoneKey Clé issue de doli2shop_normalize_phone()
+ * @return string Chiffres uniquement ('' si la clé est vide)
+ * @since  2.6.1
+ */
+function doli2shop_phone_sql_suffix($phoneKey)
+{
+    $digits = preg_replace('/\D+/', '', (string) $phoneKey);
+    if ($digits === null || $digits === '') {
+        return '';
+    }
+    return substr($digits, -9);
+}
+
+/**
+ * Normalise un texte (nom, adresse) pour comparaison : minuscules, sans accents, hors lettres et
+ * chiffres remplacés par des espaces, espaces unifiés (Story 66-6, R3/R4).
+ *
+ * @param  string $text Texte brut
+ * @return string Texte normalisé
+ * @since  2.6.1
+ */
+function doli2shop_fold_text($text)
+{
+    $text = (string) $text;
+    $text = function_exists('mb_strtolower') ? mb_strtolower($text, 'UTF-8') : strtolower($text);
+    $text = strtr($text, array(
+        'à' => 'a', 'á' => 'a', 'â' => 'a', 'ã' => 'a', 'ä' => 'a', 'å' => 'a', 'æ' => 'ae',
+        'ç' => 'c', 'è' => 'e', 'é' => 'e', 'ê' => 'e', 'ë' => 'e', 'ì' => 'i', 'í' => 'i',
+        'î' => 'i', 'ï' => 'i', 'ñ' => 'n', 'ò' => 'o', 'ó' => 'o', 'ô' => 'o', 'õ' => 'o',
+        'ö' => 'o', 'ø' => 'o', 'œ' => 'oe', 'ù' => 'u', 'ú' => 'u', 'û' => 'u', 'ü' => 'u',
+        'ý' => 'y', 'ÿ' => 'y', 'ß' => 'ss',
+    ));
+    $text = preg_replace('/[^a-z0-9]+/', ' ', $text);
+    return trim((string) $text);
+}
+
+/**
+ * Normalise un nom de personne ou de société : doli2shop_fold_text() sans les civilités
+ * (madame, mme, monsieur, mr, mlle, ms, mrs...) — Story 66-6, R3.
+ *
+ * @param  string $name Nom brut
+ * @return string Nom normalisé ('' s'il ne reste que des civilités)
+ * @since  2.6.1
+ */
+function doli2shop_normalize_person_name($name)
+{
+    $civilities = array('madame', 'mme', 'monsieur', 'mr', 'm', 'mademoiselle', 'mlle', 'ms', 'mrs', 'mister', 'miss');
+    $tokens = array();
+    foreach (explode(' ', doli2shop_fold_text($name)) as $token) {
+        if ($token !== '' && !in_array($token, $civilities, true)) {
+            $tokens[] = $token;
+        }
+    }
+    return implode(' ', $tokens);
+}
+
+/**
+ * Deux noms sont-ils compatibles ? Égalité après normalisation, OU l'un contient l'autre en
+ * mots entiers ("martin" dans "alice martin" ; "martinez" n'est PAS dans "martin") — Story 66-6, R3.
+ * Un nom normalisé de moins de 2 caractères n'est jamais compatible (en cas de doute, créer).
+ *
+ * @param  string $nameA Premier nom (brut)
+ * @param  string $nameB Second nom (brut)
+ * @return bool
+ * @since  2.6.1
+ */
+function doli2shop_person_names_compatible($nameA, $nameB)
+{
+    $a = doli2shop_normalize_person_name($nameA);
+    $b = doli2shop_normalize_person_name($nameB);
+    if (strlen($a) < 2 || strlen($b) < 2) {
+        return false;
+    }
+    if ($a === $b) {
+        return true;
+    }
+    return strpos(' ' . $a . ' ', ' ' . $b . ' ') !== false
+        || strpos(' ' . $b . ' ', ' ' . $a . ' ') !== false;
+}
+
+/**
+ * Le nom libre d'un tiers (societe.nom) désigne-t-il cette personne ? (Story 66-6, R3 durci — review 4 couches M1)
+ *
+ * Le nom de famille ET le prénom doivent TOUS DEUX se trouver dans le nom du tiers comme mots entiers,
+ * dans n'importe quel ordre ("Martin Alice" convient à Alice Martin ; "Martin Dupont" NE convient PAS à
+ * Alice Martin : le prénom manque). Si le prénom ou le nom de famille n'est pas connu côté Shopify, la
+ * réponse est false : en cas de doute, on crée un tiers plutôt que de rattacher.
+ *
+ * @param  string $firstName     Prénom Shopify
+ * @param  string $lastName      Nom de famille Shopify
+ * @param  string $candidateName Nom du tiers candidat (texte libre)
+ * @return bool
+ * @since  2.6.1
+ */
+function doli2shop_person_matches_thirdparty_name($firstName, $lastName, $candidateName)
+{
+    $first = doli2shop_normalize_person_name($firstName);
+    $last = doli2shop_normalize_person_name($lastName);
+    $candidate = ' ' . doli2shop_normalize_person_name($candidateName) . ' ';
+    if ($first === '' || $last === '' || trim($candidate) === '') {
+        return false;
+    }
+    foreach (array_merge(explode(' ', $first), explode(' ', $last)) as $word) {
+        if (strpos($candidate, ' ' . $word . ' ') === false) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Égalité stricte de deux noms après normalisation, indépendante de l'ordre des mots
+ * ("Alice Martin" == "Martin Alice") — Story 66-6, R4 (le nom doit COÏNCIDER, pas seulement contenir).
+ *
+ * @param  string $nameA Premier nom (brut)
+ * @param  string $nameB Second nom (brut)
+ * @return bool
+ * @since  2.6.1
+ */
+function doli2shop_person_names_equal($nameA, $nameB)
+{
+    $a = explode(' ', doli2shop_normalize_person_name($nameA));
+    $b = explode(' ', doli2shop_normalize_person_name($nameB));
+    sort($a);
+    sort($b);
+    $a = trim(implode(' ', $a));
+    $b = trim(implode(' ', $b));
+    return $a !== '' && $a === $b;
+}
+
+/**
  * Récupère le statut courant d'un objet Dolibarr lié à un event webhook (Story 38.2).
  *
  * Requête légère sur la PK de la table métier (filtrée par entité), pour afficher
@@ -1987,6 +2225,154 @@ function doli2shop_get_object_status_label($db, $objectType, $objectId)
 
     // product ou type inconnu : pas de statut pertinent
     return null;
+}
+
+/**
+ * Story 68-3 : construit le tableau `$data` de `StoreService::update()` pour UNE section de la fiche
+ * boutique (admin/stores.php), à partir du POST. Fonction PURE (aucun accès à $_POST, GETPOST ou
+ * la base) pour être testable de bout en bout.
+ *
+ * Règle de classe : chaque formulaire a SA section, et au sein d'une section un champ n'est écrit
+ * que si sa CLÉ est présente dans `$post` (`array_key_exists`, jamais une lecture de valeur qui
+ * confond « absent » et « 0 »). Une clé présente à ''/0 = effacement volontaire (NULL). Une section
+ * inconnue ou vide ne produit rien (le handler refuse alors l'écriture).
+ *
+ * Sections : `connection` (label non vide, active — poste toujours 0|1 via un champ caché ; absent = non touché), `shipping`
+ * (location_id), `categories_product` (fk_categorie seul), `categories_documents`
+ * (fk_categorie_order/invoice/proposal, chacun seulement s'il est posté : le formulaire n'expose pas
+ * le devis quand Categorie::TYPE_PROPOSAL n'existe pas, Dolibarr < oct. 2025).
+ *
+ * Les champs texte (`label`, `location_id`) doivent avoir été assainis par l'appelant (GETPOST).
+ *
+ * @param  string $section Valeur de `update_section`
+ * @param  array  $post    Données postées (clé => valeur)
+ * @return array           Données pour StoreService::update() (vide si rien à écrire)
+ * @since  2.6.1
+ */
+function doli2shopBuildStoreUpdateData($section, array $post)
+{
+    $data = array();
+
+    // Entier de pointeur catégorie : > 0 = valeur, sinon NULL (effacement). Une valeur non scalaire
+    // (tableau forgé) est traitée comme ABSENTE : on n'efface pas sur une entrée incohérente.
+    $addPointer = function ($column) use (&$data, $post) {
+        if (!array_key_exists($column, $post) || !is_scalar($post[$column])) {
+            return;
+        }
+        $value = (int) $post[$column];
+        $data[$column] = $value > 0 ? $value : null;
+    };
+
+    if ($section === 'connection') {
+        // Un libellé vide est ignoré (jamais écrit, donc jamais de renommage des catégories)
+        if (array_key_exists('label', $post) && is_scalar($post['label']) && trim((string) $post['label']) !== '') {
+            $data['label'] = (string) $post['label'];
+        }
+        // Le formulaire poste toujours `active` (champ caché 0 avant la case) : clé absente = non touché
+        if (array_key_exists('active', $post) && is_scalar($post['active'])) {
+            $data['active'] = (int) $post['active'] ? 1 : 0;
+        }
+    } elseif ($section === 'shipping') {
+        if (array_key_exists('location_id', $post) && is_scalar($post['location_id'])) {
+            $data['location_id'] = (string) $post['location_id'];
+        }
+    } elseif ($section === 'categories_product') {
+        $addPointer('fk_categorie');
+    } elseif ($section === 'categories_documents') {
+        $addPointer('fk_categorie_order');
+        $addPointer('fk_categorie_invoice');
+        $addPointer('fk_categorie_proposal');
+    }
+
+    return $data;
+}
+
+/**
+ * Story 68-3 : traitement COMPLET de l'enregistrement d'une section de la fiche boutique (lecture du
+ * POST -> données -> UPDATE via StoreService -> journal). Le handler d'admin/stores.php n'en est
+ * qu'un appel mince ; la chaîne entière est testable sur SQL capturé.
+ *
+ * @param  StoreService $storeService Service boutiques (entity courante)
+ * @param  int          $dolibarrStoreId Rowid de la boutique
+ * @param  string       $section      Valeur de `update_section`
+ * @param  array        $post         Données postées (champs texte déjà assainis par l'appelant)
+ * @return array                      ['data' => array, 'oldStore' => object|null, 'result' => int, 'renameCategories' => bool]
+ *                                    result = -1 sans appel au service si rien à écrire
+ * @since  2.6.1
+ */
+function doli2shopApplyStoreSectionUpdate($storeService, $dolibarrStoreId, $section, array $post)
+{
+    $data = doli2shopBuildStoreUpdateData($section, $post);
+    if (empty($data)) {
+        return array('data' => array(), 'oldStore' => null, 'result' => -1, 'renameCategories' => false);
+    }
+
+    // Ancien état capturé AVANT l'update (renommage de catégories, journal)
+    $oldStore = $storeService->fetch((int) $dolibarrStoreId);
+    $result = $storeService->update((int) $dolibarrStoreId, $data);
+
+    if ($result >= 0 && ($section === 'categories_product' || $section === 'categories_documents')) {
+        doli2shopLogStoreCategoryPointerChange($oldStore, $data, (int) $dolibarrStoreId);
+    }
+
+    // Renommage des catégories (Story 49-5) : seulement si le libellé a réellement changé
+    $renameCategories = $result >= 0 && $section === 'connection' && isset($data['label'])
+        && $oldStore !== null && $data['label'] !== (string) $oldStore->label;
+
+    return array('data' => $data, 'oldStore' => $oldStore, 'result' => $result, 'renameCategories' => $renameCategories);
+}
+
+/**
+ * Story 68-3 : sous-onglet de la fiche boutique où revenir après l'enregistrement d'une section.
+ * Les deux sections catégories vivent dans le sous-onglet `categories` ; toute section sans entrée
+ * retombe sur `connection`.
+ *
+ * @param  string $section Valeur de `update_section`
+ * @return string          connection|categories|shipping
+ * @since  2.6.1
+ */
+function doli2shopStoreSectionToSubtab($section)
+{
+    $map = array(
+        'connection'           => 'connection',
+        'shipping'             => 'shipping',
+        'categories_product'   => 'categories',
+        'categories_documents' => 'categories',
+    );
+    return isset($map[$section]) ? $map[$section] : 'connection';
+}
+
+/**
+ * Story 68-3 : journalise (LOG_INFO) les anciennes et nouvelles valeurs des pointeurs catégorie
+ * touchés par une écriture de la section catégories — le passé n'était pas reconstituable faute de
+ * trace. Seuls des identifiants de catégorie sont écrits (aucune donnée sensible). Jamais bloquant :
+ * toute erreur est avalée.
+ *
+ * @param  object|null $oldStore  Boutique AVANT l'écriture (null si introuvable)
+ * @param  array       $data      Données envoyées à StoreService::update()
+ * @param  int         $dolibarrStoreId Rowid de la boutique
+ * @return void
+ * @since  2.6.1
+ */
+function doli2shopLogStoreCategoryPointerChange($oldStore, array $data, $dolibarrStoreId)
+{
+    try {
+        $parts = array();
+        foreach (array('fk_categorie', 'fk_categorie_order', 'fk_categorie_invoice', 'fk_categorie_proposal') as $column) {
+            if (!array_key_exists($column, $data)) {
+                continue;
+            }
+            $old = ($oldStore !== null && isset($oldStore->$column)) ? (int) $oldStore->$column : null;
+            $new = $data[$column] !== null ? (int) $data[$column] : null;
+            $parts[] = $column . ': ' . ($old === null ? 'NULL' : $old) . ' -> ' . ($new === null ? 'NULL' : $new);
+        }
+        if (empty($parts)) {
+            return;
+        }
+        dol_syslog('doli2shopLogStoreCategoryPointerChange - store_id=' . (int) $dolibarrStoreId . ' ' . implode(', ', $parts), LOG_INFO);
+    } catch (\Throwable $e) {
+        // jamais bloquant
+    }
 }
 
 /**
@@ -3079,6 +3465,28 @@ function doli2shopResolveOAuthDisconnectStore(array $allStores, int $requestedSt
     // Aucune boutique par défaut trouvée (aucune boutique du tout : install jamais migrée, ou
     // toutes secondaires sans défaut — anomalie distincte, cf. doli2shopResolveCounterStoreScope()).
     return null;
+}
+
+/**
+ * Résout l'identifiant de l'utilisateur sous lequel agissent les webhooks et la création de
+ * commandes hors session (Story 68-2). Une valeur configurée <= 0 (ex. -1 enregistré par la ligne
+ * vide du sélecteur) est ignorée : repli sur l'utilisateur des tâches planifiées, puis sur
+ * l'administrateur (ID 1). Ne contrôle PAS l'existence ni les droits de l'utilisateur choisi.
+ *
+ * @param  int $configuredId DOLI2SHOP_WEBHOOK_USER_ID (lu sans valeur par défaut)
+ * @param  int $cronUserId   MAIN_CRON_USERID
+ * @return int               Identifiant strictement positif
+ * @since  2.6.1
+ */
+function doli2shopResolveWebhookUserId(int $configuredId, int $cronUserId): int
+{
+    if ($configuredId > 0) {
+        return $configuredId;
+    }
+    if ($cronUserId > 0) {
+        return $cronUserId;
+    }
+    return 1;
 }
 
 /**

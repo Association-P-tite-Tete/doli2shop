@@ -13,7 +13,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.2.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -419,6 +419,12 @@ if ($action == 'sync_batch') {
 				// depuis N cycles consécutifs), distinct de stockSyncLocationErrors (erreur GraphQL
 				// GLOBALE d'emplacement, pas ce cas).
 				$response['stockLocationCapped'] = (int) $importProducts->stockLocationCappedCount;
+
+				// Story 66-7 : collections AUTOMATIQUES auxquelles aucun produit n'a pu être rattaché
+				// (ignorées ou refusées) — avant, le journal annonçait un succès et l'écran ne disait rien.
+				// Re-review finale : les trois catégories (ignorées à conditions, refusées, détail
+				// illisible) et leurs identifiants viennent d'UNE méthode, partagée avec le CRON.
+				$response = array_merge($response, $importProducts->getCollectionsReport());
 			}
 
 			// Check if there are more products (L1 fix: alias renamed to 'total')

@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <doli2shop@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.0.26
  * @link        http://www.dolibarr.org
  * @link        https://doli2shop.ptitetete.org
@@ -3392,7 +3392,7 @@ doli2shopShowLicenseWarningBanner();
 // Subheader
 
 // === DÉBUT ISOLATION CSS v2.1.3 ===
-print '<div class=\"doli2shop-page\">';
+print '<div class="doli2shop-page">';
 $linkback = '<a href="'.DOL_URL_ROOT.'/admin/modules.php?restore_lastsearch_values=1">'.$langs->trans("BackToModuleList").'</a>';
 print load_fiche_titre($langs->trans($page_name), $linkback, 'title_setup');
 

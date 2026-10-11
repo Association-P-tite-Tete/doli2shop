@@ -1,5 +1,260 @@
 # CHANGELOG SHOPIFY INTEGRATION FOR DOLIBARR ERP CRM
 
+## 2.6.1 — 6 octobre 2026 : SYNTHÈSE — LE STOCK DOLIBARR REPART VERS SHOPIFY, L'API ET LES OUTILS DE MAINTENANCE REDEVIENNENT UTILISABLES
+
+> **Résumé de la version 2.6.1, pensé pour une lecture rapide.** Le détail complet, story par
+> story, reste dans la section « MODULE 2.6.1 — DÉTAIL COMPLET » ci-dessous (dépôt et site) ; cette
+> synthèse ne la remplace pas, elle en tire ce qui est visible ou utile pour vous.
+
+### Ce qui change pour vous
+
+- **Le stock Dolibarr repart de nouveau vers Shopify.** Dès qu'un produit avait déjà du stock en ligne,
+  Shopify refusait les mises à jour poussées par le module (« changeFromQuantity … no longer matches »).
+  Le module lit désormais la quantité réellement enregistrée chez Shopify, à l'emplacement configuré,
+  puis n'envoie que la différence ; si cette lecture est impossible, rien n'est envoyé et le produit
+  est réessayé, jamais perdu en silence. Les mises à jour sont regroupées par lot (bien moins d'appels
+  à Shopify) et une panne passagère de Shopify ne met plus les produits en échec définitif. **Les produits
+  restés bloqués sont remis en file automatiquement** à la mise à jour : rien à lancer.
+- **L'API REST du module fonctionne de nouveau.** Le paquet 2.6.0 faisait répondre toutes ses routes en
+  erreur 500 (même avec une clé valide). Corrigé et vérifié en HTTP réel sur Dolibarr 18 et 24 depuis le
+  paquet livré. **Si vous utilisez l'API REST avec la 2.6.0, installez cette version.**
+- **Les outils de maintenance s'ouvrent enfin, et l'onglet « Mappage des statuts » est retiré.** L'onglet
+  « Outils de maintenance » plantait à l'ouverture ; l'onglet « Mappage des statuts » n'a jamais eu d'effet
+  sur vos commandes, ses anciens liens redirigent vers « Configuration des commandes ».
+- **L'onglet « Webhooks » ne plante plus.** Décocher « Traitement immédiat » ou vider un champ numérique
+  provoquait une erreur fatale ; choisir la ligne vide dans « Utilisateur des webhooks » faisait répondre
+  une erreur 500 à tous vos webhooks (Shopify finit par désabonner la boutique). Corrigé.
+- **Les tags commande, facture et devis d'une boutique ne s'effacent plus** quand vous enregistrez sa
+  catégorie produit. **À vérifier par vous** : ouvrez chaque fiche boutique, onglet « Catégories et tags »,
+  et contrôlez que les trois tags sont renseignés (ressaisissez-les sinon).
+- **Une commande dont le client n'a pas d'e-mail est désormais importée** (téléphone seul, par exemple) : le
+  client est retrouvé par son identifiant Shopify, son téléphone ou son nom et son adresse, et créé sans
+  e-mail en dernier recours. En cas de doute, le module crée un tiers plutôt que de rattacher à tort.
+- **Une collection manuelle n'est plus prise pour une collection automatique** : ses produits sont de nouveau
+  rattachés, et l'écran de synchronisation signale à part les collections gérées par des conditions, où le
+  module n'ajoute volontairement pas de produits.
+- **L'image d'une collection n'est plus renvoyée à Shopify à chaque synchronisation** (moins de fichiers en
+  double, cycles plus courts). Après la mise à jour, chaque image repart une seule fois.
+- **L'outil « Doublons de photos » ne supprime plus que de vraies copies identiques** : rien n'est coché par
+  défaut, et le module revérifie lui-même avant de supprimer.
+- **L'export JSON d'un produit** ne confond plus un SKU numérique (`42285`, `00513`) avec un identifiant Shopify.
+- **Le journal dédié du module peut enfin être plus détaillé que celui de Dolibarr** : le niveau « Debug » du
+  module n'est plus plafonné par le réglage Syslog, sans alourdir le journal général de Dolibarr.
+
+### À faire par vous après la mise à jour
+
+1. **Rien d'obligatoire pour que la synchronisation continue** : les migrations s'appliquent à l'activation du module.
+2. **Vérifier les tags commande, facture et devis de chaque boutique** (fiche boutique, onglet « Catégories et tags »).
+3. **Si vous utilisez l'API REST avec la 2.6.0**, la 2.6.1 la rétablit : aucune autre action.
+4. Après la mise à jour, les images de collection repartent une fois vers Shopify, puis plus du tout.
+
+## MODULE 2.6.1 — DÉTAIL COMPLET : LE STOCK DOLIBARR REPART VERS SHOPIFY, LES OUTILS DE MAINTENANCE S'OUVRENT
+
+- **Une collection manuelle n'est plus prise pour une collection automatique : ses produits sont de nouveau rattachés, et le module
+  n'annonce plus un ajout qui n'a pas eu lieu.** Une collection manuelle à laquelle un produit a été ajouté à la main (ou l'a été un jour)
+  porte, dans la nouvelle API Shopify, une « source de conditions » **sans aucune condition**. Le module la classait « automatique »
+  sur la seule présence de cette source, refusait d'y ajouter des produits (« Smart Collection - skipping manual product addition ») et
+  journalisait pourtant « Successfully added ». Le critère est désormais : automatique si la collection a des règles, OU au moins une
+  condition réelle, OU une source de sous-collections ; une source sans condition, ou un détail indisponible, vaut manuelle. Si Shopify refuse de
+  lire ce détail pour votre version d'API, le module retombe sur l'ancienne lecture (jamais « automatique » par défaut), boutique par boutique.
+  **Les collections gérées par des conditions**, le module n'y ajoute pas de produits (choix du module) : l'ajout est désormais compté
+  à part (jamais comme un succès), journalisé en avertissement, et l'écran de synchronisation affiche « X collection(s) gérée(s) par
+  des conditions dans Shopify : le module n'y ajoute pas de produits — passez la collection en manuelle pour qu'il la remplisse »
+  (5 langues, également dans la sortie du CRON). Si Shopify refuse l'ajout avec un message évoquant une collection automatique, un
+  second bandeau le distingue (« refusée(s) par Shopify »). Une collection qui n'a que des conditions d'exclusion est aussi
+  considérée comme gérée par des conditions. Quand le détail des sources est illisible, l'adoption d'une collection existante par son
+  titre reste prudente (aucune réécriture de description, d'image ni de publication), comme avant cette version. Même prudence à
+  l'ajout : si Shopify refuse de lire les conditions d'une collection qui porte une source de conditions, le module n'y ajoute aucun
+  produit (comptée et affichée à part, « ignorée(s) par prudence »). Limite connue : sur une boutique où Shopify refuse de renvoyer les conditions d'exclusion, une
+  collection manuelle à laquelle un produit a été ajouté à la main n'est plus alimentée par le module (prudence, signalée par ce
+  même bandeau) ; le bilan de l'écran compte chaque collection une seule fois sur l'ensemble des lots. **Mappings déjà posés à tort** (collection manuelle adoptée par son titre avant cette
+  version et figée « gérée en externe ») : ils sont requalifiés automatiquement au prochain passage, uniquement lorsque Shopify
+  confirme l'absence de condition ; une collection réellement automatique reste intouchée (description, image et publication). Un
+  appel de lecture supplémentaire par collection concernée et par exécution. Le journal DEBUG du module résume les sources lues (types,
+  nombre de conditions, présence de règles ; identifiants seulement). Vérifié sur une boutique de test : l'ajout d'un produit dans une collection
+  manuelle du nouveau modèle fonctionne (il est appliqué par Shopify quelques secondes après). Shopify accepte désormais aussi
+  l'ajout manuel à une collection à conditions ; le module s'en abstient volontairement, pour respecter les règles posées par le
+  marchand. Limite : `collectionAddProducts` est marquée dépréciée par Shopify et sera à remplacer dans une version ultérieure.
+
+- **L'export JSON d'un produit ne prend plus un SKU numérique pour un identifiant Shopify.** Dans Outils > Exporter un
+  produit (JSON), une saisie entièrement numérique (SKU de variante comme `42285` ou `00513`) était toujours traitée comme un
+  ID de produit Shopify, d'où « Produit gid://shopify/Product/42285 introuvable côté Shopify ». Le module cherche désormais
+  d'abord un SKU de variante **identique caractère pour caractère** (les zéros de tête comptent : `00513` n'est pas `513`),
+  puis un titre, et seulement en dernier recours un ID de produit (jamais pour une saisie commençant par 0, qui n'est pas un
+  ID Shopify). Un vrai ID numérique continue de fonctionner. En cas d'échec, le message dit que la saisie a été cherchée
+  comme SKU, titre puis ID. Les SKU sont parcourus page par page (5 pages de 50 variantes au plus). Limites : si un SKU est égal à l'ID
+  d'un autre produit, le SKU gagne ; un produit dont le **titre contient** le nombre saisi passe avant le repli sur l'ID (coller le gid
+  complet pour forcer l'ID) ; à SKU identique sur plusieurs produits, la première variante exacte est retenue ; l'export interroge la
+  boutique par défaut.
+
+- **Une commande dont le client n'a pas d'e-mail n'est plus rejetée : le client est retrouvé par d'autres données.**
+  Une commande passée avec le téléphone seul (ni e-mail du client, ni e-mail de commande) était rejetée avec « has no
+  customer data » et n'était jamais importée. Le module reconstruit désormais l'identité du client depuis le client
+  Shopify, puis l'adresse de facturation, puis celle de livraison, et cherche le tiers existant **dans cet ordre,
+  chaque étape n'étant jouée que si la précédente n'a rien trouvé** : (1) e-mail ; (2) identifiant client Shopify déjà
+  rattaché (nouvelle table de liaison, propre à chaque boutique) ; (3) téléphone — seulement si **un seul** tiers porte
+  ce numéro **et** que son prénom **et** son nom de famille (ou sa société) y figurent, ce tiers n'étant ni fournisseur seul, ni fermé, ni déjà lié à un autre compte Shopify de la boutique ; (4) nom + code postal + adresse, les trois
+  devant coïncider. Sans résultat, le tiers est créé **sans e-mail** (nom, téléphone, adresse), jamais avec l'e-mail ou
+  le téléphone comme nom (« Client Shopify #1001 » en dernier recours). **En cas de doute le module crée un tiers** : un
+  doublon se fusionne dans Dolibarr, un faux rattachement corrompt la comptabilité. Le téléphone d'identité est celui du
+  client ou de la facturation, **jamais celui de la livraison** (destinataire d'un cadeau possible) ; un numéro national
+  sans pays exploitable n'est jamais rapproché.
+  **Changement de comportement à connaître : une commande avec un e-mail INCONNU n'est plus créée immédiatement** ; le
+  module tente d'abord le lien client, le téléphone puis le nom + adresse. Un client qui change d'e-mail est donc retrouvé
+  (au lieu de devenir un second tiers). Un tiers retrouvé ainsi (téléphone ou nom + adresse) n'est **jamais réécrit** :
+  seuls ses champs vides sont remplis (téléphone, adresse, e-mail s'il n'en avait pas) ; s'il porte déjà un autre e-mail,
+  le rattachement exige en plus la même adresse. Un tiers retrouvé par e-mail ou par identifiant garde son comportement
+  habituel, mais une valeur vide de Shopify n'efface plus son e-mail, son téléphone ni son adresse.
+  Une commande **sans aucune identité** (ni e-mail, ni client Shopify, ni nom, téléphone ou adresse — typiquement l'accès
+  « Protected customer data » non accordé à l'application) est rejetée **explicitement** (« has no customer identity »,
+  visible en erreur dans Événements, rejouable après correction) ; aucun tiers fictif n'est créé. Si votre Dolibarr
+  impose un e-mail à chaque tiers (réglage `SOCIETE_EMAIL_MANDATORY`), l'erreur le dit au lieu du message générique.
+  Le lien est posé sur tout tiers résolu (aussi quand il est trouvé par e-mail), sans reprise de données : il se remplit au
+  fil des commandes. La fiche tiers affiche en **lecture seule** l'identifiant client Shopify et la boutique, et la
+  **fusion de deux tiers** (écran Dolibarr ou API) re-pointe les liens vers le tiers conservé. Nouvelle table
+  `llx_doli2shop_customers` (migration automatique ; la FK vers les tiers n'est posée que si votre table des tiers est
+  InnoDB, la table reste utilisable sinon). Les journaux n'écrivent aucun téléphone, nom ni adresse en clair. Limites : un
+  tiers sans e-mail ne reçoit ni e-mail transactionnel ni notification transporteur exigeant un e-mail (Colissimo & co) ;
+  un ancien client qui commande désormais sans e-mail avant d'avoir recommandé avec est cherché par téléphone ou nom +
+  adresse, sinon un doublon fusionnable est créé.
+
+- **Le journal dédié du module (`dolibarr_doli2shop.log`) peut enfin être plus détaillé que le journal général de Dolibarr.** Le réglage
+  « niveau du journal du module » (`DOLI2SHOP_LOG_FILE_LEVEL`) était en réalité plafonné par le niveau de journalisation de Dolibarr
+  (Syslog) : réglé en « Debug », le journal du module ne contenait que des avertissements dès que Syslog était réglé plus haut (cas courant
+  en production), et rien du tout si ce réglage était absent. Le module relève désormais ce niveau **uniquement le temps d'écrire sa propre ligne
+  dans son propre fichier**, puis le restitue à l'identique : le journal général de Dolibarr ne reçoit rien de plus et les autres modules ne sont
+  pas affectés. Le contournement qui consistait à passer Syslog en « Debug » n'est plus nécessaire. Pendant ce relèvement, les affichages de
+  débogage (`?log=1`, barre de débogage) sont mis de côté pour ne rien afficher de plus, y compris sur les points d'entrée publics (webhooks).
+  Limite : si le module Syslog de Dolibarr est désactivé, aucun journal n'est écrit, celui du module compris.
+
+- **L'image de collection n'est plus renvoyée à Shopify à chaque synchronisation.** Pour chaque collection liée à une
+  catégorie Dolibarr, le module renvoyait son image à Shopify à **chaque** passage de la synchronisation (envoi, création du
+  fichier, mise à jour de la collection), ce qui pouvait ajouter des fichiers en double dans « Contenu > Fichiers » (cause plausible, non mesurée) et allongeait
+  les cycles. Le module mémorise désormais l'image envoyée (empreinte de son **contenu** et du nom de la catégorie, liée à
+  la collection Shopify visée) et ne la renvoie que si l'image change, si la catégorie est renommée, si la collection est
+  recréée, ou si elle n'a plus d'image côté Shopify. **Après la mise à jour, chaque collection renverra son image une
+  seule fois** à la première synchronisation (rien n'est présumé à jour), puis plus du tout. Le nettoyage des doublons
+  déjà présents dans Contenu > Fichiers viendra plus tard : le module n'en supprime aucun. Limite : une image remplacée
+  à la main dans l'administration Shopify (sans suppression) n'est plus écrasée à chaque passage et n'est restaurée que
+  si l'image Dolibarr change. Les collections pilotées par des règles restent intouchées. Trois colonnes ajoutées à la
+  table des collections (migration automatique, sans reprise de données). Limites : en multi-boutiques, le gain reste partiel tant que le lien collection/catégorie n'est pas propre à chaque boutique (story 67-10) ; renommer une catégorie renvoie l'image une fois. Correctif voisin : en multi-boutiques, le cache
+  d'un même passage ne mélange plus les collections de deux boutiques.
+
+- **Le stock Dolibarr repart de nouveau vers Shopify quand le stock en ligne n'est pas nul.** Les mises à
+  jour de stock poussées de Dolibarr vers Shopify (après une vente, une expédition, un mouvement de stock, ou
+  un recalage) étaient refusées par Shopify dès que le produit avait déjà du stock en ligne, avec le message
+  « The changeFromQuantity argument no longer matches the persisted quantity » : le module annonçait à Shopify
+  un stock enregistré de zéro sans l'avoir vérifié. Le module **lit désormais la quantité réellement
+  enregistrée chez Shopify, à l'emplacement configuré pour la boutique**, puis n'envoie que la différence. Si
+  cette lecture est impossible (incident réseau, emplacement désactivé ou invalide, article non activé à cet
+  emplacement), **rien n'est envoyé** : l'erreur est explicite (visible dans la file d'attente et le journal)
+  et le produit est réessayé, jamais perdu en silence ni écrit avec une valeur inventée.
+- **Moins d'appels à Shopify, et une panne de Shopify ne bloque plus la file.** Les mises à jour d'une même
+  boutique sont regroupées (une lecture et une écriture par lot de 100 produits au plus, au lieu de deux
+  appels par produit) ; si Shopify refuse un lot à cause d'un article (stock qui a bougé entre-temps, article
+  non stocké à l'emplacement, quantité refusée…), les produits du lot sont rejoués un par un, et un produit
+  fautif ne bloque plus ses voisins. Si deux produits Dolibarr correspondent à la même variante Shopify, la
+  valeur du dernier dans l'ordre du lot est envoyée et l'autre est signalée (jamais comptée comme poussée).
+  Une réponse illisible ou vide de Shopify n'est plus prise pour un succès : le produit est réessayé. Quand Shopify
+  est momentanément indisponible, injoignable ou limite le débit, les produits concernés sont réessayés
+  **sans consommer leurs essais** : une panne passagère ne les met plus en échec définitif. Ce répit est
+  limité à 24 heures : au-delà, les essais sont consommés et le produit passe en échec définitif avec un
+  message explicite. Un refus durable (jeton Shopify révoqué, droit manquant) n'en bénéficie jamais : il est
+  traité comme un échec normal. Un emplacement mal configuré sur une boutique est signalé explicitement et
+  ne fait pas échouer le produit sur les autres boutiques (même limite de 24 heures s'il n'y a aucune autre
+  boutique).
+- **Remise en file automatique des produits restés bloqués.** À la mise à jour du module, les produits dont le
+  dernier échec mentionnait « changeFromQuantity » (en échec définitif, ou en cours d'échec) sont remis en
+  file avec leurs 5 essais, en conservant leur ordre d'arrivée : vous n'avez rien à lancer. Les échecs d'une
+  autre cause (délai dépassé, produit non mappé…) ne sont pas touchés ; ils se relancent depuis
+  l'administration. Le débit dépend de Shopify : les produits sont traités par petits lots, dans un temps
+  borné à chaque passage de la tâche planifiée ; les « 100 produits par passage de 5 minutes » sont un
+  plafond, pas un débit garanti. Ce qui n'a pas pu être traité à temps repart au passage suivant, sans perdre
+  d'essai. Un nouveau mouvement de stock ou une relance manuelle repart avec tous ses essais.
+- **Corrigé : enregistrer la catégorie produit d'une boutique effaçait en silence ses tags commande, facture et
+  devis.** Dans la fiche boutique, onglet « Catégories et tags », le formulaire de la catégorie produit remettait
+  à zéro les trois étiquettes de documents ; le formulaire des tags documents ré-enregistrait aussi la catégorie
+  produit (valeur parfois périmée) et, sur un Dolibarr sans catégorie de devis, effaçait celle du devis. Chaque
+  formulaire n'enregistre désormais que ses propres champs, et chaque changement est journalisé (anciennes et
+  nouvelles valeurs). **Action pour vous** : ouvrez la fiche de chaque boutique, onglet « Catégories et tags »,
+  et vérifiez que les tags commande, facture et devis sont renseignés ; sinon, ressaisissez-les. Tant qu'un tag
+  est vide, les nouvelles commandes et factures ne reçoivent plus l'étiquette de leur boutique, et la prochaine
+  mise à jour ou réactivation du module recrée des catégories vides en double (« Boutique — Commandes »…). Les
+  catégories et les liens des anciens documents, eux, n'ont pas été supprimés. Requête de diagnostic (lecture
+  seule, à lancer dans votre base ; remplacez `llx_` par votre préfixe et `1` par votre entité) : boutiques
+  avec une catégorie produit mais un tag commande ou facture vide —
+  `SELECT rowid, label, fk_categorie, fk_categorie_order, fk_categorie_invoice, fk_categorie_proposal FROM llx_doli2shop_stores WHERE entity = 1 AND fk_categorie > 0 AND (fk_categorie_order IS NULL OR fk_categorie_invoice IS NULL);`
+  Une boutique jamais taguée peut aussi y apparaître ; le vrai signe d'un tag perdu est une catégorie de
+  commande/facture au libellé de la boutique dans `llx_categorie` que plus aucune boutique ne référence : la
+  ré-associer dans la fiche rend les anciens documents cohérents. Aucun outil de réparation automatique n'est
+  fourni (décision du mainteneur) ; contactez le support si vous souhaitez de l'aide.
+- **Limites connues** : sur une installation multi-entités, la file de stock n'est vidée que pour l'entité
+  de la tâche planifiée ; la remise en file couvre toutes les entités mais seule celle-là repart (correctif
+  prévu). Un mécanisme d'attente progressive et d'alerte en cas de panne prolongée de Shopify est prévu dans
+  une prochaine version.
+- **Les outils de maintenance s'ouvrent enfin.** L'onglet « Outils de maintenance » plantait à
+  l'ouverture (erreur fatale : la bibliothèque du module était chargée après son premier usage) ;
+  une seconde erreur fatale, masquée par la première, se produisait ensuite (appel d'une méthode
+  inexistante de l'import de produits). Les deux sont corrigées ; le diagnostic de la table de
+  correspondance produits est de nouveau utilisable. Le titre de la page et le lien de retour,
+  qui s'affichaient sous forme de clés brutes, sont désormais traduits (langues chargées avant
+  usage) ; un balisage HTML mal échappé est corrigé sur 4 écrans (Maintenance, Diagnostic,
+  Webhooks, Collections).
+- **L'onglet « Mappage des statuts » est retiré.** Il demandait une « Configuration Shopify »
+  qu'il ne trouvait jamais, et ses réglages n'avaient aucun effet sur vos commandes : la
+  synchronisation des statuts de Dolibarr vers Shopify n'a jamais fonctionné. Les anciens liens ou
+  signets vers cet écran redirigent (en conservant la boutique choisie) vers l'onglet « Configuration des commandes ». Les tables et le
+  mappeur de statuts sont conservés (aucune migration) ; une vraie synchronisation des statuts vers
+  Shopify serait une fonctionnalité nouvelle, à cadrer si vous la demandez.
+- **Deux garde-fous automatiques** (tests) : plus aucun écran d'administration ne peut appeler une
+  fonction de la bibliothèque du module avant de l'avoir chargée ; toute constante de configuration
+  lue sous un nom non préfixé doit être déclarée et justifiée (c'est ce défaut qui rendait l'écran
+  des statuts inutilisable). Traductions : 25 clés de l'écran retiré supprimées dans les 5 langues.
+- **L'onglet « Webhooks » ne plante plus, et un utilisateur vide ne bloque plus vos webhooks.**
+  Décocher « Traitement immédiat » ou vider un champ numérique (limite de traitement, durée de
+  conservation…) provoquait une erreur fatale à l'enregistrement, après que les abonnements avaient déjà
+  été modifiés ; le réglage « Traitement immédiat » ne pouvait donc jamais être désactivé. C'est corrigé :
+  une case décochée enregistre « désactivé », et une valeur vide ou hors plage est ramenée en silence à une
+  valeur admise (limite de traitement 1 à 1000, 100 par défaut ; conservation 1 à 365 jours, 30 par défaut).
+  Choisir la ligne vide dans la liste « Utilisateur des webhooks » enregistrait la valeur -1, ce qui faisait
+  répondre une erreur 500 à **tous** les webhooks (Shopify finit alors par désabonner votre boutique) et
+  laissait la création des commandes s'exécuter sans aucun utilisateur. La ligne vide supprime désormais le
+  réglage ; **si votre installation a déjà enregistré cette valeur, aucune action n'est nécessaire** : le module
+  l'ignore et utilise l'utilisateur des tâches planifiées de Dolibarr, à défaut l'administrateur (identifiant 1).
+  Pour les installations concernées, les webhooks s'exécutent donc désormais sous ce compte, avec ses droits.
+  Un envoi du formulaire Webhooks sans le bouton « Enregistrer » (ex. envoi automatique) provoquait aussi
+  une erreur fatale : corrigé.
+  La page de déconnexion OAuth ne plante plus quand on l'ouvre sans boutique précisée dans l'adresse
+  (ancien signet) ; elle propose la boutique par défaut. Un garde-fou automatique (test) interdit désormais
+  ce type de lecture non convertie dans tous les écrans du module. Limite connue : un utilisateur choisi
+  mais inexistant ou désactivé donne toujours une erreur 500 (contrôle prévu dans une version ultérieure).
+- **L'outil « Doublons de photos » ne supprime plus que de vraies copies identiques.** Jusqu'ici, il proposait
+  de supprimer, pour chaque produit, toutes les photos importées avant la correction de septembre 2026 sauf la
+  plus récente, déjà cochées, sans regarder leur contenu : deux photos réellement différentes d'un même produit
+  pouvaient disparaître, et la demande de confirmation ne s'affichait pas. Désormais, seules les copies de
+  contenu strictement identique sont proposées (une photo différente ne l'est jamais), **rien n'est coché par
+  défaut**, et la confirmation indique le nombre de fichiers que vous avez réellement cochés ; valider sans rien
+  cocher affiche un message. Pour chaque groupe de copies, le module garde celle qu'il utilise, sinon la
+  première photo du produit, sinon la plus récente. Au moment de supprimer, le module revérifie lui-même que
+  chaque fichier a bien une copie identique qui reste : une page périmée ou un envoi modifié ne peut plus
+  supprimer une photo distincte. Un second nettoyage lancé en même temps sur le même produit est refusé. La suppression retire aussi la photo de l'onglet « Documents » de la fiche
+  produit. Après un nettoyage, les photos des produits concernés sont renvoyées une seule fois vers Shopify,
+  sans créer de média en plus. Une copie recompressée ou ré-exportée n'est pas strictement identique : elle
+  n'est pas proposée.
+- Story 68-1 (audit des écrans d'administration du 04/10/2026, constats C1-C3). Constantes fantômes
+  restantes (`SHOPIFY_DOLIBARR_PROCATE`, `USER_CURRENT`) et gardes génériques : stories 68-26 et 68-27.
+- **Corrigé : l'API REST du module répondait en erreur 500 depuis la 2.6.0.** Le paquet 2.6.0 retirait les
+  commentaires du code, mais le fichier de l'API en porte un rôle fonctionnel : ils indiquent à Dolibarr quelles
+  routes exposer et que l'accès exige une clé API valide. Sans eux, l'identité de l'appelant n'était jamais
+  renseignée et les appels `/doli2shop/status`, `/stores`, `/actionlog`… échouaient en HTTP 500, même avec une
+  clé valide. Le paquet conserve désormais tous les commentaires du fichier de l'API, ainsi que ceux des
+  propriétés de toutes les classes (Dolibarr instancie sinon certaines classes sans argument et plante), et les
+  types de retour des aides internes de l'API ne citent plus de classe (la simulation de l'enregistrement
+  Restler sur le cœur Dolibarr 18 y échouait déjà dans le dépôt ; correction vérifiée en HTTP réel sur Dolibarr 18.0.10 / PHP 8.1 et 24). Taille du paquet mesurée : environ 1 369 000 octets (2.6.0 :
+  1 339 001), sous le seuil de 1 992 294. Garde-fous : tests unitaires rejouant l'algorithme de Restler sur le
+  code réellement strippé, et script de contrôle HTTP depuis le ZIP livré (`test/release/run_api_from_zip_online.php`).
+  **Action pour vous** : si vous utilisez l'API REST avec la 2.6.0, installez cette version.
+
 ## 2.6.0 — 29 septembre 2026 : SYNTHÈSE — LE MODULE TIENT SON JOURNAL, LA CONNEXION SHOPIFY SE VÉRIFIE MIEUX
 
 > **Résumé de la version 2.6.0, pensé pour une lecture rapide.** Le détail complet, story par

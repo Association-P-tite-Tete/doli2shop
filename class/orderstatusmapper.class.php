@@ -77,8 +77,10 @@ class OrderStatusMapper
      * fichier n'a jamais existé dans le dépôt, et aucun fichier `llx_*.sql` ne pose de valeur par
      * défaut pour ces tables (uniquement des `CREATE TABLE`) — le Validate du 09/09/2026 l'a
      * confirmé. Source de vérité UNIQUE, partagée entre le seeding d'installation
-     * (`ensureDefaultMappings()`, appelé depuis `modDoli2Shop::init()`) et l'action
-     * `restore_defaults` de `admin/orderstatusmapping.php`.
+     * (`ensureDefaultMappings()`, appelé depuis `modDoli2Shop::init()`). L'ancienne action
+     * `restore_defaults` de l'écran `admin/orderstatusmapping.php` a disparu avec lui (retiré en
+     * 2.6.1, story 68-1 : le fichier n'est plus qu'une redirection ; ce mapper et ses tables sont
+     * conservés).
      *
      * Codes `dolibarr_status` alignés sur les VRAIES constantes de `commande.class.php`, pour
      * Dolibarr 19+ à 23+ : `Commande::STATUS_CANCELED` (-1), `STATUS_DRAFT` (0),
@@ -87,15 +89,15 @@ class OrderStatusMapper
      * `Commande::STATUS_DELIVERED` distinct dans le Dolibarr réellement ciblé par le module : ni
      * `commande/class/commande.class.php` (core), ni `stubs/dolibarr.stub`, ni
      * `test/bootstrap.php` ne déclarent une telle constante — seules les 5 ci-dessus existent.
-     * `docs/features/ORDER_STATUS_MAPPING.md` et l'ancienne vue de `admin/orderstatusmapping.php`
-     * décrivaient un schéma à 6 statuts (0..5, avec un `STATUS_DELIVERED` et un `STATUS_CLOSED`
+     * `docs/features/ORDER_STATUS_MAPPING.md` et l'ancienne vue de l'écran retiré
+     * `admin/orderstatusmapping.php` décrivaient un schéma à 6 statuts (0..5, avec un `STATUS_DELIVERED` et un `STATUS_CLOSED`
      * distincts) qui n'a jamais existé dans un Dolibarr réel : recopier ces valeurs aurait
      * déplacé le défaut plutôt que de le corriger (AC7).
      *
      * Revue finale du train 2.5.3, point 1 — les 8 lignes initiales ne couvraient que 4 des 8
      * valeurs réelles de l'enum Shopify `OrderFinancialStatus` (liste exhaustive confirmée dans
-     * `class/shopifyordermanager.class.php` ~ligne 741-742 et `admin/orderstatusmapping.php`
-     * ~ligne 357-366) : il manquait `AUTHORIZED`, `EXPIRED`, `PARTIALLY_REFUNDED`, `REFUNDED`.
+     * `class/shopifyordermanager.class.php` ~ligne 741-742 et l'ancien écran
+     * `admin/orderstatusmapping.php`, retiré en 2.6.1) : il manquait `AUTHORIZED`, `EXPIRED`, `PARTIALLY_REFUNDED`, `REFUNDED`.
      * Une commande `REFUNDED` + `FULFILLED` ne trouvait alors aucune correspondance (ni exacte,
      * ni financial-only) et retombait sur le fallback fulfillment-only (ligne PAID/FULFILLED) →
      * classée `STATUS_CLOSED`, comme une commande normalement honorée. Correspondances ajoutées,
@@ -179,8 +181,8 @@ class OrderStatusMapper
     /**
      * Retourne la définition des correspondances Shopify → Dolibarr par défaut (lecture seule).
      *
-     * Exposée pour les tests et pour l'action `restore_defaults` de
-     * `admin/orderstatusmapping.php` — évite de dupliquer la liste.
+     * Exposée pour les tests et pour le seeding d'installation (`ensureDefaultMappings()`) — évite
+     * de dupliquer la liste. (L'action `restore_defaults` de l'ancien écran est retirée, 2.6.1.)
      *
      * @return array<int, array{shopify_financial_status: string, shopify_fulfillment_status: string, dolibarr_status: int, default_mapping: int, priority: int, description: string}>
      * @since 2.5.3

@@ -23,7 +23,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.1.8
  * @link        https://doli2shop.ptitetete.org
  */
@@ -258,14 +258,12 @@ switch ($entityResolution['status']) {
 // On charge l'utilisateur configuré pour les CRONs, ou à défaut l'admin (ID=1).
 // Lu APRES la résolution d'entité ci-dessus : DOLI2SHOP_WEBHOOK_USER_ID est une constante par
 // entité (llx_const), donc lue depuis la MAUVAISE entité si elle était consultée plus tôt.
-$webhookUserId = getDolGlobalInt('DOLI2SHOP_WEBHOOK_USER_ID', 0);
-if (empty($webhookUserId)) {
-    // Fallback : utiliser l'utilisateur CRON configuré dans Dolibarr
-    $webhookUserId = getDolGlobalInt('MAIN_CRON_USERID', 0);
-}
-if (empty($webhookUserId)) {
-    // Dernier recours : admin (ID=1)
-    $webhookUserId = 1;
+$configuredWebhookUserId = getDolGlobalInt('DOLI2SHOP_WEBHOOK_USER_ID', 0);
+// Story 68-2 : une valeur <= 0 (ex. -1 enregistré par la ligne vide du sélecteur) retombe sur
+// l'utilisateur CRON puis sur l'admin (ID=1) au lieu de provoquer un HTTP 500.
+$webhookUserId = doli2shopResolveWebhookUserId($configuredWebhookUserId, getDolGlobalInt('MAIN_CRON_USERID', 0));
+if ($configuredWebhookUserId < 0) {
+    dol_syslog("Doli2Shop Webhook: DOLI2SHOP_WEBHOOK_USER_ID invalide (" . $configuredWebhookUserId . ") ignoré, repli sur l'utilisateur ID=" . $webhookUserId, LOG_WARNING);
 }
 
 // Charger l'utilisateur avec ses droits

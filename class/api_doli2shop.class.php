@@ -9,7 +9,7 @@
  * @author      P'tite Tête
  * @copyright   2024-2026 P'tite Tête <shopifyintegration@ptitetete.com>
  * @license     http://www.gnu.org/licenses/gpl.html GNU General Public License
- * @version     2.6.0
+ * @version     2.6.1
  * @since       2.5.0
  * @link        https://doli2shop.ptitetete.org
  */
@@ -226,7 +226,7 @@ class Doli2Shop extends DolibarrApi
      *
      * @param  int $productId
      * @param  int $entity
-     * @return Product
+     * @return object  Instance de Product (texte libre : aucune classe citée, Restler n'en résout aucune, story 67-9)
      * @throws RestException 404 Produit introuvable OU hors entity
      */
     protected function fetchProductInEntityOrFail($productId, $entity)
@@ -319,7 +319,7 @@ class Doli2Shop extends DolibarrApi
 
     /**
      * @param  int $entity
-     * @return Product
+     * @return object  Instance de Product (texte libre : aucune classe citée, Restler n'en résout aucune, story 67-9)
      */
     protected function createProduct($entity)
     {
@@ -330,7 +330,7 @@ class Doli2Shop extends DolibarrApi
      * Factory protégée SyncFlowPolicy (Story 53-3, site 7 — remplace createSyncUtils()).
      *
      * @param  int $entity
-     * @return SyncFlowPolicy
+     * @return object  Instance de SyncFlowPolicy (texte libre : aucune classe citée, Restler n'en résout aucune, story 67-9)
      */
     protected function createSyncFlowPolicy($entity)
     {
@@ -339,7 +339,7 @@ class Doli2Shop extends DolibarrApi
 
     /**
      * @param  int $entity
-     * @return ShopifyStockTrigger
+     * @return object  Instance de ShopifyStockTrigger (texte libre : aucune classe citée, Restler n'en résout aucune, story 67-9)
      */
     protected function createStockTrigger($entity)
     {
@@ -348,7 +348,7 @@ class Doli2Shop extends DolibarrApi
 
     /**
      * @param  int $entity
-     * @return StockRecalageService
+     * @return object  Instance de StockRecalageService (texte libre : aucune classe citée, Restler n'en résout aucune, story 67-9)
      */
     protected function createStockRecalageService($entity)
     {
@@ -357,7 +357,7 @@ class Doli2Shop extends DolibarrApi
 
     /**
      * @param  int $entity
-     * @return StoreService
+     * @return object  Instance de StoreService (texte libre : aucune classe citée, Restler n'en résout aucune, story 67-9)
      */
     protected function createStoreService($entity)
     {
@@ -367,7 +367,7 @@ class Doli2Shop extends DolibarrApi
     /**
      * @param  int         $entity
      * @param  object|null $store  Boutique validée (null = chemin historique entité/constantes)
-     * @return importProducts
+     * @return object  Instance de importProducts (texte libre : aucune classe citée, Restler n'en résout aucune, story 67-9)
      */
     protected function createImportProducts($entity, $store)
     {
@@ -381,7 +381,7 @@ class Doli2Shop extends DolibarrApi
      *
      * @param  int         $entity
      * @param  object|null $store  Boutique validée (null = chemin historique entité/constantes)
-     * @return ShopifyOrderManager
+     * @return object  Instance de ShopifyOrderManager (texte libre : aucune classe citée, Restler n'en résout aucune, story 67-9)
      */
     protected function createOrderManager($entity, $store)
     {
@@ -397,7 +397,7 @@ class Doli2Shop extends DolibarrApi
      *
      * @param  int         $entity
      * @param  object|null $store
-     * @return ShopifyOrderManager
+     * @return object  Instance de ShopifyOrderManager (texte libre : aucune classe citée, Restler n'en résout aucune, story 67-9)
      * @throws RestException 403 Droits Dolibarr standard manquants pour l'utilisateur du token API
      */
     protected function instantiateOrderManagerOrFail($entity, $store)
